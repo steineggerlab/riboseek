@@ -15,6 +15,9 @@ public:
     /*contains int to amino acid mapping*/
     char* num2aa;
 
+    /* reverse complement lookup: num2revcompnum[i] = complement of residue i */
+    unsigned char* num2revcompnum;
+
     /* size of alphabet*/
     int alphabetSize;
 

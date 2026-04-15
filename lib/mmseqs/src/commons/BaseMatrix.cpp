@@ -1,4 +1,5 @@
 #include <climits>
+#include <vector>
 #include "BaseMatrix.h"
 
 #include "simd.h"
@@ -13,15 +14,20 @@ BaseMatrix::BaseMatrix(){
     // init [amino acid <-> int] mappings
 
     num2aa = new char[255];
-    aa2num = new unsigned char[UCHAR_MAX];
-    for (int i = 0; i < UCHAR_MAX; ++i) {
+    aa2num = new unsigned char[USHRT_MAX];
+    for (int i = 0; i < USHRT_MAX; ++i) {
         aa2num[i] = UCHAR_MAX;
+    }
+    num2revcompnum = new unsigned char[UCHAR_MAX];
+    for (int i = 0; i < UCHAR_MAX; ++i) {
+        num2revcompnum[i] = UCHAR_MAX;
     }
 }
 
 BaseMatrix::~BaseMatrix(){
     delete[] num2aa;
     delete[] aa2num;
+    delete[] num2revcompnum;
     delete[] pBack;
     for (int i = 0; i < allocatedAlphabetSize; i++){
         delete[] probMatrix[i];
@@ -125,16 +131,54 @@ void BaseMatrix::generateSubMatrix(double ** probMatrix, double ** subMatrix, fl
     for (int i = 0; i < size; i++) {
         for (int j = 0; j < size; j++) {
             subMatrix[i][j] = std::log2(probMatrix[i][j] / (pBack[i] * pBack[j]));
-            //printf("%3.4f %3.4f %3.4f \n",  probMatrix[i][j], pBack[i], pBack[j] );
-
         }
     }
+
     delete[] pBack;
-//    subMatrix[size - 1][size - 1] = -.7;
-//    for (int i = 0; i < size; i++) {
-//        subMatrix[size - 1][i] = -.7;
-//        subMatrix[i][size - 1] = -.7;
-//    }
+}
+
+static std::vector<size_t> returnCanonicalIndices(size_t index) {
+    switch (index) {
+        case 16: return {0, 1, 2, 3};     // AX
+        case 17: return {4, 5, 6, 7};     // CX
+        case 18: return {8, 9, 10, 11};   // GX
+        case 19: return {12, 13, 14, 15}; // TX/UX
+        case 20: return {0, 4, 8, 12};    // XA
+        case 21: return {1, 5, 9, 13};    // XC
+        case 22: return {2, 6, 10, 14};   // XG
+        case 23: return {3, 7, 11, 15};   // XU/T
+        case 24: return {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}; // XX
+        default: return {};
+    }
+}
+
+static void recalcNonCanonicalDinuc(double ** subMatrix, int size) {
+    for (int i = 16; i < size; i++) {
+        std::vector<size_t> dinucs_row = returnCanonicalIndices(i);
+        for (int j = 0; j < size; j++) {
+            std::vector<size_t> dinucs_col;
+            if (j > 15) {
+                dinucs_col = returnCanonicalIndices(j);
+            }
+            if (dinucs_col.empty()) {
+                double score_sum = 0.0;
+                for (size_t row_idx : dinucs_row) {
+                    score_sum += subMatrix[row_idx][j];
+                }
+                subMatrix[i][j] = score_sum / static_cast<double>(dinucs_row.size());
+                subMatrix[j][i] = subMatrix[i][j];
+            } else {
+                double score_sum = 0.0;
+                for (size_t row_idx : dinucs_row) {
+                    for (size_t col_idx : dinucs_col) {
+                        score_sum += subMatrix[row_idx][col_idx];
+                    }
+                }
+                subMatrix[i][j] = score_sum / static_cast<double>(dinucs_row.size() * dinucs_col.size());
+                subMatrix[j][i] = subMatrix[i][j];
+            }
+        }
+    }
 }
 
 // made non-static for testing purpose
@@ -144,6 +188,12 @@ void BaseMatrix::generateSubMatrix(double ** probMatrix, float ** subMatrixPseud
         sm[i] = new double[size];
 
     generateSubMatrix(probMatrix, sm, subMatrixPseudoCounts, size, containsX);
+
+    // For dinucleotide matrices, recalculate non-canonical entries (indices 16+)
+    // by averaging the corresponding canonical entries
+    if (size >= 25 && matrixName.find("dinuc") != std::string::npos) {
+        recalcNonCanonicalDinuc(sm, size);
+    }
 
     // convert to short data type matrix
     for (int i = 0; i < size; i++){

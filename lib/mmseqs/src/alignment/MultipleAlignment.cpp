@@ -146,7 +146,7 @@ void MultipleAlignment::updateGapsInSequenceSet(char **msaSequence, size_t cente
                 if(bt.at(alnPos) == 'D'){
                     while (alnPos < bt.size() && bt.at(alnPos) == 'D') {
                         if(noDeletionMSA == false) {
-                            unsigned char letter = (reverse == true) ? Orf::complement(subMat->num2aa[edgeSeq[targetPos]]) :
+                            unsigned char letter = (reverse == true) ? subMat->num2aa[subMat->num2revcompnum[edgeSeq[targetPos]]] :
                                                                         subMat->num2aa[edgeSeq[targetPos]];
                             edgeSeqMSA[bufferPos] = letter;
                             bufferPos++;
@@ -161,7 +161,7 @@ void MultipleAlignment::updateGapsInSequenceSet(char **msaSequence, size_t cente
                         bufferPos++;
                         queryPos++;
                     } else if(bt.at(alnPos) == 'M'){
-                        unsigned char letter = (reverse == true) ? Orf::complement(subMat->num2aa[edgeSeq[targetPos]]) :
+                        unsigned char letter = (reverse == true) ? subMat->num2aa[subMat->num2revcompnum[edgeSeq[targetPos]]] :
                                                 subMat->num2aa[edgeSeq[targetPos]];
                         edgeSeqMSA[bufferPos] = letter;
                         bufferPos++;
@@ -179,7 +179,7 @@ void MultipleAlignment::updateGapsInSequenceSet(char **msaSequence, size_t cente
                         }
                     }
                     // M state
-                    unsigned char letter = (reverse == true) ? Orf::complement(subMat->num2aa[edgeSeq[targetPos]]) :
+                    unsigned char letter = (reverse == true) ? subMat->num2aa[subMat->num2revcompnum[edgeSeq[targetPos]]] :
                                            subMat->num2aa[edgeSeq[targetPos]];
                     edgeSeqMSA[bufferPos] = letter;
 
@@ -225,6 +225,10 @@ MultipleAlignment::MSAResult MultipleAlignment::computeMSA(Sequence *centerSeq, 
         for (size_t pos = 0; pos < centerSeqSize; ++pos) {
             msaSequence[k][pos] = (msaSequence[k][pos] == '-') ?
                                   GAP : static_cast<int>(subMat->aa2num[static_cast<int>(msaSequence[k][pos])]);
+            // If the msaSequence[k][pos] is non-canonical letters, change it to ANY
+            if (msaSequence[k][pos] > 15 && msaSequence[k][pos] < GAP) {
+                msaSequence[k][pos] = ANY;
+            }
         }
         int len = std::min(maxMsaSeqLen, (centerSeqSize + VECSIZE_INT*4));
         int startPos = std::min(centerSeqSize, maxMsaSeqLen - 1);

@@ -58,7 +58,13 @@ Prefiltering::Prefiltering(const std::string &queryDB,
     sameQTDB = isSameQTDB();
 
     // init the substitution matrices
-    switch (querySeqType & Parameters::DBTYPE_MASK) {
+    // If aux callbacks are registered (e.g. dinucleotide encoding), nucleotide DBs use amino acid alphabet for k-mer matching
+    int effectiveQueryType = querySeqType;
+    if (Sequence::getAuxInfo(querySeqType) != NULL
+        && Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES)) {
+        effectiveQueryType = Parameters::DBTYPE_AMINO_ACIDS;
+    }
+    switch (effectiveQueryType & Parameters::DBTYPE_MASK) {
         case Parameters::DBTYPE_NUCLEOTIDES:
             kmerSubMat = getSubstitutionMatrix(scoringMatrixFile, par.alphabetSize, 1.0, false, true);
             ungappedSubMat = kmerSubMat;

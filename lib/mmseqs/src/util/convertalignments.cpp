@@ -246,6 +246,8 @@ int convertalignments(int argc, const char **argv, const Command &command) {
     EvalueComputation *evaluer = NULL;
     bool queryProfile = false;
     bool targetProfile = false;
+    const Sequence::SeqAuxInfo *auxInfo = needSequenceDB ? Sequence::getAuxInfo(tDbr->sequenceReader->getDbtype()) : NULL;
+    const unsigned char *num2outputnum = (auxInfo != NULL) ? auxInfo->num2outputnum : NULL;
     if (needSequenceDB) {
         queryProfile = Parameters::isEqualDbtype(qDbr.sequenceReader->getDbtype(), Parameters::DBTYPE_HMM_PROFILE);
         targetProfile = Parameters::isEqualDbtype(tDbr->sequenceReader->getDbtype(), Parameters::DBTYPE_HMM_PROFILE);
@@ -552,6 +554,10 @@ int convertalignments(int argc, const char **argv, const Command &command) {
                                     case Parameters::OUTFMT_TSEQ:
                                         if (targetProfile) {
                                             result.append(targetProfData.c_str(), res.dbLen);
+                                        } else if (num2outputnum != NULL) {
+                                            for (int pos = 0; pos < res.dbLen; pos++) {
+                                                result.push_back(subMat->num2aa[num2outputnum[subMat->aa2num[(unsigned char)targetSeqData[pos]]]]);
+                                            }
                                         } else {
                                             result.append(targetSeqData, res.dbLen);
                                         }

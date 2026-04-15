@@ -8,6 +8,7 @@
 #include "DBConcat.h"
 #include "HeaderSummarizer.h"
 #include "CompressedA3M.h"
+#include "Sequence.h"
 
 #ifdef OPENMP
 #include <omp.h>
@@ -141,6 +142,9 @@ int result2msa(int argc, const char **argv, const Command &command) {
     Debug(Debug::INFO) << "Query database size: " << qDbr->getSize() << " type: " << qDbr->getDbTypeName() << "\n";
     Debug(Debug::INFO) << "Target database size: " << tDbr->getSize() << " type: " << tDbr->getDbTypeName() << "\n";
 
+    const Sequence::SeqAuxInfo *auxInfo = Sequence::getAuxInfo(tDbr->getDbtype());
+    const unsigned char *num2outputnum = (auxInfo != NULL) ? auxInfo->num2outputnum : NULL;
+
     const bool isFiltering = par.filterMsa != 0;
     Debug::Progress progress(dbSize - dbFrom);
 #pragma omp parallel num_threads(localThreads)
@@ -259,6 +263,18 @@ int result2msa(int argc, const char **argv, const Command &command) {
 
             MultipleAlignment::MSAResult res = aligner.computeMSA(&centerSequence, seqSet, alnResults, !par.allowDeletion);
             //MultipleAlignment::print(res, &subMat);
+
+            // Remap internal encoding to output encoding (e.g. dinucleotide -> nucleotide)
+            if (num2outputnum != NULL) {
+                for (size_t k = 0; k < res.setSize; k++) {
+                    for (size_t pos = 0; pos < res.centerLength; pos++) {
+                        char aa = res.msaSequence[k][pos];
+                        if (aa < MultipleAlignment::GAP) {
+                            res.msaSequence[k][pos] = num2outputnum[(unsigned char)aa];
+                        }
+                    }
+                }
+            }
 
             if (par.msaFormatMode == Parameters::FORMAT_MSA_FASTADB || par.msaFormatMode == Parameters::FORMAT_MSA_FASTADB_SUMMARY) {
                 if (isFiltering) {
@@ -462,7 +478,8 @@ int result2msa(int argc, const char **argv, const Command &command) {
 
                             // add lower case deletions
                             while(btPos < bt.size() && bt[btPos] == 'D') {
-                                result.push_back(tolower(subMat.num2aa[seq[seqStartPos+seqPos]]));
+                                unsigned char aa = seq[seqStartPos+seqPos];
+                                result.push_back(tolower(subMat.num2aa[num2outputnum ? num2outputnum[aa] : aa]));
                                 btPos++;
                                 seqPos++;
                             }

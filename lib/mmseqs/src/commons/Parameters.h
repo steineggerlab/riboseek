@@ -93,7 +93,10 @@ public:
     static const unsigned int DBTYPE_EXTENDED_CONTEXT_PSEUDO_COUNTS = 4;
     static const unsigned int DBTYPE_EXTENDED_GPU = 8;
     static const unsigned int DBTYPE_EXTENDED_SET = 16;
-
+    // Data on disk is raw sequence (not PSSM), profile built on-the-fly from submat
+    static const unsigned int DBTYPE_EXTENDED_SRC_SEQUENCE = 32;
+    // Dinucleotide RNA database (riboseek): signals RNA-corrected E-value computation
+    static const unsigned int DBTYPE_EXTENDED_DINUCLEOTIDE = 64;
     // don't forget to add new database types to DBReader::getDbTypeName and Parameters::PARAM_OUTPUT_DBTYPE
 
     static const int LINCLUST_VERSION1 = 1;

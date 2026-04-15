@@ -198,7 +198,8 @@ int offsetalignment(int argc, const char **argv, const Command &command) {
         Debug(Debug::ERROR) << "Please recreate your database or add a .dbtype file to your sequence/profile database.\n";
         return EXIT_FAILURE;
     }
-    const bool queryNucl = Parameters::isEqualDbtype(queryDbType, Parameters::DBTYPE_NUCLEOTIDES);
+    // RNA dinucleotide search: query and target are always nucleotide-derived
+    const bool queryNucl = true;
     IndexReader *qSourceDbr = NULL;
     if (queryNucl) {
         qSourceDbr = new IndexReader(par.db1.c_str(), par.threads, IndexReader::SRC_SEQUENCES, (touch) ? (IndexReader::PRELOAD_INDEX) : 0, DBReader<unsigned int>::USE_INDEX);
@@ -216,7 +217,7 @@ int offsetalignment(int argc, const char **argv, const Command &command) {
         Debug(Debug::ERROR) << "Please recreate your database or add a .dbtype file to your sequence/profile database.\n";
         return EXIT_FAILURE;
     }
-    const bool targetNucl = Parameters::isEqualDbtype(targetDbType, Parameters::DBTYPE_NUCLEOTIDES);
+    const bool targetNucl = true;
     IndexReader *tSourceDbr = NULL;
     bool isSameSrcDB = (par.db3.compare(par.db1) == 0);
     bool isNuclNuclSearch = false;

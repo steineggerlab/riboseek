@@ -12,10 +12,10 @@
 class MultipleAlignment {
 public:
     enum alignment_element {
-        ANY=20,   //number representing an X (any amino acid) internally
-        NAA=20,   //number of amino acids (0-19)
-        GAP=21,   //number representing a gap internally
-        ENDGAP=22 //number representing a ignored gaps (for some calculations like gap percentage)
+        ANY=24,   //number representing an X (any amino acid) internally
+        NAA=24,   //number of dinucleotides (0-23)
+        GAP=25,   //number representing a gap internally
+        ENDGAP=26 //number representing a ignored gaps (for some calculations like gap percentage)
     };
 
     struct MSAResult {

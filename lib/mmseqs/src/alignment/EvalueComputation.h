@@ -5,13 +5,21 @@
 #include "SubstitutionMatrix.h"
 #include "Util.h"
 #include "sls_alignment_evaluer.hpp"
+#include <cmath>
 
 class EvalueComputation {
 public:
-    EvalueComputation(size_t dbResCount, BaseMatrix *subMat) : dbResCount(dbResCount) {
+    EvalueComputation(size_t dbResCount, BaseMatrix *subMat)
+        : dbResCount(dbResCount), bothStrands(false), useRnaCorrection(false) {
         init(subMat, 0, 0, false);
     }
-    EvalueComputation(size_t dbResCount, BaseMatrix *subMat, int gapOpen, int gapExtend) : dbResCount(dbResCount) {
+    EvalueComputation(size_t dbResCount, BaseMatrix *subMat, int gapOpen, int gapExtend)
+        : dbResCount(dbResCount), bothStrands(false), useRnaCorrection(false) {
+        init(subMat, gapOpen, gapExtend, true);
+    }
+    EvalueComputation(size_t dbResCount, BaseMatrix *subMat, int gapOpen, int gapExtend,
+                      bool bothStrands, bool useRnaCorrection)
+        : dbResCount(dbResCount), bothStrands(bothStrands), useRnaCorrection(useRnaCorrection) {
         init(subMat, gapOpen, gapExtend, true);
     }
 
@@ -35,7 +43,10 @@ public:
 
     inline double computeEvalue(double score, double seqLength) {
         const double epa = evaluer.evaluePerArea( score );
-        const double a = area( score, seqLength );
+        const double a = area( score, seqLength ) * (bothStrands ? 2.0 : 1.0);
+        if (useRnaCorrection) {
+            return 0.0382461572658595 * std::pow(epa * a, 0.8283631544068919);
+        }
         return epa * a;
     }
 
@@ -73,6 +84,12 @@ private:
                                                        30.455610143099914211, -622.28684628915891608,
                                                        29.602444874818868215, -601.81087985041381216}},
                 {"blosum62.out", 0,  0, false, {0.3207378152604042354,  0.13904657125294345166,
+                                                       0.76221128839920349041, 0,
+                                                       0.76221128839920349041, 0,
+                                                       4.5269915477182944841,  0,
+                                                       4.5269915477182944841,  0,
+                                                       4.5269915477182944841,  0}},
+                {"dinuc.out", 23, 1, true, {0.18542241, 36.332014,
                                                        0.76221128839920349041, 0,
                                                        0.76221128839920349041, 0,
                                                        4.5269915477182944841,  0,
@@ -159,6 +176,8 @@ private:
 
     Sls::AlignmentEvaluer evaluer;
     const size_t dbResCount;
+    const bool bothStrands;
+    const bool useRnaCorrection;
     double logK;
 
     struct EvalueParameters {

@@ -18,7 +18,13 @@ void Sequence::registerAuxSplit(unsigned int extFlag,
                                 const unsigned char *aux,
                                 const unsigned char *matData,
                                 unsigned int matDataLen,
-                                unsigned int auxAlphabetSize) {
+                                unsigned int auxAlphabetSize,
+                                MapSequenceFn mapSequenceFn,
+                                MapSequenceFn mapSequenceReverseFn,
+                                MapProfileFn mapProfileFn,
+                                ReverseComplementFn reverseComplementFn,
+                                SetupMatrixFn setupMatrixFn,
+                                const unsigned char *num2outputnum) {
     SeqAuxInfo info;
     info.extFlag = extFlag;
     info.primaryRemap = primary;
@@ -26,6 +32,12 @@ void Sequence::registerAuxSplit(unsigned int extFlag,
     info.auxMatData = matData;
     info.auxMatDataLen = matDataLen;
     info.auxAlphabetSize = auxAlphabetSize;
+    info.mapSequenceFn = mapSequenceFn;
+    info.mapSequenceReverseFn = mapSequenceReverseFn;
+    info.mapProfileFn = mapProfileFn;
+    info.reverseComplementFn = reverseComplementFn;
+    info.setupMatrixFn = setupMatrixFn;
+    info.num2outputnum = num2outputnum;
     auxRegistry.push_back(info);
 }
 
@@ -94,7 +106,8 @@ Sequence::Sequence(size_t maxLen, int seqType, const BaseMatrix *subMat, const u
     }
 
     // init memory for profile search
-    if (Parameters::isEqualDbtype(seqType, Parameters::DBTYPE_HMM_PROFILE)) {
+    hasProfileData = Parameters::isEqualDbtype(seqType, Parameters::DBTYPE_HMM_PROFILE);
+    if (hasProfileData) {
         // setup memory for profiles
         profile_row_size = (size_t) PROFILE_AA_SIZE / (VECSIZE_INT*4); //
         profile_row_size = (profile_row_size+1) * (VECSIZE_INT*4); // for SIMD memory alignment
@@ -136,7 +149,7 @@ Sequence::~Sequence() {
     if (aaPosInSpacedPattern){
         delete[] aaPosInSpacedPattern;
     }
-    if (Parameters::isEqualDbtype(seqType, Parameters::DBTYPE_HMM_PROFILE)) {
+    if (hasProfileData) {
         for (size_t i = 0; i < kmerSize; ++i) {
             delete profile_matrix[i];
         }
@@ -252,13 +265,44 @@ void Sequence::mapSequence(size_t id, unsigned int dbKey, const char *sequence, 
     if (Parameters::isEqualDbtype(this->seqType, Parameters::DBTYPE_AMINO_ACIDS) || Parameters::isEqualDbtype(this->seqType, Parameters::DBTYPE_NUCLEOTIDES)) {
         mapSequence(sequence, seqLen);
     } else if (Parameters::isEqualDbtype(this->seqType, Parameters::DBTYPE_HMM_PROFILE)) {
-        mapProfile(sequence, seqLen);
+        const SeqAuxInfo *aux = getAuxInfo(this->seqType);
+        if (aux != NULL && aux->mapProfileFn != NULL) {
+            aux->mapProfileFn(this, sequence, seqLen);
+        } else {
+            mapProfile(sequence, seqLen);
+        }
     } else {
         Debug(Debug::ERROR) << "Invalid sequence type!\n";
         EXIT(EXIT_FAILURE);
     }
     currItPos = -1;
 
+}
+
+void Sequence::mapSequenceReverse(size_t id, unsigned int dbKey, const char *sequence, unsigned int seqLen) {
+    this->id = id;
+    this->dbKey = dbKey;
+    this->seqData = sequence;
+    if (Parameters::isEqualDbtype(this->seqType, Parameters::DBTYPE_AMINO_ACIDS) || Parameters::isEqualDbtype(this->seqType, Parameters::DBTYPE_NUCLEOTIDES)) {
+        if (seqLen >= maxLen) {
+            numSequence = static_cast<unsigned char*>(realloc(numSequence, seqLen + 1));
+            if (numSequenceAux != NULL) {
+                numSequenceAux = static_cast<unsigned char*>(realloc(numSequenceAux, seqLen + 1));
+            }
+            maxLen = seqLen;
+        }
+        const SeqAuxInfo *aux = getAuxInfo(this->seqType);
+        if (aux != NULL && aux->mapSequenceReverseFn != NULL) {
+            aux->mapSequenceReverseFn(this, sequence, seqLen);
+        } else {
+            // Fallback: use forward encoding
+            mapSequence(sequence, seqLen);
+        }
+    } else {
+        Debug(Debug::ERROR) << "mapSequenceReverse only supports sequence types!\n";
+        EXIT(EXIT_FAILURE);
+    }
+    currItPos = -1;
 }
 
 void Sequence::mapSequence(size_t id, unsigned int dbKey, std::pair<const unsigned char *,const unsigned int> data){
@@ -365,10 +409,28 @@ void Sequence::nextProfileKmer() {
 }
 
 bool Sequence::kmerWindowContainsX() const {
-    const simd_int xVec = simdi8_set(subMat->aa2num[static_cast<int>('X')]);
+    const simd_int xChar = simdi8_set(subMat->aa2num[static_cast<int>('X')]);
+    const simd_int tChar = simdi8_set(subMat->aa2num[static_cast<int>('T')]);
+    const simd_int vChar = simdi8_set(subMat->aa2num[static_cast<int>('V')]);
+    const simd_int wChar = simdi8_set(subMat->aa2num[static_cast<int>('W')]);
+    const simd_int yChar = simdi8_set(subMat->aa2num[static_cast<int>('Y')]);
+    const simd_int bChar = simdi8_set(subMat->aa2num[static_cast<int>('B')]);
+    const simd_int jChar = simdi8_set(subMat->aa2num[static_cast<int>('J')]);
+    const simd_int oChar = simdi8_set(subMat->aa2num[static_cast<int>('O')]);
+    const simd_int uChar = simdi8_set(subMat->aa2num[static_cast<int>('U')]);
     const simd_int *simdKmer = reinterpret_cast<const simd_int *>(kmerWindow);
     for (unsigned int pos = 0; pos < simdKmerRegisterCnt; pos++) {
-        if (simd_any(simdi8_eq(simdi_load(simdKmer + pos), xVec))) {
+        simd_int kmer = simdi_load(simdKmer + pos);
+        simd_int match = simdi8_eq(kmer, xChar);
+        match = simdi_or(match, simdi8_eq(kmer, tChar));
+        match = simdi_or(match, simdi8_eq(kmer, vChar));
+        match = simdi_or(match, simdi8_eq(kmer, wChar));
+        match = simdi_or(match, simdi8_eq(kmer, yChar));
+        match = simdi_or(match, simdi8_eq(kmer, bChar));
+        match = simdi_or(match, simdi8_eq(kmer, jChar));
+        match = simdi_or(match, simdi8_eq(kmer, oChar));
+        match = simdi_or(match, simdi8_eq(kmer, uChar));
+        if (simd_any(match)) {
             return true;
         }
     }
@@ -383,7 +445,10 @@ void Sequence::mapSequence(const char * sequence, unsigned int dataLen){
         }
         maxLen = dataLen;
     }
-    if (activePrimaryRemap != NULL) {
+    const SeqAuxInfo *aux = getAuxInfo(this->seqType);
+    if (aux != NULL && aux->mapSequenceFn != NULL) {
+        aux->mapSequenceFn(this, sequence, dataLen);
+    } else if (activePrimaryRemap != NULL) {
         for (unsigned int i = 0; i < dataLen; i++) {
             unsigned char raw = static_cast<unsigned char>(sequence[i]);
             numSequence[i] = activePrimaryRemap[raw];
@@ -394,6 +459,7 @@ void Sequence::mapSequence(const char * sequence, unsigned int dataLen){
                 numSequenceAux[i] = activeAuxRemap[raw];
             }
         }
+        this->L = dataLen;
     } else {
         const unsigned char* lookup = subMat->aa2num;  // local pointer for speed
         unsigned int i = 0;
@@ -406,8 +472,8 @@ void Sequence::mapSequence(const char * sequence, unsigned int dataLen){
         for (; i < dataLen; i++) {
             numSequence[i]   = lookup[(unsigned char)sequence[i]];
         }
+        this->L = dataLen;
     }
-    this->L = dataLen;
 }
 
 void Sequence::printPSSM(){

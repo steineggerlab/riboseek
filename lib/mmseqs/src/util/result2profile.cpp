@@ -9,6 +9,7 @@
 #include "tantan.h"
 #include "IndexReader.h"
 #include "Masker.h"
+#include "Sequence.h"
 
 #ifdef OPENMP
 #include <omp.h>
@@ -124,7 +125,10 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
 
     // adjust score of each match state by -0.2 to trim alignment
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, -0.2f);
-    EvalueComputation evalueComputation(tDbr->getAminoAcidDBSize(), &subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid());
+    const bool isDinuc = (DBReader<unsigned int>::getExtendedDbtype(targetDbtype) & Parameters::DBTYPE_EXTENDED_DINUCLEOTIDE) != 0;
+    EvalueComputation evalueComputation(tDbr->getAminoAcidDBSize(), &subMat,
+                                        par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(),
+                                        isDinuc && (par.strand == 2), isDinuc);
 
     if (qDbr->getDbtype() == -1 || targetSeqType == -1) {
         Debug(Debug::ERROR) << "Please recreate your database or add a .dbtype file to your sequence/profile database\n";
@@ -137,6 +141,10 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
 
     Debug(Debug::INFO) << "Query database size: " << qDbr->getSize() << " type: " << qDbr->getDbTypeName() << "\n";
     Debug(Debug::INFO) << "Target database size: " << tDbr->getSize() << " type: " << Parameters::getDbTypeName(targetSeqType) << "\n";
+
+    const Sequence::SeqAuxInfo *auxInfo = Sequence::getAuxInfo(targetSeqType);
+    const unsigned int canonicalAlphabetSize = (auxInfo != NULL && auxInfo->auxAlphabetSize > 0) ? auxInfo->auxAlphabetSize : 0;
+    const bool hasReverseMap = (auxInfo != NULL && auxInfo->mapSequenceReverseFn != NULL);
 
     const bool isFiltering = par.filterMsa != 0 || returnAlnRes;
     Debug::Progress progress(dbSize - dbFrom);
@@ -218,12 +226,22 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
                         Debug(Debug::ERROR) << "Sequence " << key << " does not exist in target sequence database\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    edgeSequence.mapSequence(edgeId, key, tDbr->getData(edgeId, thread_idx), tDbr->getSeqLen(edgeId));
-                    seqSet.emplace_back(std::vector<unsigned char>(edgeSequence.numSequence, edgeSequence.numSequence + edgeSequence.L));
 
+                    // Parse alignment first to determine strand (reverse if qStartPos > qEndPos)
+                    bool isReverse = false;
                     if (columns > Matcher::ALN_RES_WITHOUT_BT_COL_CNT) {
                         alnResults.emplace_back(Matcher::parseAlignmentRecord(data));
+                        isReverse = hasReverseMap && (alnResults.back().qStartPos > alnResults.back().qEndPos);
+                    }
+
+                    if (isReverse) {
+                        edgeSequence.mapSequenceReverse(edgeId, key, tDbr->getData(edgeId, thread_idx), tDbr->getSeqLen(edgeId));
                     } else {
+                        edgeSequence.mapSequence(edgeId, key, tDbr->getData(edgeId, thread_idx), tDbr->getSeqLen(edgeId));
+                    }
+                    seqSet.emplace_back(std::vector<unsigned char>(edgeSequence.numSequence, edgeSequence.numSequence + edgeSequence.L));
+
+                    if (columns <= Matcher::ALN_RES_WITHOUT_BT_COL_CNT) {
                         // Recompute if not all the backtraces are present
                         if (isQueryInit == false) {
                             matcher.initQuery(&centerSequence);
@@ -238,13 +256,35 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
             // Recompute if not all the backtraces are present
             MultipleAlignment::MSAResult res = aligner.computeMSA(&centerSequence, seqSet, alnResults, true);
 
+            if (queryKey == 0) {
+                FILE *f = fopen("/tmp/riboseek_msa.txt", "a");
+                if (f) {
+                    fprintf(f, "RBS qkey=%u setSize=%zu centerLen=%zu\n", queryKey, res.setSize, res.centerLength);
+                    for (size_t r = 0; r < res.setSize && r < 10; r++) {
+                        fprintf(f, "  row=%zu |", r);
+                        for (size_t pos = 0; pos < res.centerLength && pos < 80; pos++) {
+                            fprintf(f, " %02x", (unsigned char)res.msaSequence[r][pos]);
+                        }
+                        fprintf(f, "\n");
+                    }
+                    fclose(f);
+                }
+            }
+
+            for (size_t i = 0; i < res.setSize; i++) {
+                for (size_t pos = 0; pos < res.centerLength; pos++) {
+                    if (res.msaSequence[i][pos] != MultipleAlignment::GAP
+                        && res.msaSequence[i][pos] >= canonicalAlphabetSize) {
+                        res.msaSequence[i][pos] = MultipleAlignment::ANY;
+                    }
+                }
+            }
+
             // do not count query
             size_t filteredSetSize = (isFiltering == true)  ?
                                      filter.filter(res, alnResults, (int)(par.covMSAThr * 100), qid_vec, par.qsc, (int)(par.filterMaxSeqId * 100), par.Ndiff, par.filterMinEnable)
                                      :
                                      res.setSize;
-             //MultipleAlignment::print(res, &subMat);
-
             if (returnAlnRes) {
                 for (size_t i = 0; i < (filteredSetSize - 1); ++i) {
                     size_t len = Matcher::resultToBuffer(buffer, alnResults[i], true);
@@ -280,7 +320,7 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
                         masker.maskPssm(centerSequence, par.maskProb, pssmRes);
                     }
                     pssmRes.toBuffer(centerSequence, subMat, result);
-                } 
+                }
             }
             resultWriter.writeData(result.c_str(), result.length(), queryKey, thread_idx, writePlain == false);
             result.clear();

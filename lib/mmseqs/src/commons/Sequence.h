@@ -84,6 +84,9 @@ public:
     // Map char -> int
     void mapSequence(size_t id, unsigned int dbKey, const char *seq, unsigned int seqLen);
 
+    // Map char -> int with reverse encoding (X sentinel at beginning instead of end)
+    void mapSequenceReverse(size_t id, unsigned int dbKey, const char *seq, unsigned int seqLen);
+
     // map sequence from SequenceLookup
     void mapSequence(size_t id, unsigned int dbKey, std::pair<const unsigned char *, const unsigned int> data);
 
@@ -456,9 +459,9 @@ public:
 #endif
     // const size_t PROFILE_ROW_SIZE = (((size_t) PROFILE_AA_SIZE / (VECSIZE_INT * 4)) + 1) * (VECSIZE_INT * 4);
     size_t profile_row_size;
-    static const size_t PROFILE_AA_SIZE = 20;
-    static const size_t PROFILE_CONSENSUS = 21;     // new
-    static const size_t PROFILE_NEFF = 22;          // new
+    static const size_t PROFILE_AA_SIZE = 24;
+    static const size_t PROFILE_CONSENSUS = 25;     // new
+    static const size_t PROFILE_NEFF = 26;          // new
 #ifdef GAP_POS_SCORING
     static const size_t PROFILE_GAP_DEL = 23;       // new
     static const size_t PROFILE_GAP_INS = 24;       // new
@@ -466,8 +469,8 @@ public:
     static const size_t PROFILE_GAP_RESERVED1 = 23;
     static const size_t PROFILE_GAP_RESERVED2 = 24;
 #endif
-    // 20 AA, 1 query, 1 consensus, 1 Neff M, 2 gap penalties
-    static const size_t PROFILE_READIN_SIZE = 25;
+    // 24 AA, 1 query, 1 consensus, 1 Neff M
+    static const size_t PROFILE_READIN_SIZE = 27;
     ScoreMatrix **profile_matrix;
     // Memory layout of this profile is qL * AA
     //   Query length
@@ -532,14 +535,29 @@ public:
         return userSpacedKmerPattern;
     }
 
-    // Static registry for downstream projects (e.g. Foldseek)
+    // Callback type for custom sequence encoding (e.g., dinucleotide)
+    // Receives Sequence* for full access to public fields (numSequence, L, profile_score, etc.)
+    typedef void (*MapSequenceFn)(Sequence *seq, const char *sequence, unsigned int dataLen);
+    // Callback for custom profile reading/remapping (e.g., dinucleotide remap)
+    typedef void (*MapProfileFn)(Sequence *seq, const char *profileData, unsigned int seqLen);
+    typedef void (*ReverseComplementFn)(unsigned char *numSequence, unsigned int L,
+                                        const BaseMatrix *subMat);
+    typedef void (*SetupMatrixFn)(BaseMatrix *mat);
+
+    // Static registry for downstream projects (e.g., Riboseek, Foldseek)
     struct SeqAuxInfo {
         unsigned int extFlag;
-        const unsigned char *primaryRemap;   // 256-entry: raw byte -> primary numeric value
-        const unsigned char *auxRemap;       // 256-entry: raw byte -> aux numeric value
-        const unsigned char *auxMatData;     // embedded substitution matrix data
-        unsigned int auxMatDataLen;          // length of embedded matrix data
-        unsigned int auxAlphabetSize;        // number of states in aux alphabet (e.g. 12)
+        const unsigned char *primaryRemap;
+        const unsigned char *auxRemap;
+        const unsigned char *auxMatData;
+        unsigned int auxMatDataLen;
+        unsigned int auxAlphabetSize;
+        MapSequenceFn mapSequenceFn;
+        MapSequenceFn mapSequenceReverseFn;
+        MapProfileFn mapProfileFn;
+        ReverseComplementFn reverseComplementFn;
+        SetupMatrixFn setupMatrixFn;
+        const unsigned char *num2outputnum;
     };
     static std::vector<SeqAuxInfo> auxRegistry;
     static void registerAuxSplit(unsigned int extFlag,
@@ -547,7 +565,13 @@ public:
                                  const unsigned char *aux,
                                  const unsigned char *matData,
                                  unsigned int matDataLen,
-                                 unsigned int auxAlphabetSize);
+                                 unsigned int auxAlphabetSize,
+                                 MapSequenceFn mapSequenceFn = NULL,
+                                 MapSequenceFn mapSequenceReverseFn = NULL,
+                                 MapProfileFn mapProfileFn = NULL,
+                                 ReverseComplementFn reverseComplementFn = NULL,
+                                 SetupMatrixFn setupMatrixFn = NULL,
+                                 const unsigned char *num2outputnum = NULL);
     static const SeqAuxInfo* getAuxInfo(int seqType);
 
     // Per-instance remap pointers (NULL if no remap active)
@@ -599,6 +623,9 @@ private:
 
     // bias correction in profiles
     bool aaBiasCorrection;
+
+    // true if profile arrays (profile_score, profile_for_alignment, etc.) are allocated
+    bool hasProfileData;
 
     // spaced pattern
     bool spaced;

@@ -133,7 +133,7 @@ private:
     EvalueComputation * evaluer;
     
     const char* querySeq;
-    const unsigned char * queryNumSeq;
+    unsigned char * queryNumSeq;
     int queryLength;
     int querySeqType;
     int16_t* queryCompBias;

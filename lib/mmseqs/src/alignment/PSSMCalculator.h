@@ -70,7 +70,7 @@ public:
     //     Both PPMs assume statistical independence between positions in the pattern
     // 2.) PSSM Log odds score
     //     M_{aa,pos}={log(M_{aa,pos} / b_{aa}).
-    static void computeLogPSSM(BaseMatrix *subMat, char *pssm, const float *profile, float bitFactor, size_t queryLength, float scoreBias);
+    static void computeLogPSSM(BaseMatrix *subMat, char *pssm, const float *profile, float bitFactor, size_t queryLength, float scoreBias, size_t canonicalSize = 0);
 
 private:
     BaseMatrix* subMat;
@@ -144,6 +144,11 @@ private:
 
     size_t maxSeqLength;
     size_t maxSetSize;
+
+    // For dinucleotide alphabets (alphabetSize > 21), only the first 16 indices
+    // are canonical dinucleotides; indices 16-23 are non-canonical (sentinels).
+    // For standard amino acids, all 20 are canonical.
+    size_t canonicalSize;
 
     // compute the Neff_M per column -p log(p)
     void computeNeff_M(float *frequency, float *seqWeight, float *Neff_M, size_t queryLength, size_t setSize, char const **msaSeqs);
