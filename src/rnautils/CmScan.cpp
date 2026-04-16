@@ -657,7 +657,7 @@ struct LogSumAccBase2T<false> {
     double scaledSum;
     bool has;
 
-    LogSumAccBase2T<false>() : maxVal(NEG_INF), scaledSum(0.0), has(false) {}
+    LogSumAccBase2T() : maxVal(NEG_INF), scaledSum(0.0), has(false) {}
 
     inline void add(double x) {
         if (!has) {
@@ -691,7 +691,7 @@ struct LogSumAccBase2T<true> {
     float maxVal;
     bool has;
 
-    LogSumAccBase2T<true>() : maxVal(-std::numeric_limits<float>::infinity()), has(false) {}
+    LogSumAccBase2T() : maxVal(-std::numeric_limits<float>::infinity()), has(false) {}
 
     inline void add(double x) {
         const float xf = static_cast<float>(x);
