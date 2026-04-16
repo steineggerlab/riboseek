@@ -1,0 +1,251 @@
+name: Build & upload binaries
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/README.md'
+  workflow_dispatch:
+
+env:
+  regression: 1
+
+jobs:
+  build_macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust Toolchain
+        run: |
+          rustup update
+          rustup target install x86_64-apple-darwin
+          rustup target install aarch64-apple-darwin
+
+      - name: Build
+        run: |
+          cd ${{ github.workspace }}
+          ./lib/mmseqs/util/build_osx.sh . build riboseek
+
+      - name: Run Regression Suite
+        if: ${{ env.regression == 1 }}
+        run: |
+          ${{ github.workspace }}/regression/run_regression.sh ${{ github.workspace }}/build/riboseek ${{ github.workspace }}/scratch
+
+      - name: Upload MacOS Universal
+        uses: actions/upload-artifact@v4
+        with:
+          name: riboseek-darwin-universal
+          path: ${{ github.workspace }}/build/riboseek
+
+  build_ubuntu:
+    name: Build Ubuntu
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - SIMD: AVX2
+            STATIC: 1
+            MPI: 0
+            BUILD_TYPE: RelWithDebInfo
+          - SIMD: SSE4_1
+            STATIC: 1
+            MPI: 0
+            BUILD_TYPE: RelWithDebInfo
+          - SIMD: AVX2
+            STATIC: 0
+            MPI: 0
+            BUILD_TYPE: ASan
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install G++
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-12 g++-12 rustc cargo libgcc-12-dev build-essential cmake
+
+      - name: Install Dependencies
+        if: matrix.MPI == 1
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install mpi-default-dev mpi-default-bin
+
+      - name: Build riboseek
+        run: |
+          mkdir build
+          cd build
+          export CC=gcc-12
+          export CXX=g++-12
+          if [ "${{ matrix.STATIC }}" -eq "1" ]; then
+              LIBGOMP=/usr/lib/gcc/x86_64-linux-gnu/12
+              cmake \
+                -DHAVE_SANITIZER=1 -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -DHAVE_TESTS=1 \
+                -DFORCE_STATIC_DEPS=1 \
+                -DOpenMP_C_FLAGS="-fopenmp -I${LIBGOMP}" -DOpenMP_C_LIB_NAMES=gomp -DOpenMP_CXX_FLAGS="-fopenmp -I${LIBGOMP}" -DOpenMP_CXX_LIB_NAMES=gomp -DOpenMP_gomp_LIBRARY=${LIBGOMP}/libgomp.a \
+                -DENABLE_WERROR=1 -DHAVE_${{ matrix.SIMD }}=1 -DHAVE_MPI=${{ matrix.MPI }} ..
+          else
+              cmake \
+                -DHAVE_SANITIZER=1 -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -DHAVE_TESTS=1 \
+                -DENABLE_WERROR=1 -DHAVE_${{ matrix.SIMD }}=1 -DHAVE_MPI=${{ matrix.MPI }} ..
+          fi
+          make -j $(nproc --all)
+
+      - name: Run Regression Suite
+        if: ${{ env.regression == 1 }}
+        run: |
+          export TTY=0
+          ${{ github.workspace }}/util/regression/run_regression.sh ${{ github.workspace }}/build/src/riboseek ${{ github.workspace }}/regression
+
+      - name: Upload Linux
+        if: matrix.STATIC == 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: riboseek-linux-${{ matrix.SIMD }}
+          path: build/src/riboseek
+
+  build_ubuntu_cross:
+    name: Ubuntu Cross-Compile
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        include:
+          - SIMD: ARM8
+            ARCH: arm64
+            CPREF: aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Toolchain
+        run: |
+          sudo dpkg --add-architecture ${{ matrix.ARCH }}
+          cat << HEREDOC | sudo tee /etc/apt/sources.list
+          deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu/ jammy main universe multiverse
+          deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu/ jammy-updates main universe multiverse
+          deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu/ jammy-backports main universe multiverse
+          deb [arch=amd64,i386] http://security.ubuntu.com/ubuntu/ jammy-security main universe multiverse
+          deb [arch=${{ matrix.ARCH }}] http://ports.ubuntu.com/ubuntu-ports/ jammy main universe multiverse
+          deb [arch=${{ matrix.ARCH }}] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe multiverse
+          deb [arch=${{ matrix.ARCH }}] http://ports.ubuntu.com/ubuntu-ports/ jammy-backports main universe multiverse
+          deb [arch=${{ matrix.ARCH }}] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main universe multiverse
+          HEREDOC
+          sudo apt-get update
+          sudo apt-get -y install -o APT::Immediate-Configure=false \
+            cmake crossbuild-essential-${{ matrix.ARCH }} zlib1g-dev:${{ matrix.ARCH }} libbz2-dev:${{ matrix.ARCH }} \
+            gcc-12-${{ matrix.CPREF }}-linux-gnu g++-12-${{ matrix.CPREF }}-linux-gnu
+          rustup target add ${{ matrix.CPREF }}-unknown-linux-gnu
+
+      - name: Build Cross
+        run: |
+          mkdir build && cd build
+          export CC=${{ matrix.CPREF }}-linux-gnu-gcc-12
+          export CXX=${{ matrix.CPREF }}-linux-gnu-g++-12
+          export LIBGOMP=/usr/lib/gcc-cross/${{ matrix.CPREF }}-linux-gnu/12
+          cmake \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DHAVE_TESTS=1 \
+            -DFORCE_STATIC_DEPS=1 \
+            -DOpenMP_C_FLAGS="-fopenmp -I${LIBGOMP}" -DOpenMP_C_LIB_NAMES=gomp -DOpenMP_CXX_FLAGS="-fopenmp -I${LIBGOMP}" -DOpenMP_CXX_LIB_NAMES=gomp -DOpenMP_gomp_LIBRARY=${LIBGOMP}/libgomp.a \
+            -DRust_CARGO_TARGET=${{ matrix.CPREF }}-unknown-linux-gnu \
+            -DENABLE_WERROR=1 -DHAVE_${{ matrix.SIMD }}=1 ..
+          make -j $(nproc --all)
+
+      - name: Upload Linux Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: riboseek-linux-${{ matrix.SIMD }}
+          path: build/src/riboseek
+
+  upload_artifacts:
+    name: Upload Artifacts
+    runs-on: ubuntu-latest
+    needs: [build_macos, build_ubuntu, build_ubuntu_cross]
+    # if: github.event_name != 'pull_request'
+    if: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Artifacts Directory
+        run: |
+          mkdir riboseek
+          cp -f README.md LICENSE.md riboseek
+          mkdir riboseek/bin
+
+      # MacOS
+      - name: Download riboseek-darwin-universal Artifact
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: riboseek-darwin-universal
+          path: riboseek/bin
+
+      - name: Archive Mac Binary
+        run: |
+          chmod +x riboseek/bin/riboseek
+          tar -czvf riboseek-osx-universal.tar.gz riboseek
+
+      # Linux SSE41
+      - name: Download riboseek-linux-SSE4_1 Artifact
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: riboseek-linux-SSE4_1
+          path: riboseek/bin
+
+      - name: Archive SSE4_1 Binary
+        run: |
+          chmod +x riboseek/bin/riboseek
+          tar -czvf riboseek-linux-sse41.tar.gz riboseek
+
+      # Linux AVX2
+      - name: Download riboseek-linux-AVX2 Artifact
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: riboseek-linux-AVX2
+          path: riboseek/bin
+
+      - name: Archive AVX2 Binary
+        run: |
+          chmod +x riboseek/bin/riboseek
+          tar -czvf riboseek-linux-avx2.tar.gz riboseek
+
+      # Linux ARM64
+      - name: Download riboseek-linux-ARM8 Artifact
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: riboseek-linux-ARM8
+          path: riboseek/bin
+
+      - name: Archive ARM8 Binary
+        run: |
+          chmod +x riboseek/bin/riboseek
+          tar -czvf riboseek-linux-arm64.tar.gz riboseek
+
+      - name: Get Deployment Key
+        run: |
+            mkdir -p $HOME/.ssh
+            echo "$PRIVATE_KEY" > $HOME/.ssh/id_rsa
+            chmod 700 $HOME/.ssh && chmod 600 $HOME/.ssh/id_rsa
+            ssh-keygen -f $HOME/.ssh/id_rsa -y > $HOME/.ssh/id_rsa.pub
+        env:
+          PRIVATE_KEY : ${{ secrets.PRIVATE_KEY }}
+
+      - name: Sign and Upload Artifacts
+        run: |
+          ssh-keygen -Y sign -f $HOME/.ssh/id_rsa -n file riboseek-osx-universal.tar.gz riboseek-linux-sse41.tar.gz riboseek-linux-avx2.tar.gz riboseek-linux-arm64.tar.gz
+          curl --retry 5 --retry-all-errors -X POST \
+            -F file[]=@riboseek-osx-universal.tar.gz -F signature[]=@riboseek-osx-universal.tar.gz.sig \
+            -F file[]=@riboseek-linux-sse41.tar.gz -F signature[]=@riboseek-linux-sse41.tar.gz.sig \
+            -F file[]=@riboseek-linux-avx2.tar.gz -F signature[]=@riboseek-linux-avx2.tar.gz.sig \
+            -F file[]=@riboseek-linux-arm64.tar.gz -F signature[]=@riboseek-linux-arm64.tar.gz.sig \
+            -F identifier="riboseek" -F directory="${{ github.sha }}" \
+              https://mmseqs.com/upload
