@@ -6,13 +6,11 @@ export DATADIR="${RESULTS}"
 QUERY="${EXAMPLEDIR}/QUERY.fasta"
 QUERYDB="${RESULTS}/query"
 "${RIBOSEEK}" createdb "${QUERY}" "${QUERYDB}"
-awk 'BEGIN { printf("%c%c%c%c",0,0,0,0); exit; }' > "${QUERYDB}.dbtype"
 
 TARGET="${EXAMPLEDIR}/DB.fasta"
 TARGETDB="${RESULTS}/target"
 "${RIBOSEEK}" createdb "${TARGET}" "${TARGETDB}"
-awk 'BEGIN { printf("%c%c%c%c",0,0,0,0); exit; }' > "${TARGETDB}.dbtype"
-"${RIBOSEEK}" search "${QUERYDB}" "${TARGETDB}" "${RESULTS}/results" "${RESULTS}/tmp"
+"${RIBOSEEK}" rnasearch "${QUERYDB}" "${TARGETDB}" "${RESULTS}/results" "${RESULTS}/tmp"
 
 "${RIBOSEEK}" convertalis "${QUERYDB}" "${TARGETDB}" "${RESULTS}/results" "${RESULTS}/results.m8"
 
