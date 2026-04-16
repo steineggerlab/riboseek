@@ -216,7 +216,7 @@ if (ARM)
 elseif (X86 OR X64)
     set(HMMER_IMPL_DIR ${INFERNAL_HMMER_SRC_DIR}/impl_sse)
 else ()
-    message(FATAL_ERROR "Unsupported architecture: neither ARM nor X64 is set")
+    message(FATAL_ERROR "Unsupported architecture: neither ARM nor X86/X64 is set")
 endif ()
 
 set(HMMER_IMPL_SRCS
@@ -235,7 +235,7 @@ set(HMMER_IMPL_SRCS
 )
 if (ARM)
     list(APPEND EASEL_SRCS ${INFERNAL_EASEL_DIR}/esl_neon.c)
-elseif (X64)
+elseif (X86 OR X64)
     list(APPEND EASEL_SRCS ${INFERNAL_EASEL_DIR}/esl_sse.c)
 endif ()
 
