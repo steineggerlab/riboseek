@@ -31,7 +31,7 @@ if (ENABLE_INFERNAL_BRIDGE)
 endif ()
 
 # ViennaRNA minimal library (lib/mmseqs has the source but doesn't build it)
-add_subdirectory(lib/ViennaRNA)
+# add_subdirectory(lib/ViennaRNA)
 
 add_subdirectory(data)
 add_subdirectory(src)
