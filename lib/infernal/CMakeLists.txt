@@ -1,15 +1,36 @@
 set(INFERNAL_SRC_DIR ${INFERNAL_ROOT}/src)
+set(INFERNAL_HMMER_DIR ${INFERNAL_ROOT}/hmmer)
 set(INFERNAL_HMMER_SRC_DIR ${INFERNAL_ROOT}/hmmer/src)
 set(INFERNAL_EASEL_DIR ${INFERNAL_ROOT}/easel)
+
+# out-of-source autoconf configure for hmmer+easel
+set(INFERNAL_CONFIGURE_DIR ${CMAKE_BINARY_DIR}/infernal-configure)
+
+if (NOT EXISTS ${INFERNAL_HMMER_DIR}/configure)
+    message(FATAL_ERROR "hmmer configure script not found at ${INFERNAL_HMMER_DIR}/configure")
+endif ()
+
+if (NOT EXISTS ${INFERNAL_CONFIGURE_DIR}/src/p7_config.h)
+    file(MAKE_DIRECTORY ${INFERNAL_CONFIGURE_DIR})
+    message(STATUS "Configuring hmmer out-of-source in ${INFERNAL_CONFIGURE_DIR}")
+    execute_process(
+            COMMAND ${INFERNAL_HMMER_DIR}/configure
+            WORKING_DIRECTORY ${INFERNAL_CONFIGURE_DIR}
+            RESULT_VARIABLE _configure_rc
+    )
+    if (NOT _configure_rc EQUAL 0)
+        message(FATAL_ERROR "./configure failed for hmmer (exit code ${_configure_rc})")
+    endif ()
+endif ()
 
 if (NOT EXISTS ${INFERNAL_SRC_DIR}/config.h)
     message(FATAL_ERROR "Infernal bridge requires generated ${INFERNAL_SRC_DIR}/config.h in INFERNAL_ROOT")
 endif ()
-if (NOT EXISTS ${INFERNAL_HMMER_SRC_DIR}/p7_config.h)
-    message(FATAL_ERROR "Infernal bridge requires generated ${INFERNAL_HMMER_SRC_DIR}/p7_config.h in INFERNAL_ROOT")
+if (NOT EXISTS ${INFERNAL_CONFIGURE_DIR}/src/p7_config.h)
+    message(FATAL_ERROR "hmmer configure did not produce ${INFERNAL_CONFIGURE_DIR}/src/p7_config.h")
 endif ()
-if (NOT EXISTS ${INFERNAL_EASEL_DIR}/esl_config.h)
-    message(FATAL_ERROR "Infernal bridge requires generated ${INFERNAL_EASEL_DIR}/esl_config.h in INFERNAL_ROOT")
+if (NOT EXISTS ${INFERNAL_CONFIGURE_DIR}/easel/esl_config.h)
+    message(FATAL_ERROR "hmmer configure did not produce ${INFERNAL_CONFIGURE_DIR}/easel/esl_config.h")
 endif ()
 
 find_package(Threads REQUIRED)
@@ -218,12 +239,17 @@ set(INFERNAL_CORE_SRCS
 
 add_library(infernal-vendor-easel STATIC ${EASEL_SRCS})
 target_compile_definitions(infernal-vendor-easel PRIVATE HAVE_CONFIG_H=1)
-target_include_directories(infernal-vendor-easel PRIVATE ${INFERNAL_EASEL_DIR})
+target_include_directories(infernal-vendor-easel PRIVATE
+        ${INFERNAL_CONFIGURE_DIR}/easel
+        ${INFERNAL_EASEL_DIR}
+)
 target_link_libraries(infernal-vendor-easel PUBLIC Threads::Threads m)
 
 add_library(infernal-vendor-hmmer STATIC ${HMMER_SRCS} ${HMMER_IMPL_SRCS})
 target_compile_definitions(infernal-vendor-hmmer PRIVATE HAVE_CONFIG_H=1)
 target_include_directories(infernal-vendor-hmmer PRIVATE
+        ${INFERNAL_CONFIGURE_DIR}/src
+        ${INFERNAL_CONFIGURE_DIR}/easel
         ${INFERNAL_HMMER_SRC_DIR}
         ${INFERNAL_HMMER_SRC_DIR}/impl_neon
         ${INFERNAL_EASEL_DIR}
@@ -233,6 +259,8 @@ target_link_libraries(infernal-vendor-hmmer PUBLIC infernal-vendor-easel Threads
 add_library(infernal-vendor-core STATIC ${INFERNAL_CORE_SRCS})
 target_compile_definitions(infernal-vendor-core PRIVATE HAVE_CONFIG_H=1)
 target_include_directories(infernal-vendor-core PRIVATE
+        ${INFERNAL_CONFIGURE_DIR}/src
+        ${INFERNAL_CONFIGURE_DIR}/easel
         ${INFERNAL_SRC_DIR}
         ${INFERNAL_HMMER_SRC_DIR}
         ${INFERNAL_EASEL_DIR}
@@ -254,7 +282,13 @@ set_source_files_properties(${INFERNAL_SRC_DIR}/cmcalibrate.c PROPERTIES
 target_compile_definitions(infernal-bridge PRIVATE HAVE_CONFIG_H=1)
 
 target_include_directories(infernal-bridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(infernal-bridge PRIVATE ${INFERNAL_SRC_DIR} ${INFERNAL_HMMER_SRC_DIR} ${INFERNAL_EASEL_DIR})
+target_include_directories(infernal-bridge PRIVATE
+        ${INFERNAL_CONFIGURE_DIR}/src
+        ${INFERNAL_CONFIGURE_DIR}/easel
+        ${INFERNAL_SRC_DIR}
+        ${INFERNAL_HMMER_SRC_DIR}
+        ${INFERNAL_EASEL_DIR}
+)
 
 target_link_libraries(infernal-bridge
         infernal-vendor-core
