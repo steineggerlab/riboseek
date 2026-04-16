@@ -213,7 +213,7 @@ set(HMMER_SRCS
 
 if (ARM)
     set(HMMER_IMPL_DIR ${INFERNAL_HMMER_SRC_DIR}/impl_neon)
-elseif (X64)
+elseif (X86 OR X64)
     set(HMMER_IMPL_DIR ${INFERNAL_HMMER_SRC_DIR}/impl_sse)
 else ()
     message(FATAL_ERROR "Unsupported architecture: neither ARM nor X64 is set")
