@@ -112,8 +112,8 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
         ori_target="$TARGETDB"
 
         if [ $cur -eq 2 ]; then
-            cp ${QUERYDB}.index ${QUERYDB}.index.tmp
-            awk '(FNR % 2 == 1)' ${QUERYDB}.index.tmp > ${QUERYDB}.index
+            cp "${QUERYDB}.index" "${QUERYDB}.index.tmp"
+            awk '(FNR % 2 == 1)' "${QUERYDB}.index.tmp" > "${QUERYDB}.index"
         fi
 
         PREF_TMP=""
@@ -152,10 +152,10 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
         fi
 
         if [ $cur -eq 2 ]; then
-            mv ${QUERYDB}.index.tmp ${QUERYDB}.index
+            mv "${QUERYDB}.index.tmp" "${QUERYDB}.index"
             # fake pref for reverse strands
-            awk 'BEGIN {OFS="\t"} {print;print $1+1, $2+$3-1, 0}' ${PREF_TMP}.index > ${PREF_TMP}.index.tmp
-            mv ${PREF_TMP}.index.tmp ${PREF_TMP}.index
+            awk 'BEGIN {OFS="\t"} {print;print $1+1, $2+$3-1, 0}' "${PREF_TMP}.index" > "${PREF_TMP}.index.tmp"
+            mv "${PREF_TMP}.index.tmp" "${PREF_TMP}.index"
         fi
 
         if [ "$STEP" -ge 1 ]; then
