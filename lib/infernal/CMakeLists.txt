@@ -11,10 +11,43 @@ if (NOT EXISTS ${INFERNAL_HMMER_DIR}/configure)
 endif ()
 
 if (NOT EXISTS ${INFERNAL_CONFIGURE_DIR}/src/p7_config.h)
+    # hmmer's configure needs easel/Makefile.in reachable as ${srcdir}/easel/Makefile.in.
+    # The symlink is committed, but recreate it as a fallback for environments where
+    # git does not restore symlinks (e.g. Windows without core.symlinks).
+    if (NOT EXISTS ${INFERNAL_HMMER_DIR}/easel)
+        execute_process(
+                COMMAND ${CMAKE_COMMAND} -E create_symlink ../easel ${INFERNAL_HMMER_DIR}/easel
+                RESULT_VARIABLE _symlink_rc
+        )
+        if (NOT _symlink_rc EQUAL 0)
+            message(FATAL_ERROR "Failed to create easel symlink in ${INFERNAL_HMMER_DIR}")
+        endif ()
+    endif ()
+    # Pass --host so configure uses the right target architecture and skips
+    # run-time probes that fail when cross-compiling
+    set(_hmmer_configure_args "CC=${CMAKE_C_COMPILER}" "CFLAGS=${CMAKE_C_FLAGS}")
+    if (CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+        # macOS cross-arch build targeting x86_64 (e.g. on Apple Silicon)
+        list(APPEND _hmmer_configure_args --host=x86_64-apple-darwin)
+    elseif (CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        list(APPEND _hmmer_configure_args --host=aarch64-apple-darwin)
+    elseif (CMAKE_CROSSCOMPILING)
+        if (CMAKE_C_COMPILER_TARGET)
+            # Clang exposes the full target triple (e.g. aarch64-linux-gnu)
+            list(APPEND _hmmer_configure_args --host=${CMAKE_C_COMPILER_TARGET})
+        elseif (CMAKE_LIBRARY_ARCHITECTURE)
+            # GCC multilib toolchains set this (e.g. aarch64-linux-gnu)
+            list(APPEND _hmmer_configure_args --host=${CMAKE_LIBRARY_ARCHITECTURE})
+        else ()
+            # Fallback: construct a basic triplet from CMake's system variables
+            string(TOLOWER "${CMAKE_SYSTEM_NAME}" _system_lc)
+            list(APPEND _hmmer_configure_args --host=${CMAKE_SYSTEM_PROCESSOR}-${_system_lc})
+        endif ()
+    endif ()
     file(MAKE_DIRECTORY ${INFERNAL_CONFIGURE_DIR})
-    message(STATUS "Configuring hmmer out-of-source in ${INFERNAL_CONFIGURE_DIR}")
+    message(STATUS "Configuring hmmer out-of-source in ${INFERNAL_CONFIGURE_DIR} (args: ${_hmmer_configure_args})")
     execute_process(
-            COMMAND ${INFERNAL_HMMER_DIR}/configure
+            COMMAND ${INFERNAL_HMMER_DIR}/configure ${_hmmer_configure_args}
             WORKING_DIRECTORY ${INFERNAL_CONFIGURE_DIR}
             RESULT_VARIABLE _configure_rc
     )
@@ -86,7 +119,6 @@ set(EASEL_SRCS
         ${INFERNAL_EASEL_DIR}/esl_msafile_stockholm.c
         ${INFERNAL_EASEL_DIR}/esl_msashuffle.c
         ${INFERNAL_EASEL_DIR}/esl_msaweight.c
-        ${INFERNAL_EASEL_DIR}/esl_neon.c
         ${INFERNAL_EASEL_DIR}/esl_normal.c
         ${INFERNAL_EASEL_DIR}/esl_paml.c
         ${INFERNAL_EASEL_DIR}/esl_quicksort.c
@@ -181,20 +213,33 @@ set(HMMER_SRCS
         ${INFERNAL_HMMER_SRC_DIR}/fm_ssv.c
 )
 
+if (ARM)
+    set(HMMER_IMPL_DIR ${INFERNAL_HMMER_SRC_DIR}/impl_neon)
+elseif (X64)
+    set(HMMER_IMPL_DIR ${INFERNAL_HMMER_SRC_DIR}/impl_sse)
+else ()
+    message(FATAL_ERROR "Unsupported architecture: neither ARM nor X64 is set")
+endif ()
+
 set(HMMER_IMPL_SRCS
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/decoding.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/fwdback.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/io.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/ssvfilter.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/msvfilter.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/null2.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/optacc.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/stotrace.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/vitfilter.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/p7_omx.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/p7_oprofile.c
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon/mpi.c
+        ${HMMER_IMPL_DIR}/decoding.c
+        ${HMMER_IMPL_DIR}/fwdback.c
+        ${HMMER_IMPL_DIR}/io.c
+        ${HMMER_IMPL_DIR}/ssvfilter.c
+        ${HMMER_IMPL_DIR}/msvfilter.c
+        ${HMMER_IMPL_DIR}/null2.c
+        ${HMMER_IMPL_DIR}/optacc.c
+        ${HMMER_IMPL_DIR}/stotrace.c
+        ${HMMER_IMPL_DIR}/vitfilter.c
+        ${HMMER_IMPL_DIR}/p7_omx.c
+        ${HMMER_IMPL_DIR}/p7_oprofile.c
+        ${HMMER_IMPL_DIR}/mpi.c
 )
+if (ARM)
+    list(APPEND EASEL_SRCS ${INFERNAL_EASEL_DIR}/esl_neon.c)
+elseif (X64)
+    list(APPEND EASEL_SRCS ${INFERNAL_EASEL_DIR}/esl_sse.c)
+endif ()
 
 set(INFERNAL_CORE_SRCS
         ${INFERNAL_SRC_DIR}/cm.c
@@ -251,7 +296,7 @@ target_include_directories(infernal-vendor-hmmer PRIVATE
         ${INFERNAL_CONFIGURE_DIR}/src
         ${INFERNAL_CONFIGURE_DIR}/easel
         ${INFERNAL_HMMER_SRC_DIR}
-        ${INFERNAL_HMMER_SRC_DIR}/impl_neon
+        ${HMMER_IMPL_DIR}
         ${INFERNAL_EASEL_DIR}
 )
 target_link_libraries(infernal-vendor-hmmer PUBLIC infernal-vendor-easel Threads::Threads m)

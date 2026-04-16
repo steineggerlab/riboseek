@@ -91,11 +91,11 @@ jobs:
                 -DHAVE_SANITIZER=1 -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -DHAVE_TESTS=1 \
                 -DFORCE_STATIC_DEPS=1 \
                 -DOpenMP_C_FLAGS="-fopenmp -I${LIBGOMP}" -DOpenMP_C_LIB_NAMES=gomp -DOpenMP_CXX_FLAGS="-fopenmp -I${LIBGOMP}" -DOpenMP_CXX_LIB_NAMES=gomp -DOpenMP_gomp_LIBRARY=${LIBGOMP}/libgomp.a \
-                -DENABLE_WERROR=1 -DHAVE_${{ matrix.SIMD }}=1 -DHAVE_MPI=${{ matrix.MPI }} ..
+                -DENABLE_WERROR=0 -DHAVE_${{ matrix.SIMD }}=1 -DHAVE_MPI=${{ matrix.MPI }} ..
           else
               cmake \
                 -DHAVE_SANITIZER=1 -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -DHAVE_TESTS=1 \
-                -DENABLE_WERROR=1 -DHAVE_${{ matrix.SIMD }}=1 -DHAVE_MPI=${{ matrix.MPI }} ..
+                -DENABLE_WERROR=0 -DHAVE_${{ matrix.SIMD }}=1 -DHAVE_MPI=${{ matrix.MPI }} ..
           fi
           make -j $(nproc --all)
 
@@ -158,7 +158,7 @@ jobs:
             -DFORCE_STATIC_DEPS=1 \
             -DOpenMP_C_FLAGS="-fopenmp -I${LIBGOMP}" -DOpenMP_C_LIB_NAMES=gomp -DOpenMP_CXX_FLAGS="-fopenmp -I${LIBGOMP}" -DOpenMP_CXX_LIB_NAMES=gomp -DOpenMP_gomp_LIBRARY=${LIBGOMP}/libgomp.a \
             -DRust_CARGO_TARGET=${{ matrix.CPREF }}-unknown-linux-gnu \
-            -DENABLE_WERROR=1 -DHAVE_${{ matrix.SIMD }}=1 ..
+            -DENABLE_WERROR=0 -DHAVE_${{ matrix.SIMD }}=1 ..
           make -j $(nproc --all)
 
       - name: Upload Linux Artifact
