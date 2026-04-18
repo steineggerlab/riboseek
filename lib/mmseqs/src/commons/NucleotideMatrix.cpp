@@ -5,6 +5,7 @@ NucleotideMatrix::NucleotideMatrix(const char* scoringMatrixFileName, float bitF
         : SubstitutionMatrix(scoringMatrixFileName, bitFactor, scoreBias) {
     setupLetterMapping();
     reverseLookup = new int[alphabetSize];
+    // TODO think about making the matrix dynamic
     reverseLookup[aa2num[static_cast<int>('A')]] = aa2num[static_cast<int>('T')];
     reverseLookup[aa2num[static_cast<int>('G')]] = aa2num[static_cast<int>('C')];
     reverseLookup[aa2num[static_cast<int>('C')]] = aa2num[static_cast<int>('G')];

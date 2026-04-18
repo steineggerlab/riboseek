@@ -15,8 +15,10 @@ public:
     /*contains int to amino acid mapping*/
     char* num2aa;
 
+#ifdef RIBOSEEK
     /* reverse complement lookup: num2revcompnum[i] = complement of residue i */
     unsigned char* num2revcompnum;
+#endif
 
     /* size of alphabet*/
     int alphabetSize;

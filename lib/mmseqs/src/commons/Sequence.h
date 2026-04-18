@@ -84,8 +84,10 @@ public:
     // Map char -> int
     void mapSequence(size_t id, unsigned int dbKey, const char *seq, unsigned int seqLen);
 
+#ifdef RIBOSEEK
     // Map char -> int with reverse encoding (X sentinel at beginning instead of end)
     void mapSequenceReverse(size_t id, unsigned int dbKey, const char *seq, unsigned int seqLen);
+#endif
 
     // map sequence from SequenceLookup
     void mapSequence(size_t id, unsigned int dbKey, std::pair<const unsigned char *, const unsigned int> data);
@@ -459,9 +461,15 @@ public:
 #endif
     // const size_t PROFILE_ROW_SIZE = (((size_t) PROFILE_AA_SIZE / (VECSIZE_INT * 4)) + 1) * (VECSIZE_INT * 4);
     size_t profile_row_size;
+#ifdef RIBOSEEK
     static const size_t PROFILE_AA_SIZE = 24;
     static const size_t PROFILE_CONSENSUS = 25;     // new
     static const size_t PROFILE_NEFF = 26;          // new
+#else
+    static const size_t PROFILE_AA_SIZE = 20;
+    static const size_t PROFILE_CONSENSUS = 21;     // new
+    static const size_t PROFILE_NEFF = 22;          // new
+#endif
 #ifdef GAP_POS_SCORING
     static const size_t PROFILE_GAP_DEL = 23;       // new
     static const size_t PROFILE_GAP_INS = 24;       // new
@@ -469,8 +477,13 @@ public:
     static const size_t PROFILE_GAP_RESERVED1 = 23;
     static const size_t PROFILE_GAP_RESERVED2 = 24;
 #endif
+#ifdef RIBOSEEK
     // 24 AA, 1 query, 1 consensus, 1 Neff M
     static const size_t PROFILE_READIN_SIZE = 27;
+#else
+    // 20 AA, 1 query, 1 consensus, 1 Neff M, 2 gap penalties
+    static const size_t PROFILE_READIN_SIZE = 25;
+#endif
     ScoreMatrix **profile_matrix;
     // Memory layout of this profile is qL * AA
     //   Query length
@@ -623,9 +636,6 @@ private:
 
     // bias correction in profiles
     bool aaBiasCorrection;
-
-    // true if profile arrays (profile_score, profile_for_alignment, etc.) are allocated
-    bool hasProfileData;
 
     // spaced pattern
     bool spaced;

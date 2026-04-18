@@ -106,8 +106,7 @@ Sequence::Sequence(size_t maxLen, int seqType, const BaseMatrix *subMat, const u
     }
 
     // init memory for profile search
-    hasProfileData = Parameters::isEqualDbtype(seqType, Parameters::DBTYPE_HMM_PROFILE);
-    if (hasProfileData) {
+    if (Parameters::isEqualDbtype(seqType, Parameters::DBTYPE_HMM_PROFILE)) {
         // setup memory for profiles
         profile_row_size = (size_t) PROFILE_AA_SIZE / (VECSIZE_INT*4); //
         profile_row_size = (profile_row_size+1) * (VECSIZE_INT*4); // for SIMD memory alignment
@@ -149,7 +148,7 @@ Sequence::~Sequence() {
     if (aaPosInSpacedPattern){
         delete[] aaPosInSpacedPattern;
     }
-    if (hasProfileData) {
+    if (profile_matrix != NULL) {
         for (size_t i = 0; i < kmerSize; ++i) {
             delete profile_matrix[i];
         }
@@ -279,6 +278,7 @@ void Sequence::mapSequence(size_t id, unsigned int dbKey, const char *sequence, 
 
 }
 
+#ifdef RIBOSEEK
 void Sequence::mapSequenceReverse(size_t id, unsigned int dbKey, const char *sequence, unsigned int seqLen) {
     this->id = id;
     this->dbKey = dbKey;
@@ -304,6 +304,7 @@ void Sequence::mapSequenceReverse(size_t id, unsigned int dbKey, const char *seq
     }
     currItPos = -1;
 }
+#endif
 
 void Sequence::mapSequence(size_t id, unsigned int dbKey, std::pair<const unsigned char *,const unsigned int> data){
     this->id = id;
@@ -409,6 +410,7 @@ void Sequence::nextProfileKmer() {
 }
 
 bool Sequence::kmerWindowContainsX() const {
+#ifdef RIBOSEEK
     const simd_int xChar = simdi8_set(subMat->aa2num[static_cast<int>('X')]);
     const simd_int tChar = simdi8_set(subMat->aa2num[static_cast<int>('T')]);
     const simd_int vChar = simdi8_set(subMat->aa2num[static_cast<int>('V')]);
@@ -431,6 +433,12 @@ bool Sequence::kmerWindowContainsX() const {
         match = simdi_or(match, simdi8_eq(kmer, oChar));
         match = simdi_or(match, simdi8_eq(kmer, uChar));
         if (simd_any(match)) {
+#else
+    const simd_int xVec = simdi8_set(subMat->aa2num[static_cast<int>('X')]);
+    const simd_int *simdKmer = reinterpret_cast<const simd_int *>(kmerWindow);
+    for (unsigned int pos = 0; pos < simdKmerRegisterCnt; pos++) {
+        if (simd_any(simdi8_eq(simdi_load(simdKmer + pos), xVec))) {
+#endif
             return true;
         }
     }

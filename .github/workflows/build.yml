@@ -241,7 +241,7 @@ jobs:
       - name: Sign and Upload Artifacts
         run: |
           ssh-keygen -Y sign -f $HOME/.ssh/id_rsa -n file riboseek-osx-universal.tar.gz riboseek-linux-sse41.tar.gz riboseek-linux-avx2.tar.gz riboseek-linux-arm64.tar.gz
-          curl --retry 5 --retry-all-errors -X POST \
+          curl --retry 5 --retry-all-errors --fail -X POST \
             -F file[]=@riboseek-osx-universal.tar.gz -F signature[]=@riboseek-osx-universal.tar.gz.sig \
             -F file[]=@riboseek-linux-sse41.tar.gz -F signature[]=@riboseek-linux-sse41.tar.gz.sig \
             -F file[]=@riboseek-linux-avx2.tar.gz -F signature[]=@riboseek-linux-avx2.tar.gz.sig \

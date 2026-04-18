@@ -146,8 +146,13 @@ void MultipleAlignment::updateGapsInSequenceSet(char **msaSequence, size_t cente
                 if(bt.at(alnPos) == 'D'){
                     while (alnPos < bt.size() && bt.at(alnPos) == 'D') {
                         if(noDeletionMSA == false) {
+#ifdef RIBOSEEK
                             unsigned char letter = (reverse == true) ? subMat->num2aa[subMat->num2revcompnum[edgeSeq[targetPos]]] :
                                                                         subMat->num2aa[edgeSeq[targetPos]];
+#else
+                            unsigned char letter = (reverse == true) ? Orf::complement(subMat->num2aa[edgeSeq[targetPos]]) :
+                                                                        subMat->num2aa[edgeSeq[targetPos]];
+#endif
                             edgeSeqMSA[bufferPos] = letter;
                             bufferPos++;
                         }
@@ -161,8 +166,13 @@ void MultipleAlignment::updateGapsInSequenceSet(char **msaSequence, size_t cente
                         bufferPos++;
                         queryPos++;
                     } else if(bt.at(alnPos) == 'M'){
+#ifdef RIBOSEEK
                         unsigned char letter = (reverse == true) ? subMat->num2aa[subMat->num2revcompnum[edgeSeq[targetPos]]] :
                                                 subMat->num2aa[edgeSeq[targetPos]];
+#else
+                        unsigned char letter = (reverse == true) ? Orf::complement(subMat->num2aa[edgeSeq[targetPos]]) :
+                                                subMat->num2aa[edgeSeq[targetPos]];
+#endif
                         edgeSeqMSA[bufferPos] = letter;
                         bufferPos++;
                         queryPos++;
@@ -179,8 +189,13 @@ void MultipleAlignment::updateGapsInSequenceSet(char **msaSequence, size_t cente
                         }
                     }
                     // M state
+#ifdef RIBOSEEK
                     unsigned char letter = (reverse == true) ? subMat->num2aa[subMat->num2revcompnum[edgeSeq[targetPos]]] :
                                            subMat->num2aa[edgeSeq[targetPos]];
+#else
+                    unsigned char letter = (reverse == true) ? Orf::complement(subMat->num2aa[edgeSeq[targetPos]]) :
+                                           subMat->num2aa[edgeSeq[targetPos]];
+#endif
                     edgeSeqMSA[bufferPos] = letter;
 
                     bufferPos++;
@@ -225,10 +240,12 @@ MultipleAlignment::MSAResult MultipleAlignment::computeMSA(Sequence *centerSeq, 
         for (size_t pos = 0; pos < centerSeqSize; ++pos) {
             msaSequence[k][pos] = (msaSequence[k][pos] == '-') ?
                                   GAP : static_cast<int>(subMat->aa2num[static_cast<int>(msaSequence[k][pos])]);
+#ifdef RIBOSEEK
             // If the msaSequence[k][pos] is non-canonical letters, change it to ANY
             if (msaSequence[k][pos] > 15 && msaSequence[k][pos] < GAP) {
                 msaSequence[k][pos] = ANY;
             }
+#endif
         }
         int len = std::min(maxMsaSeqLen, (centerSeqSize + VECSIZE_INT*4));
         int startPos = std::min(centerSeqSize, maxMsaSeqLen - 1);

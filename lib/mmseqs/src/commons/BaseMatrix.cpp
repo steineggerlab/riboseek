@@ -1,5 +1,7 @@
 #include <climits>
+#ifdef RIBOSEEK
 #include <vector>
+#endif
 #include "BaseMatrix.h"
 
 #include "simd.h"
@@ -14,6 +16,7 @@ BaseMatrix::BaseMatrix(){
     // init [amino acid <-> int] mappings
 
     num2aa = new char[255];
+#ifdef RIBOSEEK
     aa2num = new unsigned char[USHRT_MAX];
     for (int i = 0; i < USHRT_MAX; ++i) {
         aa2num[i] = UCHAR_MAX;
@@ -22,12 +25,20 @@ BaseMatrix::BaseMatrix(){
     for (int i = 0; i < UCHAR_MAX; ++i) {
         num2revcompnum[i] = UCHAR_MAX;
     }
+#else
+    aa2num = new unsigned char[UCHAR_MAX];
+    for (int i = 0; i < UCHAR_MAX; ++i) {
+        aa2num[i] = UCHAR_MAX;
+    }
+#endif
 }
 
 BaseMatrix::~BaseMatrix(){
     delete[] num2aa;
     delete[] aa2num;
+#ifdef RIBOSEEK
     delete[] num2revcompnum;
+#endif
     delete[] pBack;
     for (int i = 0; i < allocatedAlphabetSize; i++){
         delete[] probMatrix[i];
@@ -131,12 +142,19 @@ void BaseMatrix::generateSubMatrix(double ** probMatrix, double ** subMatrix, fl
     for (int i = 0; i < size; i++) {
         for (int j = 0; j < size; j++) {
             subMatrix[i][j] = std::log2(probMatrix[i][j] / (pBack[i] * pBack[j]));
+            //printf("%3.4f %3.4f %3.4f \n",  probMatrix[i][j], pBack[i], pBack[j] );
+
         }
     }
-
     delete[] pBack;
+//    subMatrix[size - 1][size - 1] = -.7;
+//    for (int i = 0; i < size; i++) {
+//        subMatrix[size - 1][i] = -.7;
+//        subMatrix[i][size - 1] = -.7;
+//    }
 }
 
+#ifdef RIBOSEEK
 static std::vector<size_t> returnCanonicalIndices(size_t index) {
     switch (index) {
         case 16: return {0, 1, 2, 3};     // AX
@@ -180,6 +198,7 @@ static void recalcNonCanonicalDinuc(double ** subMatrix, int size) {
         }
     }
 }
+#endif
 
 // made non-static for testing purpose
 void BaseMatrix::generateSubMatrix(double ** probMatrix, float ** subMatrixPseudoCounts, short ** subMatrix, int size, bool containsX, double bitFactor, double scoringBias){
@@ -189,11 +208,13 @@ void BaseMatrix::generateSubMatrix(double ** probMatrix, float ** subMatrixPseud
 
     generateSubMatrix(probMatrix, sm, subMatrixPseudoCounts, size, containsX);
 
+#ifdef RIBOSEEK
     // For dinucleotide matrices, recalculate non-canonical entries (indices 16+)
     // by averaging the corresponding canonical entries
     if (size >= 25 && matrixName.find("dinuc") != std::string::npos) {
         recalcNonCanonicalDinuc(sm, size);
     }
+#endif
 
     // convert to short data type matrix
     for (int i = 0; i < size; i++){

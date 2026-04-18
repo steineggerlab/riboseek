@@ -14,6 +14,7 @@ endif()
 set(FRAMEWORK_ONLY 1 CACHE INTERNAL "" FORCE)
 include(MMseqsSetupDerivedTarget)
 add_subdirectory(lib/mmseqs EXCLUDE_FROM_ALL)
+target_compile_definitions(mmseqs-framework PUBLIC RIBOSEEK=1)
 
 set(RIBOSEEK_FRAMEWORK_ONLY 0 CACHE BOOL "Framework mode (don't create riboseek executable)")
 if (RIBOSEEK_FRAMEWORK_ONLY)

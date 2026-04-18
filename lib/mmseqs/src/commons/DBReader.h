@@ -225,6 +225,7 @@ public:
     size_t getSize() const;
 
     unsigned int getMaxSeqLen(){
+#ifdef RIBOSEEK
             if (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_HMM_PROFILE)) {
                 if (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE) {
                     return (std::max(maxSeqLen, 2u));
@@ -232,6 +233,11 @@ public:
                 return (std::max(maxSeqLen, 1u)) / Sequence::PROFILE_READIN_SIZE;
             }
             return (std::max(maxSeqLen, 2u));
+#else
+            return (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_HMM_PROFILE ) ) ?
+                    (std::max(maxSeqLen, 1u)) / Sequence::PROFILE_READIN_SIZE :
+                    (std::max(maxSeqLen, 2u));
+#endif
     }
 
     T getDbKey(size_t id);
@@ -251,10 +257,12 @@ public:
         }
 
         if(Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_HMM_PROFILE ) ){
+#ifdef RIBOSEEK
             if (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE) {
                 // Raw sequence data stored as profile type — use sequence length calculation
                 return (std::max(length, 2u) - 2u);
             }
+#endif
             // -1 null byte
             return (std::max(length, 1u) - 1u) / Sequence::PROFILE_READIN_SIZE;
         }else{

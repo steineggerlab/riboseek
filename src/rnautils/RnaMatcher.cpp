@@ -8,8 +8,8 @@
 #include <cfloat>
 
 
-RnaMatcher::RnaMatcher(int querySeqType, int maxSeqLen, BaseMatrix *m, EvalueComputation * evaluer,
-                 bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend, float correlationScoreWeight, int zdrop)
+RnaMatcher::RnaMatcher(int, int maxSeqLen, BaseMatrix *m, EvalueComputation * evaluer,
+                 bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend, float correlationScoreWeight, int)
                  : gapOpen(gapOpen), gapExtend(gapExtend), correlationScoreWeight(correlationScoreWeight), m(m), evaluer(evaluer), tinySubMat(NULL) {
     // RNA always uses dinucleotide SSW alignment (not raw nucleotide banded aligner)
     aligner = new RnaSmithWaterman(maxSeqLen, m->alphabetSize, aaBiasCorrection,
@@ -46,7 +46,7 @@ void RnaMatcher::initQuery(Sequence* query){
     }
 }
 
-RnaMatcher::result_t RnaMatcher::getSWResult(Sequence* dbSeq, const int diagonal, bool isReverse, const int covMode, const float covThr,
+RnaMatcher::result_t RnaMatcher::getSWResult(Sequence* dbSeq, const int, bool isReverse, const int covMode, const float covThr,
                                        const double evalThr, unsigned int alignmentMode, unsigned int seqIdMode, bool isIdentity,
                                        bool wrappedScoring, bool reverse){
 

@@ -56,8 +56,10 @@ PSSMCalculator::PSSMCalculator(SubstitutionMatrix *subMat, size_t maxSeqLength, 
     this->pcmode = pcmode;
     this->pca = pca;
     this->pcb = pcb;
+#ifdef RIBOSEEK
     // Dinucleotide alphabets have 16 canonical + 8 non-canonical (sentinel) codes
     this->canonicalSize = (subMat->alphabetSize > 21) ? 16 : MultipleAlignment::NAA;
+#endif
 #ifdef GAP_POS_SCORING
     gDel = new uint8_t[(maxSeqLength + 1)];
     gIns = new uint8_t[(maxSeqLength + 1)];
@@ -196,7 +198,11 @@ PSSMCalculator::Profile PSSMCalculator::computePSSMFromMSA(
 //    PSSMCalculator::printPSSM(queryLength);
 
     // create final Matrix
+#ifdef RIBOSEEK
     computeLogPSSM(subMat, pssm, profile, 8.0, queryLength, scoreBias, canonicalSize);
+#else
+    computeLogPSSM(subMat, pssm, profile, 8.0, queryLength, scoreBias);
+#endif
 //    PSSMCalculator::printProfile(queryLength);
 //    PSSMCalculator::printPSSM(queryLength);
 #ifdef GAP_POS_SCORING
@@ -258,6 +264,7 @@ void PSSMCalculator::profileToString(std::string& result, size_t queryLength){
     result.append(1, '\n');
 }
 
+#ifdef RIBOSEEK
 void PSSMCalculator::computeLogPSSM(BaseMatrix *subMat, char *pssm, const float *profile, float bitFactor, size_t queryLength, float scoreBias, size_t canonicalSize) {
     if (canonicalSize == 0) {
         canonicalSize = Sequence::PROFILE_AA_SIZE;
@@ -316,6 +323,22 @@ void PSSMCalculator::computeLogPSSM(BaseMatrix *subMat, char *pssm, const float 
     }
     delete [] fPssm;
 }
+#else
+void PSSMCalculator::computeLogPSSM(BaseMatrix *subMat, char *pssm, const float *profile, float bitFactor, size_t queryLength, float scoreBias) {
+    for(size_t pos = 0; pos < queryLength; pos++) {
+        for(size_t aa = 0; aa < Sequence::PROFILE_AA_SIZE; aa++) {
+            const float aaProb = profile[pos * Sequence::PROFILE_AA_SIZE + aa];
+            const unsigned int idx = pos * Sequence::PROFILE_AA_SIZE + aa;
+            float logProb = MathUtil::flog2(aaProb / subMat->pBack[aa]);
+            float pssmVal = bitFactor * logProb + bitFactor * scoreBias;
+            pssmVal = static_cast<char>((pssmVal < 0.0) ? pssmVal - 0.5 : pssmVal + 0.5);
+            float truncPssmVal =  std::min(pssmVal, 127.0f);
+            truncPssmVal       =  std::max(-128.0f, truncPssmVal);
+            pssm[idx] = truncPssmVal;
+        }
+    }
+}
+#endif
 
 void PSSMCalculator::preparePseudoCounts(float *frequency, float *frequency_with_pseudocounts, size_t entrySize,
                                          size_t queryLength, float const ** R) {
@@ -331,7 +354,11 @@ void PSSMCalculator::computeNeff_M(float *frequency, float *seqWeight, float *Ne
     float Neff_HMM = 0.0f;
     for (size_t pos = 0; pos < queryLength; pos++) {
         float sum = 0.0f;
+#ifdef RIBOSEEK
         for (size_t aa = 0; aa < canonicalSize; ++aa){
+#else
+        for (size_t aa = 0; aa < Sequence::PROFILE_AA_SIZE; ++aa){
+#endif
             float freq_pos_aa = frequency[pos * Sequence::PROFILE_AA_SIZE + aa];
             if (freq_pos_aa > 1E-10) {
                 sum -= freq_pos_aa * MathUtil::flog2(freq_pos_aa);
@@ -451,7 +478,11 @@ void PSSMCalculator::computeMatchWeights(float * matchWeight, float * seqWeight,
                 }
             }
         }
+#ifdef RIBOSEEK
         MathUtil::NormalizeTo1(&matchWeight[pos * Sequence::PROFILE_AA_SIZE], canonicalSize, subMat->pBack);
+#else
+        MathUtil::NormalizeTo1(&matchWeight[pos * Sequence::PROFILE_AA_SIZE], Sequence::PROFILE_AA_SIZE, subMat->pBack);
+#endif
     }
 }
 
@@ -460,7 +491,11 @@ void PSSMCalculator::computeContextSpecificWeights(float * matchWeight, float *w
     //For weighting: include only columns into subalignment i that have a max fraction of seqs with endgap
     const float MAXENDGAPFRAC=0.1;
     const int NCOLMIN=20;   //min number of cols in subalignment for calculating pos-specific weights w[k][i]
+#ifdef RIBOSEEK
     const int ENDGAP=MultipleAlignment::ENDGAP;    //Important to distinguish because end gaps do not contribute to tansition counts
+#else
+    const int ENDGAP=22;    //Important to distinguish because end gaps do not contribute to tansition counts
+#endif
 
     int nseqi = 0;
 //    unsigned int NAA_VECSIZE = ((MultipleAlignment::NAA+ 3 + VECSIZE_INT - 1) / VECSIZE_INT) * VECSIZE_INT; // round NAA+3 up to next multiple of VECSIZE_INT
@@ -593,8 +628,13 @@ void PSSMCalculator::computeContextSpecificWeights(float * matchWeight, float *w
 
             // Add contributions to Neff[i]
             for (int j = jmin; j <= jmax; ++j) {
+#ifdef RIBOSEEK
                 MathUtil::NormalizeTo1(f[j], canonicalSize);
                 for (size_t a = 0; a < canonicalSize; ++a)
+#else
+                MathUtil::NormalizeTo1(f[j], MultipleAlignment::NAA);
+                for (int a = 0; a < 20; ++a)
+#endif
                     if (f[j][a] > 1E-10)
                         Neff_M[i] -= f[j][a]
                                      * MathUtil::flog2(f[j][a]);
@@ -618,11 +658,19 @@ void PSSMCalculator::computeContextSpecificWeights(float * matchWeight, float *w
         }
 
         // Calculate amino acid frequencies q->f[i][a] from weights wi[k]
+#ifdef RIBOSEEK
         for (size_t a = 0; a < canonicalSize; ++a)
+#else
+        for (int a = 0; a < 20; ++a)
+#endif
             matchWeight[i * Sequence::PROFILE_AA_SIZE + a] = 0.0;
         for (size_t k = 0; k < setSize; ++k)
             matchWeight[i * Sequence::PROFILE_AA_SIZE + (int) X[k][i]] += wi[k];
+#ifdef RIBOSEEK
         MathUtil::NormalizeTo1((matchWeight+ i * Sequence::PROFILE_AA_SIZE), canonicalSize, subMat->pBack);
+#else
+        MathUtil::NormalizeTo1((matchWeight+ i * Sequence::PROFILE_AA_SIZE), MultipleAlignment::NAA, subMat->pBack);
+#endif
     }
     // remove end gaps
     for (size_t k = 0; k < setSize; ++k) {
@@ -699,7 +747,11 @@ void PSSMCalculator::computeConsensusSequence(unsigned char * consensusSeq, floa
     for (size_t pos = 0; pos < queryLength; pos++) {
         float maxw = 1E-8;
         int maxa = MultipleAlignment::ANY;
+#ifdef RIBOSEEK
         for (size_t aa = 0; aa < canonicalSize; ++aa) {
+#else
+        for (size_t aa = 0; aa < Sequence::PROFILE_AA_SIZE; ++aa) {
+#endif
             float prob = frequency[pos * Sequence::PROFILE_AA_SIZE + aa];
             if (prob - pBack[aa] > maxw) {
                 maxw = prob - pBack[aa];
@@ -722,6 +774,15 @@ void PSSMCalculator::Profile::toBuffer(const unsigned char* centerSequence, size
         result.push_back(static_cast<unsigned char>(centerSequence[pos]));
         result.push_back(static_cast<unsigned char>(subMat.aa2num[static_cast<int>(consensus[pos])]));
         result.push_back(static_cast<unsigned char>(MathUtil::convertNeffToChar(neffM[pos])));
+#ifndef RIBOSEEK
+#ifdef GAP_POS_SCORING
+        result.push_back(gDel[pos]);
+        result.push_back(gIns[pos]);
+#else
+        result.push_back(static_cast<unsigned char>(0));
+        result.push_back(static_cast<unsigned char>(0));
+#endif
+#endif
     }
 }
 

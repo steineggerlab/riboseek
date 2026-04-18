@@ -43,10 +43,11 @@ public:
 
     inline double computeEvalue(double score, double seqLength) {
         const double epa = evaluer.evaluePerArea( score );
-        const double a = area( score, seqLength ) * (bothStrands ? 2.0 : 1.0);
         if (useRnaCorrection) {
+            const double a = area( score, seqLength ) * (bothStrands ? 2.0 : 1.0);
             return 0.0382461572658595 * std::pow(epa * a, 0.8283631544068919);
         }
+        const double a = area( score, seqLength );
         return epa * a;
     }
 
