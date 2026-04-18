@@ -143,7 +143,6 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
     Debug(Debug::INFO) << "Target database size: " << tDbr->getSize() << " type: " << Parameters::getDbTypeName(targetSeqType) << "\n";
 
     const Sequence::SeqAuxInfo *auxInfo = Sequence::getAuxInfo(targetSeqType);
-    const unsigned int canonicalAlphabetSize = (auxInfo != NULL && auxInfo->auxAlphabetSize > 0) ? auxInfo->auxAlphabetSize : 0;
     const bool hasReverseMap = (auxInfo != NULL && auxInfo->mapSequenceReverseFn != NULL);
 
     const bool isFiltering = par.filterMsa != 0 || returnAlnRes;
@@ -255,30 +254,6 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
 
             // Recompute if not all the backtraces are present
             MultipleAlignment::MSAResult res = aligner.computeMSA(&centerSequence, seqSet, alnResults, true);
-
-            if (queryKey == 0) {
-                FILE *f = fopen("/tmp/riboseek_msa.txt", "a");
-                if (f) {
-                    fprintf(f, "RBS qkey=%u setSize=%zu centerLen=%zu\n", queryKey, res.setSize, res.centerLength);
-                    for (size_t r = 0; r < res.setSize && r < 10; r++) {
-                        fprintf(f, "  row=%zu |", r);
-                        for (size_t pos = 0; pos < res.centerLength && pos < 80; pos++) {
-                            fprintf(f, " %02x", (unsigned char)res.msaSequence[r][pos]);
-                        }
-                        fprintf(f, "\n");
-                    }
-                    fclose(f);
-                }
-            }
-
-            for (size_t i = 0; i < res.setSize; i++) {
-                for (size_t pos = 0; pos < res.centerLength; pos++) {
-                    if (res.msaSequence[i][pos] != MultipleAlignment::GAP
-                        && res.msaSequence[i][pos] >= canonicalAlphabetSize) {
-                        res.msaSequence[i][pos] = MultipleAlignment::ANY;
-                    }
-                }
-            }
 
             // do not count query
             size_t filteredSetSize = (isFiltering == true)  ?

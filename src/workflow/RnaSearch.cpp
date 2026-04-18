@@ -119,7 +119,9 @@ int rnasearch(int argc, const char **argv, const Command &command) {
 
     cmd.addVariable("SPLITSTRAND", "TRUE");
     cmd.addVariable("SPLITSEQUENCE_PAR", par.createParameterString(par.splitsequence).c_str());
-    if (indexStr == "") {
+    // Match fork's behavior: single-iter splits target (via blastdi.sh);
+    // multi-iter skips target split (blastdigp.sh has the block commented out).
+    if (indexStr == "" && par.numIterations == 1) {
         cmd.addVariable("NEEDTARGETSPLIT", "TRUE");
     }
     cmd.addVariable("NEEDQUERYSPLIT", "TRUE");

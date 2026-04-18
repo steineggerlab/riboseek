@@ -188,10 +188,8 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     }
 
     size_t effectiveDbSize = targetDbSize == 0 ? tdbr->getAminoAcidDBSize() : targetDbSize;
-    if (bothStrands) {
-        effectiveDbSize *= 2;
-    }
-    EvalueComputation evaluer(effectiveDbSize, &subMat, gapOpen, gapExtend);
+    EvalueComputation evaluer(effectiveDbSize, &subMat, gapOpen, gapExtend,
+                              bothStrands, /*useRnaCorrection=*/false);
 
     Debug(Debug::INFO) << "Query database size: " << qdbr->getSize() << " type: " << Parameters::getDbTypeName(querySeqType) << "\n";
     Debug(Debug::INFO) << "Target database size: " << tdbr->getSize() << " type: " << Parameters::getDbTypeName(targetSeqType) << "\n";

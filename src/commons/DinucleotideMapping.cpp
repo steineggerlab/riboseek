@@ -464,29 +464,21 @@ static void dinucMapProfile(Sequence *seq, const char *profileData, unsigned int
         // splitstrand reversed entry order for reverse strand but didn't complement.
         seq->mapProfile(profileData, seqLen);
 
-        // Only apply reverse complement if the profile went through splitstrand,
-        // which renumbers keys so odd = reverse strand.
-        // result2profile output keeps original keys — no reverse complement needed.
+        // splitstrand owns the on-disk reverse-strand transformation:
+        // position order reversal AND per-column dinucleotide revcomp permutation
+        // on the PSSM score bytes. mapProfile above has already loaded the
+        // already-swapped scores — do NOT re-apply the permutation here
+        // (double-swap cancels since revcomp is self-inverse).
+        // We still need to revcomp the per-position query/consensus letter
+        // (byte PROFILE_AA_SIZE), which splitstrand leaves untouched.
         bool isStrandSplit = (extDbtype & LocalParameters::DBTYPE_EXTENDED_STRAND_SPLIT) != 0;
         const bool reverse = isStrandSplit && (seq->getDbKey() % 2 == 1);
         BaseMatrix *subMat = seq->subMat;
         const unsigned char *revcomp = subMat->num2revcompnum;
         const int L = seq->L;
 
-        // For reverse strand: complement dinucleotide codes in profile.
-        // splitstrand on profile DBs already reversed entry order on disk;
-        // here we permute scores per position to apply revcomp.
         if (reverse) {
             for (int i = 0; i < L; i++) {
-                // Permute profile_score: score at dinuc j moves to revcomp(j)
-                short tmpScores[Sequence::PROFILE_AA_SIZE];
-                for (size_t aa = 0; aa < Sequence::PROFILE_AA_SIZE; aa++) {
-                    tmpScores[aa] = seq->profile_score[i * seq->profile_row_size + aa];
-                }
-                for (size_t aa = 0; aa < Sequence::PROFILE_AA_SIZE; aa++) {
-                    seq->profile_score[i * seq->profile_row_size + revcomp[aa]] = tmpScores[aa];
-                }
-                // Complement the query letter
                 seq->numSequence[i] = revcomp[seq->numSequence[i]];
             }
         }

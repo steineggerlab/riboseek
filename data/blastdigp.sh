@@ -48,6 +48,11 @@ notExists() {
 
 QUERYDB="$1"
 ORIQUERYDB="$1"
+# offsetalignment needs a nucleotide-typed source DB to build the ORF-key lookup
+# (lib/mmseqs's offsetalignment gates the lookup block on queryDbType == NUCLEOTIDES).
+# The profile we overwrite ORIQUERYDB with between iterations is HMM_PROFILE, so
+# we keep a separate handle to the original nucleotide query DB for offsetalignment.
+OFFSET_QUERYDB="$1"
 TARGETDB="$2"
 TMP_PATH="$4"
 MERGE_INPUT=""
@@ -189,7 +194,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
     # offset alignment
     if notExists "$TMP_PATH/aln_offset_$STEP.done"; then
         # shellcheck disable=SC2086
-        "$MMSEQS" offsetalignment "$ORIQUERYDB" "$QUERYDB" "$2" "$TARGETDB" "$MERGE_INPUT" "$TMP_PATH/aln_offset_$STEP" ${OFFSETALIGNMENT_PAR} \
+        "$MMSEQS" offsetalignment "$OFFSET_QUERYDB" "$QUERYDB" "$2" "$TARGETDB" "$MERGE_INPUT" "$TMP_PATH/aln_offset_$STEP" ${OFFSETALIGNMENT_PAR} \
             || fail "Offset step died"
         # replace alignment with offset alignment
         if [ "$STEP" -eq 0 ]; then
@@ -260,8 +265,9 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
             $RUNNER "$MMSEQS" result2profile "$R2P_QUERY" "$R2P_TARGET" "$TMP_PATH/aln_$STEP" "$TMP_PATH/profile_$STEP" ${TMP} \
                 || fail "Create profile died"
 
-            # Set plain HMM_PROFILE type (no DINUCLEOTIDE flag) so the prefilter
-            # uses standard mapProfile — matching old MMseqs2 behavior.
+            # Plain HMM_PROFILE type: splitstrand applies the per-column dinucleotide
+            # revcomp permutation inline for the reverse-strand entry, so downstream
+            # uses standard mapProfile (matching the forked extractqueryprofiles).
             # RnaAlign forces the DINUCLEOTIDE flag itself for alignment.
             if [ -n "$SPLITSTRAND" ]; then
                 awk 'BEGIN { printf("%c%c%c%c",2,0,0,0); exit; }' > "$TMP_PATH/profile_$STEP.dbtype"

@@ -24,12 +24,13 @@ int splitstrand(int argc, const char **argv, const Command& command) {
                                  || Parameters::isEqualDbtype(inputDbtype, Parameters::DBTYPE_NUCLEOTIDES);
 
     // Keep the base type: NUCLEOTIDES for sequence input, HMM_PROFILE for profile input.
-    // Data on disk stays as nucleotide characters (ACGT).
-    // The DINUCLEOTIDE flag triggers on-the-fly dinucleotide conversion when sequences are read.
+    // For sequences the data on disk stays as nucleotide characters (ACGT) and the
+    // DINUCLEOTIDE flag triggers on-the-fly dinucleotide encoding when read.
+    // For profile input, the profile is already in dinucleotide space; we apply the
+    // per-column revcomp permutation here for the reverse-strand entry, matching the
+    // forked extractqueryprofiles behavior, so downstream uses standard mapProfile.
     int outputDbtype = inputIsSequence ? Parameters::DBTYPE_NUCLEOTIDES : Parameters::DBTYPE_HMM_PROFILE;
     unsigned int extFlags = DBReader<unsigned int>::getExtendedDbtype(inputDbtype);
-    // Only add DINUCLEOTIDE flag for sequence input — profile input is already in
-    // dinucleotide space and should use standard mapProfile (matching old system).
     if (inputIsSequence) {
         extFlags |= LocalParameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
     }
@@ -81,11 +82,30 @@ int splitstrand(int argc, const char **argv, const Command& command) {
                 // position order + revcomp column swaps (matching extractqueryprofiles).
                 // For profile data, reverse the profile entries.
                 if (Parameters::isEqualDbtype(inputDbtype, Parameters::DBTYPE_HMM_PROFILE)) {
-                    // Profile: reverse the order of PROFILE_READIN_SIZE-sized entries
+                    // Profile: reverse position order AND apply per-column dinucleotide
+                    // revcomp permutation on the PSSM scores. The score swaps mirror the
+                    // dinucleotide reverse-complement table:
+                    //   canonical pairs:     1↔15, 2↔6, 4↔12, 5↔7, 8↔9, 10↔11
+                    //   non-canonical pairs: 16↔23, 17↔22, 18↔21, 19↔20
+                    // (matches MMseqs2 fork's extractqueryprofiles inline behavior).
                     std::string revData;
-                    revData.reserve(seqLen * Sequence::PROFILE_READIN_SIZE);
+                    revData.resize(seqLen * Sequence::PROFILE_READIN_SIZE);
+                    char *out = &revData[0];
                     for (int pos = (int)seqLen - 1; pos >= 0; pos--) {
-                        revData.append(data + pos * Sequence::PROFILE_READIN_SIZE, Sequence::PROFILE_READIN_SIZE);
+                        size_t outOff = ((seqLen - 1) - pos) * Sequence::PROFILE_READIN_SIZE;
+                        memcpy(out + outOff, data + pos * Sequence::PROFILE_READIN_SIZE,
+                               Sequence::PROFILE_READIN_SIZE);
+                        char *col = out + outOff;
+                        std::swap(col[1],  col[15]);
+                        std::swap(col[2],  col[6]);
+                        std::swap(col[4],  col[12]);
+                        std::swap(col[5],  col[7]);
+                        std::swap(col[8],  col[9]);
+                        std::swap(col[10], col[11]);
+                        std::swap(col[16], col[23]);
+                        std::swap(col[17], col[22]);
+                        std::swap(col[18], col[21]);
+                        std::swap(col[19], col[20]);
                     }
                     sequenceWriter.writeData(revData.c_str(), revData.length(), key, thread_idx);
                 } else {
