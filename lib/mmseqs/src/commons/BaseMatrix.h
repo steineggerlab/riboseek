@@ -2,6 +2,9 @@
 #define BASE_MATRIX_H
 
 #include <string>
+#ifdef RIBOSEEK
+#include <vector>
+#endif
 
 class BaseMatrix{
 public:
@@ -18,6 +21,7 @@ public:
 #ifdef RIBOSEEK
     /* reverse complement lookup: num2revcompnum[i] = complement of residue i */
     unsigned char* num2revcompnum;
+    static std::vector<size_t> returnCanonicalIndices(size_t index);
 #endif
 
     /* size of alphabet*/

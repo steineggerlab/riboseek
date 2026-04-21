@@ -49,11 +49,20 @@ static void dinucCalcLocalAaBiasCorrection(const BaseMatrix *m,
     for (int i = 0; i < N; i++) {
         const int minPos = std::max(0, (i - windowSize / 2));
         const int maxPos = std::min(N, (i + (windowSize+1) / 2));
-        const int windowLength = maxPos - minPos;
+        int windowLength = maxPos - minPos;
 
         int sumSubScores = 0;
+        // If the character is not a canonical amino acid, skip it
+        if (int_sequence[i] >= 16) {
+            compositionBias[i] = 0.0;
+            continue;
+        }
         short *subMat = m->subMatrix[int_sequence[i]];
         for (int j = minPos; j < maxPos; j++) {
+	    if (int_sequence[j] >= 16) {
+	        windowLength--;
+	        continue;
+	    }
             sumSubScores += subMat[int_sequence[j]];
         }
 
