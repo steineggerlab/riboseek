@@ -264,6 +264,7 @@ struct Worker {
     int toWorker;   // parent writes, worker reads
     int fromWorker; // worker writes, parent reads
     std::mutex io;  // serialize send/recv on this worker
+    bool alive = true;
 };
 
 static void workerMainLoop(int fdIn, int fdOut) {
@@ -301,6 +302,7 @@ struct WorkerPool {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<int> free;
+    int aliveCount = 0;
 };
 
 bool isConfigured() {
@@ -350,6 +352,7 @@ WorkerPool *startWorkerPool(int nWorkers) {
         w->fromWorker = w2p[0];
         pool->workers.push_back(w);
         pool->free.push_back(static_cast<int>(pool->workers.size()) - 1);
+        pool->aliveCount++;
     }
     return pool;
 }
@@ -357,12 +360,16 @@ WorkerPool *startWorkerPool(int nWorkers) {
 void stopWorkerPool(WorkerPool *pool) {
     if (pool == NULL) return;
     for (size_t i = 0; i < pool->workers.size(); ++i) {
-        close(pool->workers[i]->toWorker); // EOF triggers worker exit
+        if (pool->workers[i]->alive) {
+            close(pool->workers[i]->toWorker); // EOF triggers worker exit
+        }
     }
     for (size_t i = 0; i < pool->workers.size(); ++i) {
-        int status = 0;
-        while (waitpid(pool->workers[i]->pid, &status, 0) < 0 && errno == EINTR) {}
-        close(pool->workers[i]->fromWorker);
+        if (pool->workers[i]->alive) {
+            int status = 0;
+            while (waitpid(pool->workers[i]->pid, &status, 0) < 0 && errno == EINTR) {}
+            close(pool->workers[i]->fromWorker);
+        }
         delete pool->workers[i];
     }
     delete pool;
@@ -381,7 +388,11 @@ bool buildCmFromStockholmText(WorkerPool *pool,
     int idx = -1;
     {
         std::unique_lock<std::mutex> lk(pool->mu);
-        pool->cv.wait(lk, [&]{ return !pool->free.empty(); });
+        pool->cv.wait(lk, [&]{ return !pool->free.empty() || pool->aliveCount == 0; });
+        if (pool->free.empty()) {
+            error = "all infernal workers have died";
+            return false;
+        }
         idx = pool->free.front();
         pool->free.pop_front();
     }
@@ -414,12 +425,24 @@ bool buildCmFromStockholmText(WorkerPool *pool,
 
     {
         std::unique_lock<std::mutex> lk(pool->mu);
-        pool->free.push_back(idx);
+        if (ok) {
+            pool->free.push_back(idx);
+        } else {
+            // Worker IPC broke — assume the child died. Retire the slot
+            // rather than returning it to the free queue so a crashed worker
+            // isn't handed out again and again.
+            w->alive = false;
+            pool->aliveCount--;
+            close(w->toWorker);
+            close(w->fromWorker);
+            int status = 0;
+            while (waitpid(w->pid, &status, 0) < 0 && errno == EINTR) {}
+        }
     }
-    pool->cv.notify_one();
+    pool->cv.notify_all();
 
     if (!ok) {
-        error = "infernal worker IPC failure";
+        error = "infernal worker IPC failure (worker retired)";
         return false;
     }
     if (rFlag == 1) {
