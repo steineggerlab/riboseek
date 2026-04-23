@@ -11,6 +11,10 @@
 #include "NucleotideMatrix.h"
 #include "Sequence.h"
 
+#ifdef OPENMP
+#include <omp.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <climits>
@@ -52,50 +56,6 @@ typedef uint16_t StateId;
 #else
 #define CM_ALWAYS_INLINE inline
 #endif
-
-struct UnaryRule {
-    int lhs;
-    char base;
-    double logp;
-};
-
-struct BinaryRule {
-    int lhs;
-    int rhs1;
-    int rhs2;
-    double logp;
-};
-
-struct PairRule {
-    int lhs;
-    int inner; // -1 means epsilon inner (consumes only the two paired terminals)
-    char leftBase;
-    char rightBase;
-    double logp;
-};
-
-struct EpsRule {
-    int lhs;
-    int rhs;
-    double logp;
-};
-
-struct Grammar {
-    std::map<std::string, int> ntToId;
-    std::vector<std::string> idToNt;
-    int start = -1;
-    double calA = 1.0;
-    double calB = 0.0;
-    double calSplit = std::numeric_limits<double>::infinity();
-    double calNegA = 1.0;
-    double calNegB = 0.0;
-    bool hasPiecewiseCal = false;
-    int modelLen = -1;
-    std::vector<UnaryRule> unaryRules;
-    std::vector<BinaryRule> binaryRules;
-    std::vector<PairRule> pairRules;
-    std::vector<EpsRule> epsRules;
-};
 
 struct FastaSeq {
     unsigned int key = 0;
@@ -325,20 +285,6 @@ static bool cmTruncModesEnabled() {
         const char *env = std::getenv("MMSEQS_CMSCAN_TRUNC");
         // Infernal-like default: truncation modes enabled unless explicitly disabled.
         cached = (env != NULL && std::string(env) == "0") ? 0 : 1;
-    }
-    return cached == 1;
-}
-
-static bool cmRefineTraceEnabled() {
-    static int cached = -1;
-    if (cached == -1) {
-        const char *env = std::getenv("MMSEQS_CMSCAN_REFINE");
-        if (env != NULL) {
-            cached = (std::string(env) == "0") ? 0 : 1;
-        } else {
-            // Skip refine traceback by default — no quality benefit, 2-3x cost.
-            cached = 0;
-        }
     }
     return cached == 1;
 }
@@ -781,27 +727,6 @@ static bool infernalExactScoreToEvalue(const InfernalExactModel &model,
     return std::isfinite(outEvalue);
 }
 
-static inline double nativeCalibratedScoreToEvalue(double scoreBits,
-                                                   double targetDbResidues) {
-    // Native fallback calibration for uncalibrated grammars:
-    // E ~= N * 2^(-S), where N is effective target DB residues and S is bit score.
-    const double n = std::max(1.0, targetDbResidues);
-    const double s = std::max(-1000.0, std::min(1000.0, scoreBits));
-    const double ev = n * std::exp2(-s);
-    return std::max(1e-300, std::min(1e300, ev));
-}
-
-static int getNtId(Grammar &g, const std::string &nt) {
-    std::map<std::string, int>::iterator it = g.ntToId.find(nt);
-    if (it != g.ntToId.end()) {
-        return it->second;
-    }
-    int id = static_cast<int>(g.idToNt.size());
-    g.ntToId[nt] = id;
-    g.idToNt.push_back(nt);
-    return id;
-}
-
 static bool looksLikeInfernalCm(const std::string &path) {
     std::ifstream in(path.c_str());
     if (!in.good()) {
@@ -930,13 +855,7 @@ static double parseInfernalAsciiProb(const std::string &tok, double nullProb) {
     return std::exp2(bits) * nullProb;
 }
 
-static InfernalExactModel parseInfernalCmExactModel(const std::string &path) {
-    std::ifstream in(path.c_str());
-    if (!in.good()) {
-        Debug(Debug::ERROR) << "Cannot open Infernal CM file: " << path << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-
+static InfernalExactModel parseInfernalCmExactModelFromStream(std::istream &in, const std::string &srcLabel) {
     int clen = -1;
     int statesN = -1;
     int w = -1;
@@ -1094,7 +1013,7 @@ static InfernalExactModel parseInfernalCmExactModel(const std::string &path) {
         states.push_back(s);
     }
     if (!done || clen <= 0 || states.empty()) {
-        Debug(Debug::ERROR) << "Failed parsing Infernal CM state graph from " << path << "\n";
+        Debug(Debug::ERROR) << "Failed parsing Infernal CM state graph from " << srcLabel << "\n";
         EXIT(EXIT_FAILURE);
     }
 
@@ -1120,311 +1039,25 @@ static InfernalExactModel parseInfernalCmExactModel(const std::string &path) {
     return m;
 }
 
-// CM grammar format (plain text):
-// START <NT>
-// UNARY <LHS> <BASE> <LOGP>
-// BINARY <LHS> <RHS1> <RHS2> <LOGP>
-// PAIR <LHS> <INNER|- > <LEFT_BASE> <RIGHT_BASE> <LOGP>
-// EPS <LHS> <RHS> <LOGP>
-static Grammar parseGrammar(const std::string &path) {
+static InfernalExactModel parseInfernalCmExactModel(const std::string &path) {
     std::ifstream in(path.c_str());
     if (!in.good()) {
-        Debug(Debug::ERROR) << "Cannot open CM grammar file: " << path << "\n";
+        Debug(Debug::ERROR) << "Cannot open Infernal CM file: " << path << "\n";
         EXIT(EXIT_FAILURE);
     }
-
-    Grammar g;
-    std::string line;
-    size_t lineNo = 0;
-    while (std::getline(in, line)) {
-        ++lineNo;
-        line = trim(line);
-        if (line.empty()) {
-            continue;
-        }
-        if (line[0] == '#') {
-            std::stringstream cs(line.substr(1));
-            std::string k;
-            cs >> k;
-            if (k == "CAL_A") {
-                double v = 1.0;
-                if (cs >> v) {
-                    g.calA = v;
-                }
-            } else if (k == "CAL_B") {
-                double v = 0.0;
-                if (cs >> v) {
-                    g.calB = v;
-                }
-            } else if (k == "CAL_SPLIT") {
-                double v = 0.0;
-                if (cs >> v) {
-                    g.calSplit = v;
-                }
-            } else if (k == "CAL_NEG_A") {
-                double v = 1.0;
-                if (cs >> v) {
-                    g.calNegA = v;
-                    g.hasPiecewiseCal = true;
-                }
-            } else if (k == "CAL_NEG_B") {
-                double v = 0.0;
-                if (cs >> v) {
-                    g.calNegB = v;
-                    g.hasPiecewiseCal = true;
-                }
-            } else if (k == "model_len") {
-                int v = -1;
-                if (cs >> v) {
-                    g.modelLen = v;
-                }
-            }
-            continue;
-        }
-        std::stringstream ss(line);
-        std::string tag;
-        ss >> tag;
-        if (tag == "START") {
-            std::string s;
-            ss >> s;
-            if (s.empty()) {
-                Debug(Debug::ERROR) << "Invalid START at " << path << ":" << lineNo << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            g.start = getNtId(g, s);
-        } else if (tag == "UNARY") {
-            std::string lhs;
-            std::string b;
-            double logp = 0.0;
-            ss >> lhs >> b >> logp;
-            if (lhs.empty() || b.size() != 1) {
-                Debug(Debug::ERROR) << "Invalid UNARY at " << path << ":" << lineNo << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            UnaryRule r;
-            r.lhs = getNtId(g, lhs);
-            r.base = normalizeBase(b[0]);
-            r.logp = logp;
-            g.unaryRules.push_back(r);
-        } else if (tag == "BINARY") {
-            std::string lhs, r1, r2;
-            double logp = 0.0;
-            ss >> lhs >> r1 >> r2 >> logp;
-            if (lhs.empty() || r1.empty() || r2.empty()) {
-                Debug(Debug::ERROR) << "Invalid BINARY at " << path << ":" << lineNo << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            BinaryRule r;
-            r.lhs = getNtId(g, lhs);
-            r.rhs1 = getNtId(g, r1);
-            r.rhs2 = getNtId(g, r2);
-            r.logp = logp;
-            g.binaryRules.push_back(r);
-        } else if (tag == "PAIR") {
-            std::string lhs, inner, lb, rb;
-            double logp = 0.0;
-            ss >> lhs >> inner >> lb >> rb >> logp;
-            if (lhs.empty() || inner.empty() || lb.size() != 1 || rb.size() != 1) {
-                Debug(Debug::ERROR) << "Invalid PAIR at " << path << ":" << lineNo << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            PairRule r;
-            r.lhs = getNtId(g, lhs);
-            r.inner = (inner == "-") ? -1 : getNtId(g, inner);
-            r.leftBase = normalizeBase(lb[0]);
-            r.rightBase = normalizeBase(rb[0]);
-            r.logp = logp;
-            g.pairRules.push_back(r);
-        } else if (tag == "EPS") {
-            std::string lhs, rhs;
-            double logp = 0.0;
-            ss >> lhs >> rhs >> logp;
-            if (lhs.empty() || rhs.empty()) {
-                Debug(Debug::ERROR) << "Invalid EPS at " << path << ":" << lineNo << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            EpsRule r;
-            r.lhs = getNtId(g, lhs);
-            r.rhs = getNtId(g, rhs);
-            r.logp = logp;
-            g.epsRules.push_back(r);
-        } else {
-            Debug(Debug::ERROR) << "Unknown grammar directive '" << tag << "' at " << path << ":" << lineNo << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-    }
-
-    if (g.start < 0) {
-        Debug(Debug::ERROR) << "Grammar has no START directive: " << path << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    return g;
-}
-
-static std::vector<FastaSeq> readFasta(const std::string &path) {
-    std::ifstream in(path.c_str());
-    if (!in.good()) {
-        Debug(Debug::ERROR) << "Cannot open FASTA file: " << path << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-
-    std::vector<FastaSeq> seqs;
-    FastaSeq cur;
-    unsigned int nextKey = 1;
-    std::set<unsigned int> usedKeys;
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty()) {
-            continue;
-        }
-        if (line[0] == '>') {
-            if (!cur.id.empty()) {
-                seqs.push_back(cur);
-                cur = FastaSeq();
-            }
-            cur.id = trim(line.substr(1));
-            // If FASTA header is numeric, preserve it as target key; otherwise assign a stable local key.
-            std::string idTok = cur.id;
-            const size_t ws = idTok.find_first_of(" \t");
-            if (ws != std::string::npos) {
-                idTok = idTok.substr(0, ws);
-            }
-            char *endptr = NULL;
-            const unsigned long parsed = std::strtoul(idTok.c_str(), &endptr, 10);
-            if (endptr != idTok.c_str() && *endptr == '\0' && parsed <= static_cast<unsigned long>(UINT_MAX)) {
-                cur.key = static_cast<unsigned int>(parsed);
-            } else {
-                cur.key = nextKey;
-            }
-            while (usedKeys.find(cur.key) != usedKeys.end()) {
-                cur.key = nextKey;
-                nextKey += 1;
-            }
-            usedKeys.insert(cur.key);
-            nextKey += 1;
-            continue;
-        }
-        std::string s = trim(line);
-        for (size_t i = 0; i < s.size(); ++i) {
-            char c = normalizeBase(s[i]);
-            if (c == 'A' || c == 'C' || c == 'G' || c == 'U' || c == 'N') {
-                cur.seq.push_back(c);
-            } else {
-                // Preserve sequence length for ambiguous IUPAC symbols by mapping to N.
-                cur.seq.push_back('N');
-            }
-        }
-    }
-    if (!cur.id.empty()) {
-        seqs.push_back(cur);
-    }
-    return seqs;
+    return parseInfernalCmExactModelFromStream(in, path);
 }
 
 static bool hasDbIndex(const std::string &path) {
     return FileUtil::fileExists((path + ".index").c_str());
 }
 
-struct RegionCoord {
-    int dbStart;  // 0-based start in target
-    int dbEnd;    // 0-based end (inclusive) in target
-    int qStart;   // 0-based start in query
-    int qEnd;     // 0-based end (inclusive) in query
-};
-
-struct CandidateResult {
-    std::unordered_map<unsigned int, std::unordered_set<unsigned int> > candidates;
-    // (queryKey, targetKey) → region coordinate from prefilter alignment
-    std::unordered_map<uint64_t, RegionCoord> regionCoords;
-
-    static uint64_t coordKey(unsigned int qKey, unsigned int tKey) {
-        return (static_cast<uint64_t>(qKey) << 32) | static_cast<uint64_t>(tKey);
-    }
-};
-
-static CandidateResult
-loadResultDbCandidates(const std::string &resultDbPath, int threads) {
-    CandidateResult result;
-    const std::string idx = resultDbPath + ".index";
-    // Data may be in resultDbPath or resultDbPath.0 (split DB format)
-    const std::string splitPath = resultDbPath + ".0";
-    if ((!FileUtil::fileExists(resultDbPath.c_str()) && !FileUtil::fileExists(splitPath.c_str()))
-        || !FileUtil::fileExists(idx.c_str())) {
-        return result;
-    }
-    DBReader<unsigned int> rdb(resultDbPath.c_str(),
-                               idx.c_str(),
-                               threads > 0 ? threads : 1,
-                               DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
-    rdb.open(DBReader<unsigned int>::LINEAR_ACCCESS);
-    result.candidates.reserve(rdb.getSize() * 2 + 1);
-    for (size_t i = 0; i < rdb.getSize(); ++i) {
-        const unsigned int qKey = rdb.getDbKey(i);
-        std::unordered_set<unsigned int> &cand = result.candidates[qKey];
-        char *data = rdb.getData(i, 0);
-        while (*data != '\0') {
-            while (*data == ' ' || *data == '\t') {
-                ++data;
-            }
-            // Try to parse as alignment result (tab-separated, ≥10 columns)
-            // Format: targetKey score seqId evalue qStart qEnd qLen dbStart dbEnd dbLen [backtrace]
-            const char *lineStart = data;
-            char *endptr = NULL;
-            const unsigned long k = std::strtoul(data, &endptr, 10);
-            if (endptr != data && k <= static_cast<unsigned long>(UINT_MAX)) {
-                const unsigned int tKey = static_cast<unsigned int>(k);
-                cand.insert(tKey);
-                // Check if this line has alignment fields (tab after first number)
-                if (*endptr == '\t') {
-                    // Count tabs to find dbStart (col 7) and dbEnd (col 8)
-                    const char *p = endptr;
-                    int col = 1;
-                    const char *colStart[12] = {NULL};
-                    colStart[0] = lineStart;
-                    while (*p != '\n' && *p != '\0' && col < 11) {
-                        if (*p == '\t') {
-                            colStart[col] = p + 1;
-                            col++;
-                        }
-                        p++;
-                    }
-                    if (col >= 10 && colStart[4] != NULL && colStart[5] != NULL
-                        && colStart[7] != NULL && colStart[8] != NULL) {
-                        uint64_t ck = CandidateResult::coordKey(qKey, tKey);
-                        // Only store the first (best-scoring) hit per (query, target)
-                        if (result.regionCoords.find(ck) == result.regionCoords.end()) {
-                            int dbStart = Util::fast_atoi<int>(colStart[7]);
-                            int dbEnd = Util::fast_atoi<int>(colStart[8]);
-                            if (dbStart > dbEnd) {
-                                std::swap(dbStart, dbEnd);
-                            }
-                            int qStart = Util::fast_atoi<int>(colStart[4]);
-                            int qEnd = Util::fast_atoi<int>(colStart[5]);
-                            if (qStart > qEnd) {
-                                std::swap(qStart, qEnd);
-                            }
-                            RegionCoord rc;
-                            rc.dbStart = dbStart;
-                            rc.dbEnd = dbEnd;
-                            rc.qStart = qStart;
-                            rc.qEnd = qEnd;
-                            result.regionCoords[ck] = rc;
-                        }
-                    }
-                }
-            }
-            data = Util::skipLine(data);
-        }
-    }
-    rdb.close();
-    return result;
-}
-
 // Decode a single sequence from an open DBReader by internal index.
 static FastaSeq decodeOneSequence(DBReader<unsigned int> &dbr,
                                   size_t id,
                                   BaseMatrix &subMat,
-                                  Sequence &seqObj) {
+                                  Sequence &seqObj,
+                                  unsigned int thread_idx) {
     FastaSeq cur;
     cur.key = dbr.getDbKey(id);
     const bool hasLookup = (dbr.getLookupSize() > 0);
@@ -1435,7 +1068,7 @@ static FastaSeq decodeOneSequence(DBReader<unsigned int> &dbr,
         cur.id = std::to_string(cur.key);
     }
     const size_t seqLen = dbr.getSeqLen(id);
-    const char *data = dbr.getData(id, 0);
+    const char *data = dbr.getData(id, thread_idx);
     cur.seq.reserve(seqLen);
     seqObj.mapSequence(id, cur.key, data, seqLen);
     for (int p = 0; p < seqObj.L; ++p) {
@@ -1449,37 +1082,9 @@ static FastaSeq decodeOneSequence(DBReader<unsigned int> &dbr,
     return cur;
 }
 
-static std::string writeTempTextFile(const std::string &text) {
-    char templ[] = "/tmp/mmseqs_cm_XXXXXX";
-    const int fd = mkstemp(templ);
-    if (fd < 0) {
-        Debug(Debug::ERROR) << "Cannot create temporary file for CM parsing\n";
-        EXIT(EXIT_FAILURE);
-    }
-    size_t off = 0;
-    while (off < text.size()) {
-        const ssize_t n = ::write(fd, text.data() + off, text.size() - off);
-        if (n <= 0) {
-            ::close(fd);
-            Debug(Debug::ERROR) << "Cannot write temporary CM parse file\n";
-            EXIT(EXIT_FAILURE);
-        }
-        off += static_cast<size_t>(n);
-    }
-    ::close(fd);
-    return std::string(templ);
-}
-
-static bool looksLikeInfernalCmText(const std::string &txt) {
-    const size_t eol = txt.find('\n');
-    const std::string first = trim(txt.substr(0, (eol == std::string::npos) ? txt.size() : eol));
-    return first.find("INFERNAL1/") != std::string::npos;
-}
-
 struct Hit {
     unsigned int dbKey = 0;
     unsigned int dbLen = 0;
-    size_t targetIdx = 0;
     std::string seqId;
     int start1 = 0;
     int end1 = 0;
@@ -1490,6 +1095,7 @@ struct Hit {
     double bias = 0.0;
     double evalue = NEG_INF;
     bool hasEvalue = false;
+    float precomputedSeqId = -1.0f; // trace-based pid, <0 means fall back to score-per-col estimate
     std::string cigar;
     std::string traceStates;
 };
@@ -2245,251 +1851,6 @@ static void exactTraceRec(ExactRecCtx &ctx,
     }
     if (bestY >= 0) {
         exactTraceRec(ctx, bestY, ni, nj, minUsed, maxUsed, obsCount, modelAggRaw, traceOps, traceStates);
-    }
-}
-
-struct RefineRecCtx {
-    int N;
-    int M;
-    const std::vector<ExactStateExec> *exec;
-    const StateId *trDst;
-    const double *trSc;
-    const std::vector<int8_t> *seqCode;
-    const int *bSplitBegByVD;
-    const int *bSplitEndByVD;
-    bool useDense;
-    std::vector<double> *memoDense;
-    std::vector<uint32_t> *memoSeen;
-    uint32_t memoGen;
-    std::unordered_map<int64_t, double> *memoVit;
-};
-
-static inline int64_t refineRecKey(const RefineRecCtx &ctx, int v, int i, int j) {
-    return (static_cast<int64_t>(v) * static_cast<int64_t>(ctx.N + 2) + i)
-           * static_cast<int64_t>(ctx.N + 2) + j;
-}
-
-static double refineVitRec(RefineRecCtx &ctx, int v, int i, int j) {
-    if (v < 0 || v >= ctx.M || i < 1 || i > ctx.N + 1 || j < 0 || j > ctx.N || i > j + 1) {
-        return NEG_INF;
-    }
-    const int d = j - i + 1;
-    const ExactStateExec &sv = (*ctx.exec)[static_cast<size_t>(v)];
-    if (sv.dmax >= sv.dmin && (d < sv.dmin || d > sv.dmax)) {
-        return NEG_INF;
-    }
-    const int64_t key = refineRecKey(ctx, v, i, j);
-    if (ctx.useDense) {
-        const size_t dk = static_cast<size_t>(key);
-        if ((*ctx.memoSeen)[dk] == ctx.memoGen) {
-            return (*ctx.memoDense)[dk];
-        }
-    } else {
-        std::unordered_map<int64_t, double>::const_iterator it = ctx.memoVit->find(key);
-        if (it != ctx.memoVit->end()) {
-            return it->second;
-        }
-    }
-    double rv = NEG_INF;
-    if (sv.type == CM_ST_E) {
-        rv = (i == j + 1) ? 0.0 : NEG_INF;
-    } else if (sv.type == CM_ST_B) {
-        const int y = sv.bLeft;
-        const int z = sv.bRight;
-        if (y >= 0 && y < ctx.M && z >= 0 && z < ctx.M) {
-            const size_t vd = static_cast<size_t>(v) * static_cast<size_t>(ctx.N + 1) + static_cast<size_t>(d);
-            const int kBeg = ctx.bSplitBegByVD[vd];
-            const int kEnd = ctx.bSplitEndByVD[vd];
-            for (int k = kBeg; k <= kEnd; ++k) {
-                const double l = refineVitRec(ctx, y, i, i + k - 1);
-                const double r = refineVitRec(ctx, z, i + k, j);
-                if (l != NEG_INF && r != NEG_INF) {
-                    rv = std::max(rv, l + r);
-                }
-            }
-        }
-    } else if (d >= sv.dConsume) {
-        const double e = cmStateEmitScoreFast(sv, *ctx.seqCode, i, j);
-        if (e != NEG_INF) {
-            const int ni = i + sv.niShift;
-            const int nj = j - (sv.dConsume - sv.niShift);
-            if (sv.trCount == 1) {
-                const double nxt = refineVitRec(ctx, static_cast<int>(sv.trDst4[0]), ni, nj);
-                if (nxt != NEG_INF) {
-                    rv = std::max(rv, e + sv.trSc4[0] + nxt);
-                }
-            } else if (sv.trCount == 2) {
-                const double nxt0 = refineVitRec(ctx, static_cast<int>(sv.trDst4[0]), ni, nj);
-                if (nxt0 != NEG_INF) {
-                    rv = std::max(rv, e + sv.trSc4[0] + nxt0);
-                }
-                const double nxt1 = refineVitRec(ctx, static_cast<int>(sv.trDst4[1]), ni, nj);
-                if (nxt1 != NEG_INF) {
-                    rv = std::max(rv, e + sv.trSc4[1] + nxt1);
-                }
-            } else if (sv.trCount == 4) {
-                const double nxt0 = refineVitRec(ctx, static_cast<int>(sv.trDst4[0]), ni, nj);
-                if (nxt0 != NEG_INF) {
-                    rv = std::max(rv, e + sv.trSc4[0] + nxt0);
-                }
-                const double nxt1 = refineVitRec(ctx, static_cast<int>(sv.trDst4[1]), ni, nj);
-                if (nxt1 != NEG_INF) {
-                    rv = std::max(rv, e + sv.trSc4[1] + nxt1);
-                }
-                const double nxt2 = refineVitRec(ctx, static_cast<int>(sv.trDst4[2]), ni, nj);
-                if (nxt2 != NEG_INF) {
-                    rv = std::max(rv, e + sv.trSc4[2] + nxt2);
-                }
-                const double nxt3 = refineVitRec(ctx, static_cast<int>(sv.trDst4[3]), ni, nj);
-                if (nxt3 != NEG_INF) {
-                    rv = std::max(rv, e + sv.trSc4[3] + nxt3);
-                }
-            } else {
-                for (int t = 0; t < sv.trCount; ++t) {
-                    const size_t ti = sv.trOff + static_cast<size_t>(t);
-                    const double nxt = refineVitRec(ctx, ctx.trDst[ti], ni, nj);
-                    if (nxt != NEG_INF) {
-                        rv = std::max(rv, e + ctx.trSc[ti] + nxt);
-                    }
-                }
-            }
-        }
-    }
-    if (ctx.useDense) {
-        const size_t dk = static_cast<size_t>(key);
-        (*ctx.memoSeen)[dk] = ctx.memoGen;
-        (*ctx.memoDense)[dk] = rv;
-    } else {
-        (*ctx.memoVit)[key] = rv;
-    }
-    return rv;
-}
-
-static void refineTraceRec(RefineRecCtx &ctx,
-                           int v,
-                           int i,
-                           int j,
-                           std::vector<int> &traceStatesRefined) {
-    const double best = refineVitRec(ctx, v, i, j);
-    if (best == NEG_INF) {
-        return;
-    }
-    const ExactStateExec &sv = (*ctx.exec)[static_cast<size_t>(v)];
-    if (sv.type == CM_ST_E) {
-        return;
-    }
-    traceStatesRefined.push_back(v);
-    if (sv.type == CM_ST_B) {
-        const int d = j - i + 1;
-        const int y = sv.bLeft;
-        const int z = sv.bRight;
-        const size_t vd = static_cast<size_t>(v) * static_cast<size_t>(ctx.N + 1) + static_cast<size_t>(d);
-        const int kBeg = ctx.bSplitBegByVD[vd];
-        const int kEnd = ctx.bSplitEndByVD[vd];
-        int bestK = -1;
-        double bestCand = NEG_INF;
-        for (int k = kBeg; k <= kEnd; ++k) {
-            const double l = refineVitRec(ctx, y, i, i + k - 1);
-            const double r = refineVitRec(ctx, z, i + k, j);
-            if (l == NEG_INF || r == NEG_INF) {
-                continue;
-            }
-            const double cand = l + r;
-            if (cand > bestCand) {
-                bestCand = cand;
-                bestK = k;
-            }
-            if (std::fabs(best - cand) < 1e-9) {
-                refineTraceRec(ctx, y, i, i + k - 1, traceStatesRefined);
-                refineTraceRec(ctx, z, i + k, j, traceStatesRefined);
-                return;
-            }
-        }
-        if (bestK >= 0) {
-            refineTraceRec(ctx, y, i, i + bestK - 1, traceStatesRefined);
-            refineTraceRec(ctx, z, i + bestK, j, traceStatesRefined);
-        }
-        return;
-    }
-    const int d = j - i + 1;
-    if (d < sv.dConsume) {
-        return;
-    }
-    const double e = cmStateEmitScoreFast(sv, *ctx.seqCode, i, j);
-    if (e == NEG_INF) {
-        return;
-    }
-    const int ni = i + sv.niShift;
-    const int nj = j - (sv.dConsume - sv.niShift);
-    int bestY = -1;
-    double bestCand = NEG_INF;
-    if (sv.trCount == 1) {
-        const int y = static_cast<int>(sv.trDst4[0]);
-        const double nxt = refineVitRec(ctx, y, ni, nj);
-        if (nxt != NEG_INF) {
-            const double cand = e + sv.trSc4[0] + nxt;
-            bestCand = cand;
-            bestY = y;
-            if (std::fabs(best - cand) < 1e-9) {
-                refineTraceRec(ctx, y, ni, nj, traceStatesRefined);
-                return;
-            }
-        }
-    } else if (sv.trCount == 2) {
-        for (int t = 0; t < 2; ++t) {
-            const int y = static_cast<int>(sv.trDst4[t]);
-            const double nxt = refineVitRec(ctx, y, ni, nj);
-            if (nxt == NEG_INF) {
-                continue;
-            }
-            const double cand = e + sv.trSc4[t] + nxt;
-            if (cand > bestCand) {
-                bestCand = cand;
-                bestY = y;
-            }
-            if (std::fabs(best - cand) < 1e-9) {
-                refineTraceRec(ctx, y, ni, nj, traceStatesRefined);
-                return;
-            }
-        }
-    } else if (sv.trCount == 4) {
-        for (int t = 0; t < 4; ++t) {
-            const int y = static_cast<int>(sv.trDst4[t]);
-            const double nxt = refineVitRec(ctx, y, ni, nj);
-            if (nxt == NEG_INF) {
-                continue;
-            }
-            const double cand = e + sv.trSc4[t] + nxt;
-            if (cand > bestCand) {
-                bestCand = cand;
-                bestY = y;
-            }
-            if (std::fabs(best - cand) < 1e-9) {
-                refineTraceRec(ctx, y, ni, nj, traceStatesRefined);
-                return;
-            }
-        }
-    } else {
-        for (int t = 0; t < sv.trCount; ++t) {
-            const size_t ti = sv.trOff + static_cast<size_t>(t);
-            const int y = ctx.trDst[ti];
-            const double nxt = refineVitRec(ctx, y, ni, nj);
-            if (nxt == NEG_INF) {
-                continue;
-            }
-            const double cand = e + ctx.trSc[ti] + nxt;
-            if (cand > bestCand) {
-                bestCand = cand;
-                bestY = y;
-            }
-            if (std::fabs(best - cand) < 1e-9) {
-                refineTraceRec(ctx, y, ni, nj, traceStatesRefined);
-                return;
-            }
-        }
-    }
-    if (bestY >= 0) {
-        refineTraceRec(ctx, bestY, ni, nj, traceStatesRefined);
     }
 }
 
@@ -3362,54 +2723,6 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 st.push_back(TbCell{bestY, ni, nd});
             }
         }
-        std::vector<int> traceStatesRefined;
-        if (cmRefineTraceEnabled()) {
-            traceStatesRefined.reserve(traceStates.size() + 8);
-            const size_t refineCells = static_cast<size_t>(M) * static_cast<size_t>(N + 2) * static_cast<size_t>(N + 2);
-            const bool refineUseDense = (refineCells <= 12000000ULL); // ~96MB values + ~48MB seen
-            std::vector<double> &memoRefDense = ws.memoVitDense;
-            std::vector<uint32_t> &memoRefSeen = ws.memoVitSeen;
-            uint32_t &memoRefGen = ws.memoVitGen;
-            std::unordered_map<int64_t, double> &memoRefMap = ws.memoVitMap;
-            uint32_t curRefGen = 0;
-            if (refineUseDense) {
-                if (memoRefDense.size() < refineCells) {
-                    memoRefDense.resize(refineCells);
-                }
-                if (memoRefSeen.size() < refineCells) {
-                    memoRefSeen.resize(refineCells, 0);
-                }
-                ++memoRefGen;
-                if (memoRefGen == 0) {
-                    std::fill(memoRefSeen.begin(), memoRefSeen.end(), 0u);
-                    memoRefGen = 1;
-                }
-                curRefGen = memoRefGen;
-                memoRefMap.clear();
-            } else {
-                memoRefDense.clear();
-                memoRefSeen.clear();
-                memoRefMap.clear();
-                memoRefMap.reserve(static_cast<size_t>(M) * static_cast<size_t>(bestD + 8));
-            }
-            RefineRecCtx rctx;
-            rctx.N = N;
-            rctx.M = M;
-            rctx.exec = &exec;
-            rctx.trDst = trDst.empty() ? NULL : &trDst[0];
-            rctx.trSc = trSc.empty() ? NULL : &trSc[0];
-            rctx.seqCode = &ws.seqCode;
-            rctx.bSplitBegByVD = bSplitBegByVD;
-            rctx.bSplitEndByVD = bSplitEndByVD;
-            rctx.useDense = refineUseDense;
-            rctx.memoDense = &memoRefDense;
-            rctx.memoSeen = &memoRefSeen;
-            rctx.memoGen = curRefGen;
-            rctx.memoVit = &memoRefMap;
-            refineTraceRec(rctx, root, bestI, bestI + bestD - 1, traceStatesRefined);
-        }
-        const std::vector<int> &traceStatesForCigar = traceStatesRefined.empty() ? traceStates : traceStatesRefined;
-
         const int tracedLen = (minUsed <= maxUsed) ? (maxUsed - minUsed + 1) : 0;
         if (minUsed > maxUsed || tracedLen < std::max(1, minSpan / 2)) {
             minUsed = bestI;
@@ -3422,8 +2735,8 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         h.mode = bestMode;
         h.trunc = (bestMode != 'J');
         h.cigar = rleTraceOps(traceOps);
-        h.traceStates = encodeTraceStates(traceStatesForCigar);
-        h.cigar = modelTraceCigar(model, traceStatesForCigar);
+        h.traceStates = encodeTraceStates(traceStates);
+        h.cigar = modelTraceCigar(model, traceStates);
         const double null2Corr = scoreCorrectionNull2BitsFromTrace(model, modelAggRaw, obsCount);
         h.cyk = static_cast<double>(bestSc) - null2Corr;
         if (wantInside) {
@@ -3935,383 +3248,6 @@ static void runInfernalExactScan(const InfernalExactModel &model,
     outHits.push_back(h);
 }
 
-static void runDpScan(const Grammar &g,
-                      const std::string &seq,
-                      bool wantInside,
-                      bool wantBacktrace,
-                      std::vector<Hit> &outHits,
-                      const std::string &seqId) {
-    const int n = static_cast<int>(seq.size());
-    const int m = static_cast<int>(g.idToNt.size());
-    if (n == 0 || m == 0) {
-        return;
-    }
-
-    // Banded CYK: cap span length at W to bound memory to O(m*n*W).
-    // W mirrors Infernal's fallback "max emit length" (3*modelLen when known).
-    int W = (g.modelLen > 0) ? std::min(n, 3 * g.modelLen) : n;
-    if (W < 1) W = n;
-    const int Wp1 = W + 1;
-    const size_t cellCount = static_cast<size_t>(m) * static_cast<size_t>(n) * static_cast<size_t>(Wp1);
-    std::vector<double> cyk(cellCount, NEG_INF);
-    std::vector<double> inside;
-    if (wantInside) {
-        inside.assign(cellCount, NEG_INF);
-    }
-
-    const auto idx = [n, Wp1](int nt, int i, int j) -> size_t {
-        return static_cast<size_t>(nt) * static_cast<size_t>(n) * static_cast<size_t>(Wp1)
-             + static_cast<size_t>(i) * static_cast<size_t>(Wp1)
-             + static_cast<size_t>(j - i + 1);
-    };
-    const auto scoreEq = [](double a, double b) -> bool {
-        if (a == NEG_INF || b == NEG_INF) {
-            return false;
-        }
-        const double d = std::fabs(a - b);
-        const double s = std::max(1.0, std::max(std::fabs(a), std::fabs(b)));
-        return d <= 1e-5 * s;
-    };
-
-    int mRoot = -1;
-    int dRoot = -1;
-    for (size_t nt = 0; nt < g.idToNt.size(); ++nt) {
-        const std::string &name = g.idToNt[nt];
-        if (name.find("M_1_") == 0) {
-            mRoot = static_cast<int>(nt);
-        } else if (name.find("D_1_") == 0) {
-            dRoot = static_cast<int>(nt);
-        }
-    }
-
-    const auto applyEpsilonClosure = [&](std::vector<double> &chart, int i, int j, bool insideMode) {
-        if (g.epsRules.empty()) {
-            return;
-        }
-        bool changed = true;
-        int iter = 0;
-        while (changed && iter < static_cast<int>(g.idToNt.size()) + 2) {
-            changed = false;
-            ++iter;
-            for (size_t r = 0; r < g.epsRules.size(); ++r) {
-                const EpsRule &er = g.epsRules[r];
-                const size_t lhs = idx(er.lhs, i, j);
-                const size_t rhs = idx(er.rhs, i, j);
-                if (chart[rhs] == NEG_INF) {
-                    continue;
-                }
-                const double cand = chart[rhs] + er.logp;
-                if (!insideMode) {
-                    if (cand > chart[lhs]) {
-                        chart[lhs] = cand;
-                        changed = true;
-                    }
-                } else {
-                    const double old = chart[lhs];
-                    chart[lhs] = logSumExpMaybeFast(chart[lhs], cand);
-                    if (chart[lhs] != old) {
-                        changed = true;
-                    }
-                }
-            }
-        }
-    };
-
-    for (int i = 0; i < n; ++i) {
-        const char b = seq[i];
-        for (size_t r = 0; r < g.unaryRules.size(); ++r) {
-            const UnaryRule &ur = g.unaryRules[r];
-            if (ur.base == b || b == 'N') {
-                size_t at = idx(ur.lhs, i, i);
-                cyk[at] = std::max(cyk[at], ur.logp);
-                if (wantInside) {
-                    inside[at] = logSumExpMaybeFast(inside[at], ur.logp);
-                }
-            }
-        }
-        applyEpsilonClosure(cyk, i, i, false);
-        if (wantInside) {
-            applyEpsilonClosure(inside, i, i, true);
-        }
-    }
-
-    // Infernal-like local semantics: evaluate all spans up to the band.
-    const int maxSpan = W;
-    const int minSpan = 1;
-    for (int len = 2; len <= maxSpan; ++len) {
-        for (int i = 0; i + len - 1 < n; ++i) {
-            const int j = i + len - 1;
-
-            for (size_t br = 0; br < g.binaryRules.size(); ++br) {
-                const BinaryRule &r = g.binaryRules[br];
-                double best = NEG_INF;
-                double sum = NEG_INF;
-                for (int k = i; k < j; ++k) {
-                    const double lCyk = cyk[idx(r.rhs1, i, k)];
-                    const double rCyk = cyk[idx(r.rhs2, k + 1, j)];
-                    if (lCyk != NEG_INF && rCyk != NEG_INF) {
-                        best = std::max(best, lCyk + rCyk + r.logp);
-                    }
-                    if (wantInside) {
-                        const double lIn = inside[idx(r.rhs1, i, k)];
-                        const double rIn = inside[idx(r.rhs2, k + 1, j)];
-                        if (lIn != NEG_INF && rIn != NEG_INF) {
-                            sum = logSumExpMaybeFast(sum, lIn + rIn + r.logp);
-                        }
-                    }
-                }
-                size_t at = idx(r.lhs, i, j);
-                cyk[at] = std::max(cyk[at], best);
-                if (wantInside) {
-                    inside[at] = logSumExpMaybeFast(inside[at], sum);
-                }
-            }
-
-            for (size_t pr = 0; pr < g.pairRules.size(); ++pr) {
-                const PairRule &r = g.pairRules[pr];
-                const char lb = seq[i];
-                const char rb = seq[j];
-                if (!((lb == r.leftBase || lb == 'N') && (rb == r.rightBase || rb == 'N'))) {
-                    continue;
-                }
-                double innerCyk = NEG_INF;
-                double innerInside = NEG_INF;
-                if (r.inner == -1) {
-                    if (j == i + 1) {
-                        innerCyk = 0.0;
-                        innerInside = 0.0;
-                    }
-                } else if (i + 1 <= j - 1) {
-                    innerCyk = cyk[idx(r.inner, i + 1, j - 1)];
-                    if (wantInside) {
-                        innerInside = inside[idx(r.inner, i + 1, j - 1)];
-                    }
-                }
-                if (innerCyk != NEG_INF) {
-                    const size_t at = idx(r.lhs, i, j);
-                    cyk[at] = std::max(cyk[at], innerCyk + r.logp);
-                    if (wantInside && innerInside != NEG_INF) {
-                        inside[at] = logSumExpMaybeFast(inside[at], innerInside + r.logp);
-                    }
-                }
-            }
-            applyEpsilonClosure(cyk, i, j, false);
-            if (wantInside) {
-                applyEpsilonClosure(inside, i, j, true);
-            }
-        }
-    }
-
-    // Report best parse per sequence for native grammar mode.
-    // This is closer to Infernal cmsearch top-hit behavior than emitting every finite window.
-    double bestCyk = NEG_INF;
-    double bestInside = NEG_INF;
-    int bestI = -1;
-    int bestJ = -1;
-    for (int i = 0; i < n; ++i) {
-        const int jMax = std::min(n - 1, i + maxSpan - 1);
-        for (int j = i; j <= jMax; ++j) {
-            const double cykSc = cyk[idx(g.start, i, j)];
-            const double inSc = wantInside ? inside[idx(g.start, i, j)] : NEG_INF;
-            if (cykSc == NEG_INF && inSc == NEG_INF) {
-                continue;
-            }
-            const int len = j - i + 1;
-            if (len < minSpan) {
-                continue;
-            }
-            const bool strictlyBetter = (bestI < 0 || cykSc > bestCyk);
-            if (strictlyBetter) {
-                bestCyk = cykSc;
-                bestInside = inSc;
-                bestI = i;
-                bestJ = j;
-            }
-        }
-    }
-    if (bestI >= 0) {
-        if (cmDebugExtEnabled()) {
-            double leftExt = NEG_INF;
-            double rightExt = NEG_INF;
-            const int bestLen = bestJ - bestI + 1;
-            const bool extFits = (bestLen + 1) <= W;
-            if (bestI > 0 && extFits) {
-                leftExt = cyk[idx(g.start, bestI - 1, bestJ)];
-            }
-            if (bestJ + 1 < n && extFits) {
-                rightExt = cyk[idx(g.start, bestI, bestJ + 1)];
-            }
-            const double mBest = (mRoot >= 0) ? cyk[idx(mRoot, bestI, bestJ)] : NEG_INF;
-            const double dBest = (dRoot >= 0) ? cyk[idx(dRoot, bestI, bestJ)] : NEG_INF;
-            const double mRight = (mRoot >= 0 && bestJ + 1 < n && extFits) ? cyk[idx(mRoot, bestI, bestJ + 1)] : NEG_INF;
-            const double dRight = (dRoot >= 0 && bestJ + 1 < n && extFits) ? cyk[idx(dRoot, bestI, bestJ + 1)] : NEG_INF;
-            const double mCoreR = (mRoot >= 0 && bestJ > bestI) ? cyk[idx(mRoot, bestI, bestJ - 1)] : NEG_INF;
-            const double dCoreR = (dRoot >= 0 && bestJ > bestI) ? cyk[idx(dRoot, bestI, bestJ - 1)] : NEG_INF;
-            const double mCoreL = (mRoot >= 0 && bestI + 1 <= bestJ) ? cyk[idx(mRoot, bestI + 1, bestJ)] : NEG_INF;
-            const double dCoreL = (dRoot >= 0 && bestI + 1 <= bestJ) ? cyk[idx(dRoot, bestI + 1, bestJ)] : NEG_INF;
-            Debug(Debug::INFO) << "cmsearch-ext-debug " << seqId
-                               << " best=[" << (bestI + 1) << "," << (bestJ + 1) << "]"
-                               << " score=" << bestCyk
-                               << " leftExt=" << leftExt
-                               << " rightExt=" << rightExt
-                               << " dL=" << (leftExt == NEG_INF ? NEG_INF : (bestCyk - leftExt))
-                               << " dR=" << (rightExt == NEG_INF ? NEG_INF : (bestCyk - rightExt))
-                               << " mBest=" << mBest
-                               << " dBest=" << dBest
-                               << " mRight=" << mRight
-                               << " dRight=" << dRight
-                               << " mCoreR=" << mCoreR
-                               << " dCoreR=" << dCoreR
-                               << " mCoreL=" << mCoreL
-                               << " dCoreL=" << dCoreL
-                               << "\n";
-        }
-        Hit h;
-        h.seqId = seqId;
-        h.start1 = bestI + 1;
-        h.end1 = bestJ + 1;
-        h.cigar = "NA";
-        h.traceStates = "NA";
-        if (wantBacktrace) {
-            std::string traceOps;
-            traceOps.reserve(static_cast<size_t>(std::max(1, bestJ - bestI + 1)));
-            std::unordered_set<uint64_t> epsStack;
-            std::function<bool(int, int, int)> traceNt =
-                [&](int nt, int i, int j) -> bool {
-                    if (i < 0 || j < i || j >= n || nt < 0 || nt >= m) {
-                        return false;
-                    }
-                    const double v = cyk[idx(nt, i, j)];
-                    if (v == NEG_INF) {
-                        return false;
-                    }
-                    if (i == j) {
-                        const char b = seq[i];
-                        for (size_t urIdx = 0; urIdx < g.unaryRules.size(); ++urIdx) {
-                            const UnaryRule &ur = g.unaryRules[urIdx];
-                            if (ur.lhs != nt) {
-                                continue;
-                            }
-                            if (!(ur.base == b || b == 'N')) {
-                                continue;
-                            }
-                            if (scoreEq(v, ur.logp)) {
-                                traceOps.push_back('M');
-                                return true;
-                            }
-                        }
-                    }
-                    for (size_t pr = 0; pr < g.pairRules.size(); ++pr) {
-                        const PairRule &r = g.pairRules[pr];
-                        if (r.lhs != nt) {
-                            continue;
-                        }
-                        if (i >= j) {
-                            continue;
-                        }
-                        const char lb = seq[i];
-                        const char rb = seq[j];
-                        if (!((lb == r.leftBase || lb == 'N') && (rb == r.rightBase || rb == 'N'))) {
-                            continue;
-                        }
-                        if (r.inner == -1) {
-                            if (j == i + 1 && scoreEq(v, r.logp)) {
-                                traceOps.push_back('M');
-                                traceOps.push_back('M');
-                                return true;
-                            }
-                            continue;
-                        }
-                        if (i + 1 > j - 1) {
-                            continue;
-                        }
-                        const double inV = cyk[idx(r.inner, i + 1, j - 1)];
-                        if (inV == NEG_INF) {
-                            continue;
-                        }
-                        if (!scoreEq(v, inV + r.logp)) {
-                            continue;
-                        }
-                        const size_t save = traceOps.size();
-                        traceOps.push_back('M');
-                        if (traceNt(r.inner, i + 1, j - 1)) {
-                            traceOps.push_back('M');
-                            return true;
-                        }
-                        traceOps.resize(save);
-                    }
-                    for (size_t br = 0; br < g.binaryRules.size(); ++br) {
-                        const BinaryRule &r = g.binaryRules[br];
-                        if (r.lhs != nt) {
-                            continue;
-                        }
-                        for (int k = i; k < j; ++k) {
-                            const double lv = cyk[idx(r.rhs1, i, k)];
-                            const double rv = cyk[idx(r.rhs2, k + 1, j)];
-                            if (lv == NEG_INF || rv == NEG_INF) {
-                                continue;
-                            }
-                            if (!scoreEq(v, lv + rv + r.logp)) {
-                                continue;
-                            }
-                            const size_t save = traceOps.size();
-                            if (traceNt(r.rhs1, i, k) && traceNt(r.rhs2, k + 1, j)) {
-                                return true;
-                            }
-                            traceOps.resize(save);
-                        }
-                    }
-                    const uint64_t stackKey = (static_cast<uint64_t>(nt) << 42)
-                                            | (static_cast<uint64_t>(i) << 21)
-                                            | static_cast<uint64_t>(j);
-                    if (epsStack.find(stackKey) != epsStack.end()) {
-                        return false;
-                    }
-                    epsStack.insert(stackKey);
-                    for (size_t erIdx = 0; erIdx < g.epsRules.size(); ++erIdx) {
-                        const EpsRule &er = g.epsRules[erIdx];
-                        if (er.lhs != nt) {
-                            continue;
-                        }
-                        const double rv = cyk[idx(er.rhs, i, j)];
-                        if (rv == NEG_INF) {
-                            continue;
-                        }
-                        if (!scoreEq(v, rv + er.logp)) {
-                            continue;
-                        }
-                        const size_t save = traceOps.size();
-                        traceOps.push_back('D');
-                        if (traceNt(er.rhs, i, j)) {
-                            epsStack.erase(stackKey);
-                            return true;
-                        }
-                        traceOps.resize(save);
-                    }
-                    epsStack.erase(stackKey);
-                    return false;
-                };
-            if (traceNt(g.start, bestI, bestJ)) {
-                h.cigar = rleTraceOps(traceOps);
-            } else {
-                h.cigar = std::to_string(std::max(1, bestJ - bestI + 1)) + "M";
-            }
-        }
-        const bool useNegCal = g.hasPiecewiseCal && bestCyk < g.calSplit;
-        const double calA = useNegCal ? g.calNegA : g.calA;
-        const double calB = useNegCal ? g.calNegB : g.calB;
-        h.cyk = calA * bestCyk + calB;
-        if (bestInside == NEG_INF) {
-            h.inside = NEG_INF;
-        } else {
-            const bool useNegCalInside = g.hasPiecewiseCal && bestInside < g.calSplit;
-            const double calAInside = useNegCalInside ? g.calNegA : g.calA;
-            const double calBInside = useNegCalInside ? g.calNegB : g.calB;
-            h.inside = calAInside * bestInside + calBInside;
-        }
-        outHits.push_back(h);
-    }
-}
 
 } // namespace
 
@@ -4329,9 +3265,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
 
     struct QueryModel {
         unsigned int key;
-        Grammar g;
         InfernalExactModel exactModel;
-        bool useInfernalCompat;
     };
 
     // For DB input, keep reader open and parse CMs lazily to avoid OOM
@@ -4347,7 +3281,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
         const std::string cmIndex = par.db1 + ".index";
         cmReader = new DBReader<unsigned int>(par.db1.c_str(),
                                               cmIndex.c_str(),
-                                              1,
+                                              par.threads > 0 ? par.threads : 1,
                                               DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
         cmReader->open(DBReader<unsigned int>::NOSORT);
         queryRefs.reserve(cmReader->getSize());
@@ -4359,33 +3293,32 @@ int cmscan(int argc, const char **argv, const Command &command) {
         }
         Debug(Debug::INFO) << "CM database: " << queryRefs.size() << " models (lazy loading)\n";
     } else {
-        singleModel.key = 0;
-        singleModel.useInfernalCompat = false;
-        if (looksLikeInfernalCm(par.db1)) {
-            Debug(Debug::INFO) << "Detected Infernal .cm file, loading internal exact state-graph model\n";
-            singleModel.exactModel = parseInfernalCmExactModel(par.db1);
-            singleModel.useInfernalCompat = true;
-        } else {
-            singleModel.g = parseGrammar(par.db1);
+        if (looksLikeInfernalCm(par.db1) == false) {
+            Debug(Debug::ERROR) << "cmscan requires an Infernal CM (run cmbuild first): " << par.db1 << "\n";
+            return EXIT_FAILURE;
         }
+        Debug(Debug::INFO) << "Loading Infernal CM: " << par.db1 << "\n";
+        singleModel.key = 0;
+        singleModel.exactModel = parseInfernalCmExactModel(par.db1);
         QueryModelRef ref;
         ref.key = 0;
         ref.dbIdx = SIZE_MAX;
         queryRefs.push_back(ref);
     }
 
+    const size_t nThreads = (par.threads > 0) ? static_cast<size_t>(par.threads) : 1u;
+
     const std::string seqDbPath = par.db2;
     const std::string seqDbIndex = par.db2 + ".index";
     DBReader<unsigned int> seqDbr(seqDbPath.c_str(),
                                   seqDbIndex.c_str(),
-                                  1,
+                                  static_cast<int>(nThreads),
                                   DBReader<unsigned int>::USE_DATA
                                       | DBReader<unsigned int>::USE_INDEX
                                       | DBReader<unsigned int>::USE_LOOKUP);
     seqDbr.open(DBReader<unsigned int>::NOSORT);
     NucleotideMatrix nucMat(Parameters::getInstance().scoringMatrixFile.values.nucleotide().c_str(), 1.0, 0.0);
     BaseMatrix &subMat = static_cast<BaseMatrix&>(nucMat);
-    Sequence seqObj(seqDbr.getMaxSeqLen(), Parameters::DBTYPE_NUCLEOTIDES, &nucMat, 0, false, false);
 
     const size_t observedDbResidues = seqDbr.getAminoAcidDBSize();
     const double strandMult = (par.strand == 2) ? 2.0 : 1.0;
@@ -4394,83 +3327,66 @@ int cmscan(int argc, const char **argv, const Command &command) {
         : (static_cast<double>(observedDbResidues) * strandMult);
     const bool wantInsideUser = (par.cmMode == LocalParameters::CM_MODE_INSIDE);
 
-    CandidateResult candidateResult = loadResultDbCandidates(par.db3, par.threads);
-    std::unordered_map<unsigned int, std::unordered_set<unsigned int> > &candidatesByQuery = candidateResult.candidates;
+    // Open the result DB like any MMseqs2 result consumer: stream per-query
+    // payloads on demand via thread_idx'd getData; no upfront parsing.
+    DBReader<unsigned int> resultReader(par.db3.c_str(),
+                                        (par.db3 + ".index").c_str(),
+                                        static_cast<int>(nThreads),
+                                        DBReader<unsigned int>::USE_DATA
+                                            | DBReader<unsigned int>::USE_INDEX);
+    resultReader.open(DBReader<unsigned int>::NOSORT);
+
     const float cmRegionFlanking = par.cmRegionFlanking;
     Debug(Debug::INFO) << subcmd << " output DB: " << par.db4 << "\n";
     DBWriter resultWriter(par.db4.c_str(),
                           par.db4Index.c_str(),
-                          1,
+                          static_cast<unsigned int>(nThreads),
                           par.compressed,
                           Parameters::DBTYPE_ALIGNMENT_RES);
     resultWriter.open();
 
-    const size_t nThreads = (par.threads > 0) ? static_cast<size_t>(par.threads) : 1u;
-    char buffer[1024 + 32768 * 4];
+    if (cmFastMathEnabled()) {
+        Debug(Debug::WARNING) << "MMSEQS_CMSCAN_FASTMATH=1 enabled: using approximate log/exp in Inside DP (scores may drift)\n";
+    }
+
     size_t totalHits = 0;
-    for (size_t qi = 0; qi < queryRefs.size(); ++qi) {
+#pragma omp parallel num_threads(static_cast<int>(nThreads)) reduction(+:totalHits)
+{
+    unsigned int thread_idx = 0;
+#ifdef OPENMP
+    thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+    char buffer[1024 + 32768 * 4];
+    Sequence seqObjLocal(seqDbr.getMaxSeqLen(), Parameters::DBTYPE_NUCLEOTIDES, &nucMat, 0, false, false);
+
+    #pragma omp for schedule(dynamic, 1)
+    for (long qi = 0; qi < static_cast<long>(queryRefs.size()); ++qi) {
         const QueryModelRef &ref = queryRefs[qi];
 
-        // Load CM lazily: parse from DB on demand, or use preloaded single model
+        // Load CM lazily, in-memory: parse the DB entry directly via istringstream.
         QueryModel qm;
         if (ref.dbIdx != SIZE_MAX && cmReader != NULL) {
             qm.key = ref.key;
-            qm.useInfernalCompat = false;
-            const char *raw = cmReader->getData(ref.dbIdx, 0);
+            const char *raw = cmReader->getData(ref.dbIdx, thread_idx);
             size_t len = cmReader->getEntryLen(ref.dbIdx);
             std::string text(raw, len);
             const size_t nul = text.find('\0');
             if (nul != std::string::npos) {
                 text.resize(nul);
             }
-            const std::string tmpPath = writeTempTextFile(text);
-            if (looksLikeInfernalCmText(text)) {
-                qm.exactModel = parseInfernalCmExactModel(tmpPath);
-                qm.useInfernalCompat = true;
-            } else {
-                qm.g = parseGrammar(tmpPath);
-            }
-            std::remove(tmpPath.c_str());
+            std::istringstream iss(text);
+            const std::string srcLabel = "cm-db-entry[" + std::to_string(qm.key) + "]";
+            qm.exactModel = parseInfernalCmExactModelFromStream(iss, srcLabel);
         } else {
             qm = singleModel;
         }
 
-        std::unordered_map<unsigned int, std::unordered_set<unsigned int> >::const_iterator cq = candidatesByQuery.find(qm.key);
-        if (cq == candidatesByQuery.end()) {
-            resultWriter.writeData("", 0, qm.key, 0);
-            continue;
-        }
+        // Infernal default: Inside score is the primary ranking signal;
+        // CYK remains the trace source. `wantInsideUser` only changes which
+        // score we report, not whether Inside is computed.
+        const bool promoteInsideToPrimary = !wantInsideUser;
+        const bool wantInside = true;
 
-        // Decode only the candidate target sequences for this query
-        std::vector<FastaSeq> targetSeqs;
-        targetSeqs.reserve(cq->second.size());
-        for (std::unordered_set<unsigned int>::const_iterator it = cq->second.begin(); it != cq->second.end(); ++it) {
-            const size_t id = seqDbr.getId(*it);
-            if (id == UINT_MAX) {
-                continue;
-            }
-            targetSeqs.push_back(decodeOneSequence(seqDbr, id, subMat, seqObj));
-        }
-        if (targetSeqs.empty()) {
-            resultWriter.writeData("", 0, qm.key, 0);
-            continue;
-        }
-
-        std::vector<Hit> hits;
-        hits.reserve(1024);
-        const bool infernalDefaultPrimaryInside = qm.useInfernalCompat && !wantInsideUser;
-        const bool wantInside = wantInsideUser || infernalDefaultPrimaryInside;
-        if (wantInside && cmFastMathEnabled()) {
-            Debug(Debug::WARNING) << "MMSEQS_CMSCAN_FASTMATH=1 enabled: using approximate log/exp in Inside DP (scores may drift)\n";
-        }
-        // Build per-target region offsets when --cm-region is active
-        std::vector<int> regionOffsets(targetSeqs.size(), 0);
-        std::vector<std::string> regionSeqs(targetSeqs.size());
-        // Per-target maxHitLen: cap the CYK d-search by a multiple of the
-        // rnasearch envelope length. A true CM hit has d within a small
-        // multiple of the prefilter span, and the memoized Viterbi only
-        // wastes memory on larger spans.
-        std::vector<int> maxHitLens(targetSeqs.size(), 0);
         // Slack for the CYK d-cap. We take the max of:
         //   - 3x the rnasearch prefilter envelope length (local extension)
         //   - 1.5x the CM consensus length (global: a true CM hit can stretch
@@ -4480,192 +3396,206 @@ int cmscan(int argc, const char **argv, const Command &command) {
         // model.w (Infernal's W) remains the hard upper bound on the CM side.
         static constexpr int CM_MAXSPAN_ENV_SLACK = 3;
         static constexpr double CM_MAXSPAN_CLEN_SLACK = 1.5;
-        const int clenFloor = qm.useInfernalCompat
-            ? static_cast<int>(qm.exactModel.clen * CM_MAXSPAN_CLEN_SLACK)
-            : 0;
-        for (size_t i = 0; i < targetSeqs.size(); ++i) {
-            const std::string &fullSeq = targetSeqs[i].seq;
-            uint64_t ck = CandidateResult::coordKey(qm.key, targetSeqs[i].key);
-            std::unordered_map<uint64_t, RegionCoord>::const_iterator it = candidateResult.regionCoords.find(ck);
-            if (cmRegionFlanking > 0.0f) {
-                if (it != candidateResult.regionCoords.end()) {
-                    const int hitStart = it->second.dbStart;
-                    const int hitEnd = it->second.dbEnd;
-                    const int qAlnLen = std::max(1, it->second.qEnd - it->second.qStart + 1);
-                    const int flank = static_cast<int>(cmRegionFlanking * qAlnLen);
-                    const int seqLen = static_cast<int>(fullSeq.size());
-                    const int regStart = std::max(0, hitStart - flank);
-                    const int regEnd = std::min(seqLen, hitEnd + flank + 1);
-                    regionSeqs[i] = fullSeq.substr(static_cast<size_t>(regStart),
-                                                   static_cast<size_t>(regEnd - regStart));
-                    regionOffsets[i] = regStart;
-                } else {
-                    regionSeqs[i] = fullSeq;
+        const int clenFloor = static_cast<int>(qm.exactModel.clen * CM_MAXSPAN_CLEN_SLACK);
+
+        std::vector<Hit> hits;
+        hits.reserve(1024);
+        std::unordered_set<unsigned int> seen;
+
+        // Finalize each scanned hit: remap strand-specific coords to forward,
+        // promote Inside -> primary score when Infernal-default, compute
+        // evalue, and (forward only, with backtrace) compute trace-based pid.
+        auto finalizeHit = [&](Hit &h, int strand, const std::string &targetFullSeq,
+                               unsigned int tKey, unsigned int fullLen,
+                               int offset, int regionLen) {
+            h.dbKey = tKey;
+            h.dbLen = fullLen;
+            if (strand > 0) {
+                if (offset > 0) {
+                    h.start1 += offset;
+                    h.end1 += offset;
                 }
             } else {
-                regionSeqs[i] = fullSeq;
-            }
-            if (it != candidateResult.regionCoords.end()) {
-                const int dbSpan = std::max(1, it->second.dbEnd - it->second.dbStart + 1);
-                maxHitLens[i] = std::max(dbSpan * CM_MAXSPAN_ENV_SLACK, clenFloor);
-            } else if (clenFloor > 0) {
-                maxHitLens[i] = clenFloor;
-            }
-        }
-
-        // Scan both forward and reverse complement strands
-        std::vector<std::string> revSeqs(targetSeqs.size());
-        for (size_t i = 0; i < targetSeqs.size(); ++i) {
-            revSeqs[i] = reverseComplement(regionSeqs[i]);
-        }
-
-        std::vector< std::vector<Hit> > perSeqHits(targetSeqs.size());
-        std::vector< std::vector<Hit> > perSeqHitsRev(targetSeqs.size());
-        if (nThreads <= 1 || targetSeqs.size() <= 1) {
-            for (size_t i = 0; i < targetSeqs.size(); ++i) {
-                if (qm.useInfernalCompat) {
-                    runInfernalExactScan(qm.exactModel, regionSeqs[i], wantInside, perSeqHits[i], targetSeqs[i].id, maxHitLens[i]);
-                    runInfernalExactScan(qm.exactModel, revSeqs[i], wantInside, perSeqHitsRev[i], targetSeqs[i].id, maxHitLens[i]);
-                } else {
-                    runDpScan(qm.g, regionSeqs[i], wantInside, par.addBacktrace, perSeqHits[i], targetSeqs[i].id);
-                    runDpScan(qm.g, revSeqs[i], wantInside, par.addBacktrace, perSeqHitsRev[i], targetSeqs[i].id);
-                }
-            }
-        } else {
-            #pragma omp parallel for schedule(dynamic, 1) num_threads(static_cast<int>(nThreads))
-            for (long i = 0; i < static_cast<long>(targetSeqs.size()); ++i) {
-                const size_t ui = static_cast<size_t>(i);
-                if (qm.useInfernalCompat) {
-                    runInfernalExactScan(qm.exactModel, regionSeqs[ui], wantInside, perSeqHits[ui], targetSeqs[ui].id, maxHitLens[ui]);
-                    runInfernalExactScan(qm.exactModel, revSeqs[ui], wantInside, perSeqHitsRev[ui], targetSeqs[ui].id, maxHitLens[ui]);
-                } else {
-                    runDpScan(qm.g, regionSeqs[ui], wantInside, par.addBacktrace, perSeqHits[ui], targetSeqs[ui].id);
-                    runDpScan(qm.g, revSeqs[ui], wantInside, par.addBacktrace, perSeqHitsRev[ui], targetSeqs[ui].id);
-                }
-            }
-        }
-        for (size_t i = 0; i < targetSeqs.size(); ++i) {
-            const int offset = regionOffsets[i];
-            const int seqLen = static_cast<int>(regionSeqs[i].size());
-            // Forward strand hits
-            for (size_t j = 0; j < perSeqHits[i].size(); ++j) {
-                perSeqHits[i][j].dbKey = targetSeqs[i].key;
-                perSeqHits[i][j].dbLen = static_cast<unsigned int>(targetSeqs[i].seq.size());
-                perSeqHits[i][j].targetIdx = i;
-                if (offset > 0) {
-                    perSeqHits[i][j].start1 += offset;
-                    perSeqHits[i][j].end1 += offset;
-                }
-            }
-            hits.insert(hits.end(), perSeqHits[i].begin(), perSeqHits[i].end());
-            // Reverse strand hits: map coordinates back to forward strand
-            // revcomp pos p corresponds to forward pos (seqLen - p + 1)
-            for (size_t j = 0; j < perSeqHitsRev[i].size(); ++j) {
-                Hit &h = perSeqHitsRev[i][j];
-                h.dbKey = targetSeqs[i].key;
-                h.dbLen = static_cast<unsigned int>(targetSeqs[i].seq.size());
-                h.targetIdx = i;
-                int fwdStart = seqLen - h.start1 + 1 + offset;
-                int fwdEnd = seqLen - h.end1 + 1 + offset;
-                // Use start > end to indicate minus strand (Infernal convention)
+                // revcomp pos p corresponds to forward pos (regionLen - p + 1);
+                // Infernal convention: start1 > end1 indicates minus strand.
+                int fwdStart = regionLen - h.start1 + 1 + offset;
+                int fwdEnd = regionLen - h.end1 + 1 + offset;
                 h.start1 = fwdStart;
                 h.end1 = fwdEnd;
             }
-            hits.insert(hits.end(), perSeqHitsRev[i].begin(), perSeqHitsRev[i].end());
-        }
-        if (infernalDefaultPrimaryInside) {
-            for (size_t i = 0; i < hits.size(); ++i) {
-                if (hits[i].inside != NEG_INF) {
-                    hits[i].cyk = hits[i].inside;
+            if (promoteInsideToPrimary && h.inside != NEG_INF) {
+                h.cyk = h.inside;
+            }
+            double ev = 0.0;
+            if (infernalExactScoreToEvalue(qm.exactModel, /*evalueModeInside=*/true, h.mode, h.cyk, targetDbResidues, ev)) {
+                h.evalue = ev;
+                h.hasEvalue = true;
+            }
+            const bool hasBacktrace = (!h.cigar.empty() && h.cigar != "NA");
+            if (hasBacktrace
+                && !h.traceStates.empty() && h.traceStates != "NA"
+                && h.start1 > 0 && h.end1 >= h.start1) {
+                const size_t s0 = static_cast<size_t>(h.start1 - 1);
+                const size_t slen = static_cast<size_t>(h.end1 - h.start1 + 1);
+                if (s0 < targetFullSeq.size()) {
+                    const std::string obs = targetFullSeq.substr(s0, std::min(slen, targetFullSeq.size() - s0));
+                    const std::vector<int> trace = decodeTraceStates(h.traceStates);
+                    const std::string cons = modelTraceConsensusForCigar(qm.exactModel, trace);
+                    h.precomputedSeqId = seqIdFromCigarConsensus(h.cigar, cons, obs);
+                }
+            }
+        };
+
+        // Stream per-target: read one candidate line at a time, decode the
+        // target, scan fwd+rev, finalize, accumulate into `hits`.
+        const size_t rid = resultReader.getId(qm.key);
+        if (rid != UINT_MAX) {
+            char *data = resultReader.getData(rid, thread_idx);
+            while (*data != '\0') {
+                while (*data == ' ' || *data == '\t') {
+                    ++data;
+                }
+                // Format: targetKey score seqId evalue qStart qEnd qLen dbStart dbEnd dbLen [backtrace]
+                const char *lineStart = data;
+                char *endptr = NULL;
+                const unsigned long k = std::strtoul(data, &endptr, 10);
+                if (endptr == data || k > static_cast<unsigned long>(UINT_MAX)) {
+                    data = Util::skipLine(data);
+                    continue;
+                }
+                const unsigned int tKey = static_cast<unsigned int>(k);
+                // Dedup: only score first occurrence (best hit per target)
+                if (seen.insert(tKey).second == false) {
+                    data = Util::skipLine(data);
+                    continue;
+                }
+
+                bool hasRegionCoord = false;
+                int dbStart = 0, dbEnd = 0, qStart = 0, qEnd = 0;
+                if (*endptr == '\t') {
+                    const char *p = endptr;
+                    int col = 1;
+                    const char *colStart[12] = {NULL};
+                    colStart[0] = lineStart;
+                    while (*p != '\n' && *p != '\0' && col < 11) {
+                        if (*p == '\t') {
+                            colStart[col] = p + 1;
+                            col++;
+                        }
+                        p++;
+                    }
+                    if (col >= 10 && colStart[4] && colStart[5] && colStart[7] && colStart[8]) {
+                        dbStart = Util::fast_atoi<int>(colStart[7]);
+                        dbEnd = Util::fast_atoi<int>(colStart[8]);
+                        if (dbStart > dbEnd) std::swap(dbStart, dbEnd);
+                        qStart = Util::fast_atoi<int>(colStart[4]);
+                        qEnd = Util::fast_atoi<int>(colStart[5]);
+                        if (qStart > qEnd) std::swap(qStart, qEnd);
+                        hasRegionCoord = true;
+                    }
+                }
+                data = Util::skipLine(data);
+
+                const size_t tId = seqDbr.getId(tKey);
+                if (tId == UINT_MAX) {
+                    continue;
+                }
+                FastaSeq fs = decodeOneSequence(seqDbr, tId, subMat, seqObjLocal, thread_idx);
+
+                // Build region slice + d-cap.
+                std::string regionSeq;
+                int offset = 0;
+                int maxHitLen = 0;
+                if (cmRegionFlanking > 0.0f && hasRegionCoord) {
+                    const int qAlnLen = std::max(1, qEnd - qStart + 1);
+                    const int flank = static_cast<int>(cmRegionFlanking * qAlnLen);
+                    const int sLen = static_cast<int>(fs.seq.size());
+                    const int regStart = std::max(0, dbStart - flank);
+                    const int regEnd = std::min(sLen, dbEnd + flank + 1);
+                    regionSeq = fs.seq.substr(static_cast<size_t>(regStart),
+                                              static_cast<size_t>(regEnd - regStart));
+                    offset = regStart;
+                } else {
+                    regionSeq = fs.seq;
+                }
+                if (hasRegionCoord) {
+                    const int dbSpan = std::max(1, dbEnd - dbStart + 1);
+                    maxHitLen = std::max(dbSpan * CM_MAXSPAN_ENV_SLACK, clenFloor);
+                } else if (clenFloor > 0) {
+                    maxHitLen = clenFloor;
+                }
+
+                std::string revSeq = reverseComplement(regionSeq);
+                std::vector<Hit> fwdHits, revHits;
+                runInfernalExactScan(qm.exactModel, regionSeq, wantInside, fwdHits, fs.id, maxHitLen);
+                runInfernalExactScan(qm.exactModel, revSeq,    wantInside, revHits, fs.id, maxHitLen);
+
+                const unsigned int fullLen = static_cast<unsigned int>(fs.seq.size());
+                const int regionLen = static_cast<int>(regionSeq.size());
+                for (Hit &h : fwdHits) {
+                    finalizeHit(h, +1, fs.seq, tKey, fullLen, offset, regionLen);
+                    hits.emplace_back(std::move(h));
+                }
+                for (Hit &h : revHits) {
+                    finalizeHit(h, -1, fs.seq, tKey, fullLen, offset, regionLen);
+                    hits.emplace_back(std::move(h));
                 }
             }
         }
-        if (qm.useInfernalCompat) {
-            const bool evalueModeInside = infernalDefaultPrimaryInside || wantInsideUser;
-            for (size_t i = 0; i < hits.size(); ++i) {
-                double ev = 0.0;
-                if (infernalExactScoreToEvalue(qm.exactModel, evalueModeInside, hits[i].mode, hits[i].cyk, targetDbResidues, ev)) {
-                    hits[i].evalue = ev;
-                    hits[i].hasEvalue = true;
-                }
-            }
-        } else {
-            for (size_t i = 0; i < hits.size(); ++i) {
-                hits[i].evalue = nativeCalibratedScoreToEvalue(hits[i].cyk, targetDbResidues);
-                hits[i].hasEvalue = true;
-            }
-        }
+
         std::sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) {
-            if (a.dbKey != b.dbKey) {
-                return a.dbKey < b.dbKey;
-            }
-            if (a.start1 != b.start1) {
-                return a.start1 < b.start1;
-            }
+            if (a.dbKey != b.dbKey) return a.dbKey < b.dbKey;
+            if (a.start1 != b.start1) return a.start1 < b.start1;
             return a.end1 < b.end1;
         });
         totalHits += hits.size();
 
-        const unsigned int modelLen = qm.useInfernalCompat
-            ? static_cast<unsigned int>(std::max(0, qm.exactModel.clen))
-            : static_cast<unsigned int>(std::max(0, qm.g.modelLen));
-        std::string resultPayload;
-        resultPayload.reserve(hits.size() * 96);
+        const unsigned int modelLen = static_cast<unsigned int>(std::max(0, qm.exactModel.clen));
+
+        // Stream the per-query result block to the writer one hit at a time.
+        resultWriter.writeStart(thread_idx);
         for (size_t i = 0; i < hits.size(); ++i) {
-            const int dbStart = std::max(0, hits[i].start1 - 1);
-            const int dbEnd = std::max(0, hits[i].end1 - 1);
-            const unsigned int alnLen = static_cast<unsigned int>(std::max(1, dbEnd - dbStart + 1));
+            const Hit &h = hits[i];
+            const int dbStartOut = std::max(0, h.start1 - 1);
+            const int dbEndOut = std::max(0, h.end1 - 1);
+            const unsigned int alnLen = static_cast<unsigned int>(std::max(1, dbEndOut - dbStartOut + 1));
             const unsigned int qLen = (modelLen > 0) ? modelLen : alnLen;
-            const int qStart = 0;
-            const int qEnd = static_cast<int>(std::min(qLen, alnLen)) - 1;
+            const int qStartOut = 0;
+            const int qEndOut = static_cast<int>(std::min(qLen, alnLen)) - 1;
             const float qcov = (qLen > 0) ? static_cast<float>(alnLen) / static_cast<float>(qLen) : 0.0f;
-            const float dbcov = (hits[i].dbLen > 0) ? static_cast<float>(alnLen) / static_cast<float>(hits[i].dbLen) : 0.0f;
-            const int bitScore = static_cast<int>(std::lrint(hits[i].cyk));
-            const double evalue = hits[i].hasEvalue ? hits[i].evalue : 1.0;
-            const bool hasBacktrace = (hits[i].cigar.empty() == false && hits[i].cigar != "NA");
-            float seqIdVal = 0.0f;
-            bool haveTraceIdentity = false;
-            if (qm.useInfernalCompat && hasBacktrace && hits[i].traceStates.empty() == false && hits[i].traceStates != "NA") {
-                if (hits[i].targetIdx < targetSeqs.size() && hits[i].start1 > 0 && hits[i].end1 >= hits[i].start1) {
-                    const FastaSeq &fs = targetSeqs[hits[i].targetIdx];
-                    const size_t s0 = static_cast<size_t>(hits[i].start1 - 1);
-                    const size_t slen = static_cast<size_t>(hits[i].end1 - hits[i].start1 + 1);
-                    if (s0 < fs.seq.size()) {
-                        const std::string obs = fs.seq.substr(s0, std::min(slen, fs.seq.size() - s0));
-                        const std::vector<int> trace = decodeTraceStates(hits[i].traceStates);
-                        const std::string cons = modelTraceConsensusForCigar(qm.exactModel, trace);
-                        seqIdVal = seqIdFromCigarConsensus(hits[i].cigar, cons, obs);
-                        haveTraceIdentity = true;
-                    }
-                }
-            }
-            if (!haveTraceIdentity) {
+            const float dbcov = (h.dbLen > 0) ? static_cast<float>(alnLen) / static_cast<float>(h.dbLen) : 0.0f;
+            const int bitScore = static_cast<int>(std::lrint(h.cyk));
+            const double evalue = h.hasEvalue ? h.evalue : 1.0;
+            const bool hasBacktrace = (!h.cigar.empty() && h.cigar != "NA");
+            float seqIdVal = h.precomputedSeqId;
+            if (seqIdVal < 0.0f) {
                 const unsigned int bitScorePos = static_cast<unsigned int>(std::max(0, bitScore));
                 seqIdVal = Matcher::estimateSeqIdByScorePerCol(static_cast<uint16_t>(std::min(bitScorePos, 65535u)),
-                                                               std::max(1u, alnLen),
-                                                               std::max(1u, alnLen));
+                                                                std::max(1u, alnLen),
+                                                                std::max(1u, alnLen));
             }
-            Matcher::result_t res(hits[i].dbKey,
+            Matcher::result_t res(h.dbKey,
                                   bitScore,
                                   std::min(1.0f, std::max(0.0f, qcov)),
                                   std::min(1.0f, std::max(0.0f, dbcov)),
                                   std::min(1.0f, std::max(0.0f, seqIdVal)),
                                   evalue,
                                   alnLen,
-                                  qStart,
-                                  qEnd,
+                                  qStartOut,
+                                  qEndOut,
                                   qLen,
-                                  dbStart,
-                                  dbEnd,
-                                  hits[i].dbLen,
-                                  hasBacktrace ? hits[i].cigar : std::string());
-            const bool addBacktrace = hasBacktrace;
-            const size_t len = Matcher::resultToBuffer(buffer, res, addBacktrace, false);
-            resultPayload.append(buffer, len);
+                                  dbStartOut,
+                                  dbEndOut,
+                                  h.dbLen,
+                                  hasBacktrace ? h.cigar : std::string());
+            const size_t len = Matcher::resultToBuffer(buffer, res, hasBacktrace, false);
+            resultWriter.writeAdd(buffer, len, thread_idx);
         }
-        resultWriter.writeData(resultPayload.c_str(), resultPayload.size(), qm.key, 0);
+        resultWriter.writeEnd(qm.key, thread_idx);
     }
+} // end omp parallel
     resultWriter.close();
+    resultReader.close();
 
     // Write companion header DB so integer target keys can be mapped back to FASTA headers.
     const std::string headerDb = par.db4 + "_h";
