@@ -4,7 +4,7 @@
 LocalParameters::LocalParameters() : Parameters(),
     PARAM_CM_REGION(PARAM_CM_REGION_ID, "--cm-region", "CM region flanking",
         "Extract target subregion around prefilter hit for CM alignment.\n"
-        "Value is flanking fraction of CLEN added on each side (0.0 = disabled, use full target)",
+        "Value is flanking fraction of prefilter alignment length (qend-qstart+1) added on each side (0.0 = disabled, use full target)",
         typeid(float), (void *) &cmRegionFlanking,
         "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_ALIGN),
     PARAM_CM_MODE(PARAM_CM_MODE_ID, "--cm-mode", "CM mode",
@@ -14,11 +14,17 @@ LocalParameters::LocalParameters() : Parameters(),
     PARAM_DB_SIZE(PARAM_DB_SIZE_ID, "--db-size", "Database size",
         "Effective database size (0: use actual size)",
         typeid(size_t), (void *) &dbSize,
-        "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN)
+        "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CALIBRATE_CM(PARAM_CALIBRATE_CM_ID, "--calibrate-cm", "Calibrate CM",
+        "Run Infernal cmcalibrate after cmbuild to fit E-value exp-tail parameters.\n"
+        "Slow (~1-2s per query). Off by default; CmScan uses a native E-value fallback.",
+        typeid(bool), (void *) &calibrateCm,
+        "", MMseqsParameter::COMMAND_MISC)
 {
     cmRegionFlanking = 0.0f;
     cmMode = 0;
     dbSize = 0;
+    calibrateCm = false;
 
     // Register dinuc.out as compiled-in matrix and set as default
     scoringMatrixFile = MultiParam<NuclAA<std::string>>(NuclAA<std::string>("dinuc.out", "dinuc.out"));
@@ -39,6 +45,11 @@ LocalParameters::LocalParameters() : Parameters(),
     splitstrand.push_back(&PARAM_THREADS);
     splitstrand.push_back(&PARAM_COMPRESSED);
     splitstrand.push_back(&PARAM_V);
+
+    cmbuild.push_back(&PARAM_CALIBRATE_CM);
+    cmbuild.push_back(&PARAM_THREADS);
+    cmbuild.push_back(&PARAM_COMPRESSED);
+    cmbuild.push_back(&PARAM_V);
 
     // result2profile needs --strand so the RNA-corrected E-value gets the
     // both-strands doubling (matches MMseqs2 RNA fork behavior)

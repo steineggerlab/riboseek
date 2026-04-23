@@ -1,7 +1,6 @@
 [submodule "lib/ViennaRNA"]
-	path = lib/ViennaRNA
+	path = lib/viennarna/ViennaRNA
 	url = https://github.com/ViennaRNA/ViennaRNA.git
-    update = none
 [submodule "util/regression"]
     path = lib/mmseqs/util/regression
     url = https://github.com/soedinglab/MMseqs2-Regression.git

@@ -232,6 +232,17 @@ struct ExactScanWorkspace {
     uint32_t memoInGen = 1;
     std::unordered_map<int64_t, double> memoVitMap;
     std::unordered_map<int64_t, double> memoInMap;
+    // Per-state ragged (v, i, d) chart for Infernal-compat exactVitRec.
+    // Each state v gets bandSize[v] * (N+1) cells, allocated contiguously
+    // and indexed via cumulative chartOffset[v]. Total cells = chartOffset[M].
+    // Bands derive from cmbuild's QDB output (CmState::dmin1/dmax1) and shrink
+    // memory ~30x vs the previous flat M*N*maxSpan layout.
+    std::vector<float> exactChart;
+    std::vector<uint32_t> exactChartSeen;
+    uint32_t exactChartGen = 1;
+    std::vector<size_t> exactChartOffset;   // M+1 entries, exactChartOffset[M] = total cells
+    std::vector<int> exactChartBandDmin;    // M entries
+    std::vector<int> exactChartBandSize;    // M entries (= dmax-dmin+1, or 0 if empty)
 };
 
 static inline std::string trim(const std::string &s) {
@@ -1317,6 +1328,8 @@ static bool hasDbIndex(const std::string &path) {
 struct RegionCoord {
     int dbStart;  // 0-based start in target
     int dbEnd;    // 0-based end (inclusive) in target
+    int qStart;   // 0-based start in query
+    int qEnd;     // 0-based end (inclusive) in query
 };
 
 struct CandidateResult {
@@ -1375,7 +1388,8 @@ loadResultDbCandidates(const std::string &resultDbPath, int threads) {
                         }
                         p++;
                     }
-                    if (col >= 10 && colStart[7] != NULL && colStart[8] != NULL) {
+                    if (col >= 10 && colStart[4] != NULL && colStart[5] != NULL
+                        && colStart[7] != NULL && colStart[8] != NULL) {
                         uint64_t ck = CandidateResult::coordKey(qKey, tKey);
                         // Only store the first (best-scoring) hit per (query, target)
                         if (result.regionCoords.find(ck) == result.regionCoords.end()) {
@@ -1384,9 +1398,16 @@ loadResultDbCandidates(const std::string &resultDbPath, int threads) {
                             if (dbStart > dbEnd) {
                                 std::swap(dbStart, dbEnd);
                             }
+                            int qStart = Util::fast_atoi<int>(colStart[4]);
+                            int qEnd = Util::fast_atoi<int>(colStart[5]);
+                            if (qStart > qEnd) {
+                                std::swap(qStart, qEnd);
+                            }
                             RegionCoord rc;
                             rc.dbStart = dbStart;
                             rc.dbEnd = dbEnd;
+                            rc.qStart = qStart;
+                            rc.qEnd = qEnd;
                             result.regionCoords[ck] = rc;
                         }
                     }
@@ -1921,68 +1942,48 @@ struct ExactRecCtx {
     const StateId *trDst;
     const double *trSc;
     const std::vector<int8_t> *seqCode;
-    bool useDense;
-    std::vector<double> *memoVitDense;
-    double *memoVitDenseData;
-    std::vector<uint32_t> *memoVitSeen;
-    uint32_t *memoVitSeenData;
-    uint32_t curVitGen;
-    std::unordered_map<int64_t, double> *memoVitMap;
+    // Per-state ragged (v, i, d) chart — float score + uint32 generation counter.
+    // Each state v has band [bandDmin[v] .. bandDmin[v]+bandSize[v]-1] derived
+    // from QDB (CmState::dmin1/dmax1). Cells for v are laid out as
+    // bandSize[v] * (N+1) consecutive floats starting at chartOffset[v].
+    float *chartScore;
+    uint32_t *chartSeen;
+    uint32_t chartGen;
+    const size_t *chartOffset;  // M+1 entries; chartOffset[M] = total cells
+    const int *chartBandDmin;   // M entries
+    const int *chartBandSize;   // M entries (= dmax-dmin+1, 0 if empty)
 };
 
-static inline int64_t exactRecKey(const ExactRecCtx &ctx, int v, int i, int j) {
-    return (static_cast<int64_t>(v) * static_cast<int64_t>(ctx.N + 2) + i)
-           * static_cast<int64_t>(ctx.N + 2) + j;
+static inline size_t exactChartIndex(const ExactRecCtx &ctx, int v, int i, int d) {
+    return ctx.chartOffset[v]
+         + static_cast<size_t>(i) * static_cast<size_t>(ctx.chartBandSize[v])
+         + static_cast<size_t>(d - ctx.chartBandDmin[v]);
 }
 
 static double exactVitRec(ExactRecCtx &ctx, int v, int i, int j) {
     if (v < 0 || v >= ctx.M || i < 1 || i > ctx.N + 1 || j < 0 || j > ctx.N || i > j + 1) {
         return NEG_INF;
     }
-    const int64_t key = exactRecKey(ctx, v, i, j);
-    if (ctx.useDense) {
-        const size_t dk = static_cast<size_t>(key);
-        if (ctx.memoVitSeenData[dk] == ctx.curVitGen) {
-            return ctx.memoVitDenseData[dk];
-        }
-    } else {
-        std::unordered_map<int64_t, double>::const_iterator it = ctx.memoVitMap->find(key);
-        if (it != ctx.memoVitMap->end()) {
-            return it->second;
-        }
+    const int d = j - i + 1;
+    const int bandDmin = ctx.chartBandDmin[v];
+    const int bandSize = ctx.chartBandSize[v];
+    if (bandSize <= 0 || d < bandDmin || d >= bandDmin + bandSize) {
+        // Out-of-band — NEG_INF. Cheap to recompute, do not memoize.
+        return NEG_INF;
+    }
+    const size_t dk = exactChartIndex(ctx, v, i, d);
+    if (ctx.chartSeen[dk] == ctx.chartGen) {
+        return static_cast<double>(ctx.chartScore[dk]);
     }
 
     const ExactStateExec &st = ctx.execData[static_cast<size_t>(v)];
-    const int d = j - i + 1;
-    if (st.dmax >= st.dmin && (d < st.dmin || d > st.dmax)) {
-        if (ctx.useDense) {
-            const size_t dk = static_cast<size_t>(key);
-            ctx.memoVitSeenData[dk] = ctx.curVitGen;
-            ctx.memoVitDenseData[dk] = NEG_INF;
-        } else {
-            (*ctx.memoVitMap)[key] = NEG_INF;
-        }
-        return NEG_INF;
-    }
     if (j < i - 1) {
-        if (ctx.useDense) {
-            const size_t dk = static_cast<size_t>(key);
-            ctx.memoVitSeenData[dk] = ctx.curVitGen;
-            ctx.memoVitDenseData[dk] = NEG_INF;
-        } else {
-            (*ctx.memoVitMap)[key] = NEG_INF;
-        }
         return NEG_INF;
     }
     if (st.type == CM_ST_E) {
         const double rv = (i == j + 1) ? 0.0 : NEG_INF;
-        if (ctx.useDense) {
-            const size_t dk = static_cast<size_t>(key);
-            ctx.memoVitSeenData[dk] = ctx.curVitGen;
-            ctx.memoVitDenseData[dk] = rv;
-        } else {
-            (*ctx.memoVitMap)[key] = rv;
-        }
+        ctx.chartSeen[dk] = ctx.chartGen;
+        ctx.chartScore[dk] = static_cast<float>(rv);
         return rv;
     }
     if (st.type == CM_ST_B) {
@@ -2007,37 +2008,20 @@ static double exactVitRec(ExactRecCtx &ctx, int v, int i, int j) {
             }
             best = std::max(best, left + right);
         }
-        if (ctx.useDense) {
-            const size_t dk = static_cast<size_t>(key);
-            ctx.memoVitSeenData[dk] = ctx.curVitGen;
-            ctx.memoVitDenseData[dk] = best;
-        } else {
-            (*ctx.memoVitMap)[key] = best;
-        }
+        ctx.chartSeen[dk] = ctx.chartGen;
+        ctx.chartScore[dk] = static_cast<float>(best);
         return best;
     }
 
     const int ni = i + st.niShift;
     const int nj = j - (st.consumesRight ? 1 : 0);
+    // Interior-bound and emit-failure NEG_INFs are cheap to recompute; skip
+    // memoization to keep the sparse map bounded by actually-scored cells.
     if (ni > nj + 1) {
-        if (ctx.useDense) {
-            const size_t dk = static_cast<size_t>(key);
-            ctx.memoVitSeenData[dk] = ctx.curVitGen;
-            ctx.memoVitDenseData[dk] = NEG_INF;
-        } else {
-            (*ctx.memoVitMap)[key] = NEG_INF;
-        }
         return NEG_INF;
     }
     const double e = cmStateEmitScoreFast(st, *ctx.seqCode, i, j);
     if (e == NEG_INF) {
-        if (ctx.useDense) {
-            const size_t dk = static_cast<size_t>(key);
-            ctx.memoVitSeenData[dk] = ctx.curVitGen;
-            ctx.memoVitDenseData[dk] = NEG_INF;
-        } else {
-            (*ctx.memoVitMap)[key] = NEG_INF;
-        }
         return NEG_INF;
     }
 
@@ -2072,13 +2056,8 @@ static double exactVitRec(ExactRecCtx &ctx, int v, int i, int j) {
             best = std::max(best, e + ctx.trSc[ti] + nxt);
         }
     }
-    if (ctx.useDense) {
-        const size_t dk = static_cast<size_t>(key);
-        ctx.memoVitSeenData[dk] = ctx.curVitGen;
-        ctx.memoVitDenseData[dk] = best;
-    } else {
-        (*ctx.memoVitMap)[key] = best;
-    }
+    ctx.chartSeen[dk] = ctx.chartGen;
+    ctx.chartScore[dk] = static_cast<float>(best);
     return best;
 }
 
@@ -2518,7 +2497,8 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                                  const std::string &seq,
                                  bool wantInside,
                                  std::vector<Hit> &outHits,
-                                 const std::string &seqId) {
+                                 const std::string &seqId,
+                                 int maxHitLen = 0) {
     const int N = static_cast<int>(seq.size());
     const int M = static_cast<int>(model.states.size());
     if (N <= 0 || M <= 0) {
@@ -2527,6 +2507,21 @@ static void runInfernalExactScan(const InfernalExactModel &model,
     if (M > static_cast<int>(std::numeric_limits<StateId>::max())) {
         Debug(Debug::ERROR) << "CM state count exceeds uint16_t capacity: " << M << "\n";
         return;
+    }
+    // Backstop: after fixing NEG_INF memoization, the map grows only with
+    // cells that return a finite score. For very large M*N^2 we still bail
+    // out to prevent pathological runtime.
+    {
+        const uint64_t workEstimate = static_cast<uint64_t>(M)
+                                    * static_cast<uint64_t>(N)
+                                    * static_cast<uint64_t>(N);
+        static constexpr uint64_t CM_EXACT_MAX_WORK = 200000000000ULL; // 2e11 cell-ops
+        if (workEstimate > CM_EXACT_MAX_WORK) {
+            Debug(Debug::WARNING) << "cmscan: skipping scan for M=" << M
+                                   << " N=" << N << " (work "
+                                   << workEstimate << " exceeds cap)\n";
+            return;
+        }
     }
     const bool fastLogsum = cmFastLogsumEnabled();
     const std::string modelConsensus = buildConsensusFromExactModel(model);
@@ -3071,6 +3066,9 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         if (model.w > 0) {
             maxSpan = std::min(maxSpan, model.w);
         }
+        if (maxHitLen > 0) {
+            maxSpan = std::min(maxSpan, maxHitLen);
+        }
         // Infernal semantics evaluate all legal spans under state dmin/dmax/w constraints.
         int minSpan = 1;
         float bestSc = NEG_INF_F;
@@ -3437,6 +3435,13 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             const size_t vStride = static_cast<size_t>(localN + 1);
             const size_t dStride = static_cast<size_t>(M) * vStride;
             const size_t insSize = static_cast<size_t>(localN + 1) * dStride;
+            static constexpr size_t CM_INSIDE_MAX_CELLS = 100000000ULL; // ~800 MB doubles
+            if (insSize > CM_INSIDE_MAX_CELLS) {
+                h.inside = NEG_INF;
+                h.bias = bestNull3Corr + null2Corr;
+                outHits.push_back(h);
+                return;
+            }
             if (!ws.insD.ensure(insSize)) {
                 Debug(Debug::ERROR) << "cmscan: failed to allocate inside buffer\n";
                 return;
@@ -3600,33 +3605,80 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         return;
     }
 
-    const size_t denseCells = static_cast<size_t>(M) * static_cast<size_t>(N + 2) * static_cast<size_t>(N + 2);
-    const bool useDense = (denseCells <= 25000000ULL); // ~200MB with score+seen buffers.
-    std::vector<double> &memoVitDense = ws.memoVitDense;
-    std::vector<uint32_t> &memoVitSeen = ws.memoVitSeen;
-    uint32_t &memoVitGen = ws.memoVitGen;
-    std::unordered_map<int64_t, double> &memoVitMap = ws.memoVitMap;
-    uint32_t curVitGen = 0;
-    if (useDense) {
-        if (memoVitDense.size() < denseCells) {
-            memoVitDense.resize(denseCells);
-        }
-        if (memoVitSeen.size() < denseCells) {
-            memoVitSeen.resize(denseCells, 0);
-        }
-        ++memoVitGen;
-        if (memoVitGen == 0) {
-            std::fill(memoVitSeen.begin(), memoVitSeen.end(), 0u);
-            memoVitGen = 1;
-        }
-        curVitGen = memoVitGen;
-        memoVitMap.clear();
-    } else {
-        memoVitDense.clear();
-        memoVitSeen.clear();
-        memoVitMap.clear();
-        memoVitMap.reserve(static_cast<size_t>(M) * static_cast<size_t>(N + 2) * 8);
+    // Compute maxSpan first so we can size the per-state ragged chart precisely.
+    int maxSpan = N;
+    if (model.w > 0) {
+        maxSpan = std::min(maxSpan, model.w);
     }
+    // Cap d-space by the prefilter alignment length when available — a true
+    // CM hit has d within a small multiple of the rnasearch envelope length,
+    // and the memoized Viterbi only wastes memory on larger spans.
+    if (maxHitLen > 0) {
+        maxSpan = std::min(maxSpan, maxHitLen);
+    }
+
+    // Per-state ragged chart: each state v gets bandSize[v]*(N+1) cells, with
+    // bands derived from QDB (CmState::dmin1/dmax1 as copied into exec[v].dmin/dmax).
+    // For big rRNA CMs (M ~ 9000) bands are typically tight (avg ~20) so the
+    // ragged chart is ~30x smaller than a flat M*(N+1)*(maxSpan+1) chart.
+    std::vector<size_t> &chartOffset = ws.exactChartOffset;
+    std::vector<int> &bandDmin = ws.exactChartBandDmin;
+    std::vector<int> &bandSize = ws.exactChartBandSize;
+    chartOffset.assign(static_cast<size_t>(M) + 1, 0);
+    bandDmin.assign(static_cast<size_t>(M), 0);
+    bandSize.assign(static_cast<size_t>(M), 0);
+    const size_t rowPlus1 = static_cast<size_t>(N + 1);
+    for (int v = 0; v < M; ++v) {
+        const ExactStateExec &e = exec[static_cast<size_t>(v)];
+        int dlo;
+        int dhi;
+        if (e.dmax >= e.dmin && e.dmin >= 0) {
+            dlo = std::max(0, e.dmin);
+            dhi = std::min(maxSpan, e.dmax);
+        } else {
+            // Unset/invalid band — fall back to full range [0..maxSpan].
+            dlo = 0;
+            dhi = maxSpan;
+        }
+        if (dhi < dlo) {
+            bandDmin[v] = 0;
+            bandSize[v] = 0;
+        } else {
+            bandDmin[v] = dlo;
+            bandSize[v] = dhi - dlo + 1;
+        }
+        chartOffset[v + 1] = chartOffset[v] +
+            static_cast<size_t>(bandSize[v]) * rowPlus1;
+    }
+    size_t chartCells = chartOffset[M];
+
+    // Safety budget. 1G cells = 4GB float + 4GB uint32 = 8GB per-thread worst case.
+    // Big rRNA CMs (M=6869-9017, like CP000968) vs comparable-length targets
+    // land at ~8G cells = 65GB with wide QDB bands; we skip rather than OOM.
+    // TODO: streaming/windowed CYK or HMM pre-filter to unblock these queries.
+    static constexpr size_t CM_EXACT_CHART_MAX_CELLS = 1000000000ULL;
+    if (chartCells > CM_EXACT_CHART_MAX_CELLS) {
+        Debug(Debug::WARNING) << "cmscan: per-state ragged chart too large "
+                              << "(" << chartCells << " > " << CM_EXACT_CHART_MAX_CELLS
+                              << " cells) for M=" << M << " N=" << N << "; skipping target\n";
+        return;
+    }
+
+    std::vector<float> &exactChart = ws.exactChart;
+    std::vector<uint32_t> &exactChartSeen = ws.exactChartSeen;
+    uint32_t &exactChartGen = ws.exactChartGen;
+    if (exactChart.size() < chartCells) {
+        exactChart.resize(chartCells);
+    }
+    if (exactChartSeen.size() < chartCells) {
+        exactChartSeen.resize(chartCells, 0);
+    }
+    ++exactChartGen;
+    if (exactChartGen == 0) {
+        std::fill(exactChartSeen.begin(), exactChartSeen.end(), 0u);
+        exactChartGen = 1;
+    }
+
     ExactRecCtx recCtx;
     recCtx.N = N;
     recCtx.M = M;
@@ -3635,18 +3687,12 @@ static void runInfernalExactScan(const InfernalExactModel &model,
     recCtx.trDst = trDst.empty() ? NULL : &trDst[0];
     recCtx.trSc = trSc.empty() ? NULL : &trSc[0];
     recCtx.seqCode = &ws.seqCode;
-    recCtx.useDense = useDense;
-    recCtx.memoVitDense = &memoVitDense;
-    recCtx.memoVitDenseData = useDense ? memoVitDense.data() : NULL;
-    recCtx.memoVitSeen = &memoVitSeen;
-    recCtx.memoVitSeenData = useDense ? memoVitSeen.data() : NULL;
-    recCtx.curVitGen = curVitGen;
-    recCtx.memoVitMap = &memoVitMap;
-
-    int maxSpan = N;
-    if (model.w > 0) {
-        maxSpan = std::min(maxSpan, model.w);
-    }
+    recCtx.chartScore = exactChart.data();
+    recCtx.chartSeen = exactChartSeen.data();
+    recCtx.chartGen = exactChartGen;
+    recCtx.chartOffset = chartOffset.data();
+    recCtx.chartBandDmin = bandDmin.data();
+    recCtx.chartBandSize = bandSize.data();
     // Infernal semantics evaluate all legal spans under state dmin/dmax/w constraints.
     int minSpan = 1;
     double bestSc = NEG_INF;
@@ -3764,6 +3810,13 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         const size_t vStride2 = static_cast<size_t>(localN2 + 1);
         const size_t dStride2 = static_cast<size_t>(M) * vStride2;
         const size_t insSize2 = static_cast<size_t>(localN2 + 1) * dStride2;
+        static constexpr size_t CM_INSIDE_MAX_CELLS2 = 100000000ULL; // ~800 MB doubles
+        if (insSize2 > CM_INSIDE_MAX_CELLS2) {
+            h.inside = NEG_INF;
+            h.bias = bestNull3Corr + null2Corr;
+            outHits.push_back(h);
+            return;
+        }
         if (!ws.insD.ensure(insSize2)) {
             Debug(Debug::ERROR) << "cmscan: failed to allocate inside buffer2\n";
             return;
@@ -3894,17 +3947,22 @@ static void runDpScan(const Grammar &g,
         return;
     }
 
-    const size_t cellCount = static_cast<size_t>(m) * static_cast<size_t>(n) * static_cast<size_t>(n);
+    // Banded CYK: cap span length at W to bound memory to O(m*n*W).
+    // W mirrors Infernal's fallback "max emit length" (3*modelLen when known).
+    int W = (g.modelLen > 0) ? std::min(n, 3 * g.modelLen) : n;
+    if (W < 1) W = n;
+    const int Wp1 = W + 1;
+    const size_t cellCount = static_cast<size_t>(m) * static_cast<size_t>(n) * static_cast<size_t>(Wp1);
     std::vector<double> cyk(cellCount, NEG_INF);
     std::vector<double> inside;
     if (wantInside) {
         inside.assign(cellCount, NEG_INF);
     }
 
-    const auto idx = [n](int nt, int i, int j) -> size_t {
-        return static_cast<size_t>(nt) * static_cast<size_t>(n) * static_cast<size_t>(n)
-             + static_cast<size_t>(i) * static_cast<size_t>(n)
-             + static_cast<size_t>(j);
+    const auto idx = [n, Wp1](int nt, int i, int j) -> size_t {
+        return static_cast<size_t>(nt) * static_cast<size_t>(n) * static_cast<size_t>(Wp1)
+             + static_cast<size_t>(i) * static_cast<size_t>(Wp1)
+             + static_cast<size_t>(j - i + 1);
     };
     const auto scoreEq = [](double a, double b) -> bool {
         if (a == NEG_INF || b == NEG_INF) {
@@ -3977,8 +4035,8 @@ static void runDpScan(const Grammar &g,
         }
     }
 
-    // Infernal-like local semantics: evaluate all spans.
-    const int maxSpan = n;
+    // Infernal-like local semantics: evaluate all spans up to the band.
+    const int maxSpan = W;
     const int minSpan = 1;
     for (int len = 2; len <= maxSpan; ++len) {
         for (int i = 0; i + len - 1 < n; ++i) {
@@ -4075,16 +4133,18 @@ static void runDpScan(const Grammar &g,
         if (cmDebugExtEnabled()) {
             double leftExt = NEG_INF;
             double rightExt = NEG_INF;
-            if (bestI > 0) {
+            const int bestLen = bestJ - bestI + 1;
+            const bool extFits = (bestLen + 1) <= W;
+            if (bestI > 0 && extFits) {
                 leftExt = cyk[idx(g.start, bestI - 1, bestJ)];
             }
-            if (bestJ + 1 < n) {
+            if (bestJ + 1 < n && extFits) {
                 rightExt = cyk[idx(g.start, bestI, bestJ + 1)];
             }
             const double mBest = (mRoot >= 0) ? cyk[idx(mRoot, bestI, bestJ)] : NEG_INF;
             const double dBest = (dRoot >= 0) ? cyk[idx(dRoot, bestI, bestJ)] : NEG_INF;
-            const double mRight = (mRoot >= 0 && bestJ + 1 < n) ? cyk[idx(mRoot, bestI, bestJ + 1)] : NEG_INF;
-            const double dRight = (dRoot >= 0 && bestJ + 1 < n) ? cyk[idx(dRoot, bestI, bestJ + 1)] : NEG_INF;
+            const double mRight = (mRoot >= 0 && bestJ + 1 < n && extFits) ? cyk[idx(mRoot, bestI, bestJ + 1)] : NEG_INF;
+            const double dRight = (dRoot >= 0 && bestJ + 1 < n && extFits) ? cyk[idx(dRoot, bestI, bestJ + 1)] : NEG_INF;
             const double mCoreR = (mRoot >= 0 && bestJ > bestI) ? cyk[idx(mRoot, bestI, bestJ - 1)] : NEG_INF;
             const double dCoreR = (dRoot >= 0 && bestJ > bestI) ? cyk[idx(dRoot, bestI, bestJ - 1)] : NEG_INF;
             const double mCoreL = (mRoot >= 0 && bestI + 1 <= bestJ) ? cyk[idx(mRoot, bestI + 1, bestJ)] : NEG_INF;
@@ -4403,24 +4463,36 @@ int cmscan(int argc, const char **argv, const Command &command) {
         if (wantInside && cmFastMathEnabled()) {
             Debug(Debug::WARNING) << "MMSEQS_CMSCAN_FASTMATH=1 enabled: using approximate log/exp in Inside DP (scores may drift)\n";
         }
-        // Determine CLEN for region extraction
-        const int clen = qm.useInfernalCompat ? qm.exactModel.clen
-                                               : qm.g.modelLen;
-
         // Build per-target region offsets when --cm-region is active
         std::vector<int> regionOffsets(targetSeqs.size(), 0);
         std::vector<std::string> regionSeqs(targetSeqs.size());
+        // Per-target maxHitLen: cap the CYK d-search by a multiple of the
+        // rnasearch envelope length. A true CM hit has d within a small
+        // multiple of the prefilter span, and the memoized Viterbi only
+        // wastes memory on larger spans.
+        std::vector<int> maxHitLens(targetSeqs.size(), 0);
+        // Slack for the CYK d-cap. We take the max of:
+        //   - 3x the rnasearch prefilter envelope length (local extension)
+        //   - 1.5x the CM consensus length (global: a true CM hit can stretch
+        //     well beyond the prefilter envelope, especially for structured
+        //     RNAs where iter-3 msa-profile mass is concentrated around the
+        //     center but the CM consensus spans the full rRNA).
+        // model.w (Infernal's W) remains the hard upper bound on the CM side.
+        static constexpr int CM_MAXSPAN_ENV_SLACK = 3;
+        static constexpr double CM_MAXSPAN_CLEN_SLACK = 1.5;
+        const int clenFloor = qm.useInfernalCompat
+            ? static_cast<int>(qm.exactModel.clen * CM_MAXSPAN_CLEN_SLACK)
+            : 0;
         for (size_t i = 0; i < targetSeqs.size(); ++i) {
             const std::string &fullSeq = targetSeqs[i].seq;
-            if (cmRegionFlanking > 0.0f && clen > 0) {
-                uint64_t ck = CandidateResult::coordKey(qm.key, targetSeqs[i].key);
-                std::unordered_map<uint64_t, RegionCoord>::const_iterator it = candidateResult.regionCoords.find(ck);
+            uint64_t ck = CandidateResult::coordKey(qm.key, targetSeqs[i].key);
+            std::unordered_map<uint64_t, RegionCoord>::const_iterator it = candidateResult.regionCoords.find(ck);
+            if (cmRegionFlanking > 0.0f) {
                 if (it != candidateResult.regionCoords.end()) {
                     const int hitStart = it->second.dbStart;
                     const int hitEnd = it->second.dbEnd;
-                    const int hitLen = hitEnd - hitStart + 1;
-                    const int uncovered = std::max(0, clen - hitLen);
-                    const int flank = static_cast<int>(uncovered / 2 + cmRegionFlanking * clen);
+                    const int qAlnLen = std::max(1, it->second.qEnd - it->second.qStart + 1);
+                    const int flank = static_cast<int>(cmRegionFlanking * qAlnLen);
                     const int seqLen = static_cast<int>(fullSeq.size());
                     const int regStart = std::max(0, hitStart - flank);
                     const int regEnd = std::min(seqLen, hitEnd + flank + 1);
@@ -4432,6 +4504,12 @@ int cmscan(int argc, const char **argv, const Command &command) {
                 }
             } else {
                 regionSeqs[i] = fullSeq;
+            }
+            if (it != candidateResult.regionCoords.end()) {
+                const int dbSpan = std::max(1, it->second.dbEnd - it->second.dbStart + 1);
+                maxHitLens[i] = std::max(dbSpan * CM_MAXSPAN_ENV_SLACK, clenFloor);
+            } else if (clenFloor > 0) {
+                maxHitLens[i] = clenFloor;
             }
         }
 
@@ -4446,8 +4524,8 @@ int cmscan(int argc, const char **argv, const Command &command) {
         if (nThreads <= 1 || targetSeqs.size() <= 1) {
             for (size_t i = 0; i < targetSeqs.size(); ++i) {
                 if (qm.useInfernalCompat) {
-                    runInfernalExactScan(qm.exactModel, regionSeqs[i], wantInside, perSeqHits[i], targetSeqs[i].id);
-                    runInfernalExactScan(qm.exactModel, revSeqs[i], wantInside, perSeqHitsRev[i], targetSeqs[i].id);
+                    runInfernalExactScan(qm.exactModel, regionSeqs[i], wantInside, perSeqHits[i], targetSeqs[i].id, maxHitLens[i]);
+                    runInfernalExactScan(qm.exactModel, revSeqs[i], wantInside, perSeqHitsRev[i], targetSeqs[i].id, maxHitLens[i]);
                 } else {
                     runDpScan(qm.g, regionSeqs[i], wantInside, par.addBacktrace, perSeqHits[i], targetSeqs[i].id);
                     runDpScan(qm.g, revSeqs[i], wantInside, par.addBacktrace, perSeqHitsRev[i], targetSeqs[i].id);
@@ -4458,8 +4536,8 @@ int cmscan(int argc, const char **argv, const Command &command) {
             for (long i = 0; i < static_cast<long>(targetSeqs.size()); ++i) {
                 const size_t ui = static_cast<size_t>(i);
                 if (qm.useInfernalCompat) {
-                    runInfernalExactScan(qm.exactModel, regionSeqs[ui], wantInside, perSeqHits[ui], targetSeqs[ui].id);
-                    runInfernalExactScan(qm.exactModel, revSeqs[ui], wantInside, perSeqHitsRev[ui], targetSeqs[ui].id);
+                    runInfernalExactScan(qm.exactModel, regionSeqs[ui], wantInside, perSeqHits[ui], targetSeqs[ui].id, maxHitLens[ui]);
+                    runInfernalExactScan(qm.exactModel, revSeqs[ui], wantInside, perSeqHitsRev[ui], targetSeqs[ui].id, maxHitLens[ui]);
                 } else {
                     runDpScan(qm.g, regionSeqs[ui], wantInside, par.addBacktrace, perSeqHits[ui], targetSeqs[ui].id);
                     runDpScan(qm.g, revSeqs[ui], wantInside, par.addBacktrace, perSeqHitsRev[ui], targetSeqs[ui].id);

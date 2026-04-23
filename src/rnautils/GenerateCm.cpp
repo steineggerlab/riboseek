@@ -10,6 +10,7 @@
 #include "MultipleAlignment.h"
 #include "Sequence.h"
 #include "SubstitutionMatrix.h"
+#include "LocalParameters.h"
 #ifdef HAVE_INFERNAL_BRIDGE
 #include "infernal/InfernalBridge.h"
 #endif
@@ -64,13 +65,22 @@ static std::string buildStockholmText(const std::string &id,
 } // namespace
 
 int cmbuild(int argc, const char **argv, const Command &command) {
-    Parameters &par = Parameters::getInstance();
+    LocalParameters &par = LocalParameters::getLocalInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
 #ifndef HAVE_INFERNAL_BRIDGE
     Debug(Debug::ERROR) << "cmbuild requires Infernal bridge support\n";
     return EXIT_FAILURE;
 #else
+
+    // Fork Infernal workers BEFORE loading DBs. Each worker stays ~small
+    // (few MB) instead of CoW-ing a post-mmap fat parent, which serializes
+    // forks under the kernel mm lock.
+    InfernalBridge::WorkerPool *workerPool = InfernalBridge::startWorkerPool(par.threads);
+    if (workerPool == NULL) {
+        Debug(Debug::ERROR) << "cmbuild: failed to start Infernal worker pool\n";
+        return EXIT_FAILURE;
+    }
 
     DBReader<unsigned int> qDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
                                 DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
@@ -226,14 +236,11 @@ int cmbuild(int argc, const char **argv, const Command &command) {
             std::string stoText = buildStockholmText(
                 "query_" + std::to_string(queryKey), stoSeqs, ssCons);
 
-            // Call Infernal bridge to build CM (not thread-safe, needs critical section)
+            // Call Infernal bridge to build CM. Bridge forks per call so OMP workers
+            // can build in parallel despite Infernal's process-wide global state.
             std::string cmText;
             std::string infernalErr;
-            bool success = false;
-#pragma omp critical(infernal_bridge)
-            {
-                success = InfernalBridge::buildCmFromStockholmText(stoText, cmText, infernalErr);
-            }
+            bool success = InfernalBridge::buildCmFromStockholmText(workerPool, stoText, cmText, infernalErr, par.calibrateCm);
 
             MultipleAlignment::deleteMSA(&msaRes);
 
@@ -254,6 +261,7 @@ int cmbuild(int argc, const char **argv, const Command &command) {
     }
     qDbr.close();
 
+    InfernalBridge::stopWorkerPool(workerPool);
     return EXIT_SUCCESS;
 #endif // HAVE_INFERNAL_BRIDGE
 }

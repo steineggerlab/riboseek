@@ -1,13 +1,20 @@
 #include "InfernalBridge.h"
 
+#include <cerrno>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <csetjmp>
+#include <cstring>
+#include <deque>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <vector>
@@ -123,13 +130,32 @@ static int runInfernalMainInProcess(int (*fn)(int, char **), const std::vector<s
 
 } // namespace
 
-namespace InfernalBridge {
+namespace {
 
-bool isConfigured() {
+static bool readWholeFile(const std::string &path, std::string &out, std::string &error) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        error = "failed to open CM file for readback";
+        return false;
+    }
+    out.clear();
+    char buf[65536];
+    for (;;) {
+        ssize_t r = read(fd, buf, sizeof(buf));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            error = "read failed on CM file";
+            close(fd);
+            return false;
+        }
+        if (r == 0) break;
+        out.append(buf, static_cast<size_t>(r));
+    }
+    close(fd);
     return true;
 }
 
-bool buildCmFromStockholmText(const std::string &stockholmText, std::string &cmText, std::string &error) {
+static bool runCmBuildInProcess(const std::string &stockholmText, std::string &cmText, std::string &error, bool calibrate) {
     char tmpTemplate[] = "/tmp/mmseqs-infernal-XXXXXX";
     char *tmpDir = mkdtemp(tmpTemplate);
     if (tmpDir == NULL) {
@@ -151,7 +177,8 @@ bool buildCmFromStockholmText(const std::string &stockholmText, std::string &cmT
     cmbArgs.push_back("-F");
     cmbArgs.push_back(cmPath);
     cmbArgs.push_back(stoPath);
-    if (runInfernalMainInProcess(&infernal_cmbuild_main, cmbArgs) != 0) {
+    bool ok = (runInfernalMainInProcess(&infernal_cmbuild_main, cmbArgs) == 0);
+    if (!ok) {
         error = "embedded infernal cmbuild failed";
         close(stoFd);
         unlink(cmPath.c_str());
@@ -159,40 +186,248 @@ bool buildCmFromStockholmText(const std::string &stockholmText, std::string &cmT
         return false;
     }
 
-    infernal_cmcalibrate_set_capture_to_memory(1);
-    std::vector<std::string> calArgs;
-    calArgs.push_back("infernal-cmcalibrate");
-    calArgs.push_back("-L");
-    calArgs.push_back("0.01");
-    calArgs.push_back("--cpu");
-    calArgs.push_back("1");
-    calArgs.push_back(cmPath);
-    if (runInfernalMainInProcess(&infernal_cmcalibrate_main, calArgs) != 0) {
+    if (calibrate) {
+        infernal_cmcalibrate_set_capture_to_memory(1);
+        std::vector<std::string> calArgs;
+        calArgs.push_back("infernal-cmcalibrate");
+        calArgs.push_back("-L");
+        calArgs.push_back("0.01");
+        calArgs.push_back("--cpu");
+        calArgs.push_back("1");
+        calArgs.push_back(cmPath);
+        if (runInfernalMainInProcess(&infernal_cmcalibrate_main, calArgs) != 0) {
+            infernal_cmcalibrate_set_capture_to_memory(0);
+            error = "embedded infernal cmcalibrate failed";
+            close(stoFd);
+            unlink(cmPath.c_str());
+            rmdir(dir.c_str());
+            return false;
+        }
+        size_t cmLen = 0;
+        const char *calibratedCm = infernal_cmcalibrate_get_captured_cm_text(&cmLen);
+        if (calibratedCm == NULL || cmLen == 0) {
+            infernal_cmcalibrate_set_capture_to_memory(0);
+            error = "embedded infernal did not return calibrated CM text";
+            close(stoFd);
+            unlink(cmPath.c_str());
+            rmdir(dir.c_str());
+            return false;
+        }
+        cmText.assign(calibratedCm, cmLen);
         infernal_cmcalibrate_set_capture_to_memory(0);
-        error = "embedded infernal cmcalibrate failed";
-        close(stoFd);
-        unlink(cmPath.c_str());
-        rmdir(dir.c_str());
-        return false;
+    } else {
+        ok = readWholeFile(cmPath, cmText, error);
     }
-    size_t cmLen = 0;
-    const char *calibratedCm = infernal_cmcalibrate_get_captured_cm_text(&cmLen);
-
-    if (calibratedCm == NULL || cmLen == 0) {
-        infernal_cmcalibrate_set_capture_to_memory(0);
-        error = "embedded infernal did not return calibrated CM text";
-        close(stoFd);
-        unlink(cmPath.c_str());
-        rmdir(dir.c_str());
-        return false;
-    }
-    cmText.assign(calibratedCm, cmLen);
-    infernal_cmcalibrate_set_capture_to_memory(0);
 
     close(stoFd);
     unlink(cmPath.c_str());
     rmdir(dir.c_str());
+    return ok;
+}
+
+static bool writeAllFd(int fd, const void *buf, size_t n) {
+    const char *p = static_cast<const char *>(buf);
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (w == 0) return false;
+        p += w;
+        n -= static_cast<size_t>(w);
+    }
     return true;
+}
+
+static bool readAllFd(int fd, void *buf, size_t n) {
+    char *p = static_cast<char *>(buf);
+    while (n > 0) {
+        ssize_t r = read(fd, p, n);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (r == 0) return false;
+        p += r;
+        n -= static_cast<size_t>(r);
+    }
+    return true;
+}
+
+} // namespace
+
+namespace {
+
+struct Worker {
+    pid_t pid;
+    int toWorker;   // parent writes, worker reads
+    int fromWorker; // worker writes, parent reads
+    std::mutex io;  // serialize send/recv on this worker
+};
+
+static void workerMainLoop(int fdIn, int fdOut) {
+    for (;;) {
+        uint8_t flag = 0;
+        uint64_t len = 0;
+        if (!readAllFd(fdIn, &flag, 1)) break;
+        if (!readAllFd(fdIn, &len, sizeof(len))) break;
+        std::string sto;
+        if (len > 0) {
+            if (len > (1ULL << 30)) break;
+            sto.resize(static_cast<size_t>(len));
+            if (!readAllFd(fdIn, &sto[0], len)) break;
+        }
+        std::string cmText;
+        std::string err;
+        bool ok = runCmBuildInProcess(sto, cmText, err, flag != 0);
+        const std::string &payload = ok ? cmText : err;
+        uint8_t outFlag = ok ? 1 : 0;
+        uint64_t outLen = static_cast<uint64_t>(payload.size());
+        if (!writeAllFd(fdOut, &outFlag, 1)) break;
+        if (!writeAllFd(fdOut, &outLen, sizeof(outLen))) break;
+        if (outLen > 0 && !writeAllFd(fdOut, payload.data(), payload.size())) break;
+    }
+    close(fdIn);
+    close(fdOut);
+}
+
+} // namespace
+
+namespace InfernalBridge {
+
+struct WorkerPool {
+    std::vector<Worker *> workers;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<int> free;
+};
+
+bool isConfigured() {
+    return true;
+}
+
+WorkerPool *startWorkerPool(int nWorkers) {
+    if (nWorkers <= 0) return NULL;
+    WorkerPool *pool = new WorkerPool();
+    pool->workers.reserve(nWorkers);
+    for (int i = 0; i < nWorkers; ++i) {
+        int p2w[2];
+        int w2p[2];
+        if (pipe(p2w) != 0) {
+            stopWorkerPool(pool);
+            return NULL;
+        }
+        if (pipe(w2p) != 0) {
+            close(p2w[0]); close(p2w[1]);
+            stopWorkerPool(pool);
+            return NULL;
+        }
+        pid_t pid = fork();
+        if (pid < 0) {
+            close(p2w[0]); close(p2w[1]);
+            close(w2p[0]); close(w2p[1]);
+            stopWorkerPool(pool);
+            return NULL;
+        }
+        if (pid == 0) {
+            // Child: close parent-side fds of our pipes + inherited fds of
+            // any older siblings, then enter serial work loop.
+            close(p2w[1]);
+            close(w2p[0]);
+            for (size_t j = 0; j < pool->workers.size(); ++j) {
+                close(pool->workers[j]->toWorker);
+                close(pool->workers[j]->fromWorker);
+            }
+            workerMainLoop(p2w[0], w2p[1]);
+            _exit(0);
+        }
+        close(p2w[0]);
+        close(w2p[1]);
+        Worker *w = new Worker();
+        w->pid = pid;
+        w->toWorker = p2w[1];
+        w->fromWorker = w2p[0];
+        pool->workers.push_back(w);
+        pool->free.push_back(static_cast<int>(pool->workers.size()) - 1);
+    }
+    return pool;
+}
+
+void stopWorkerPool(WorkerPool *pool) {
+    if (pool == NULL) return;
+    for (size_t i = 0; i < pool->workers.size(); ++i) {
+        close(pool->workers[i]->toWorker); // EOF triggers worker exit
+    }
+    for (size_t i = 0; i < pool->workers.size(); ++i) {
+        int status = 0;
+        while (waitpid(pool->workers[i]->pid, &status, 0) < 0 && errno == EINTR) {}
+        close(pool->workers[i]->fromWorker);
+        delete pool->workers[i];
+    }
+    delete pool;
+}
+
+bool buildCmFromStockholmText(WorkerPool *pool,
+                              const std::string &stockholmText,
+                              std::string &cmText,
+                              std::string &error,
+                              bool calibrate) {
+    if (pool == NULL || pool->workers.empty()) {
+        error = "no infernal worker pool available";
+        return false;
+    }
+
+    int idx = -1;
+    {
+        std::unique_lock<std::mutex> lk(pool->mu);
+        pool->cv.wait(lk, [&]{ return !pool->free.empty(); });
+        idx = pool->free.front();
+        pool->free.pop_front();
+    }
+    Worker *w = pool->workers[idx];
+
+    uint8_t flag = calibrate ? 1 : 0;
+    uint64_t len = static_cast<uint64_t>(stockholmText.size());
+    uint8_t rFlag = 0;
+    uint64_t rLen = 0;
+    std::string payload;
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> iolk(w->io);
+        ok = writeAllFd(w->toWorker, &flag, 1)
+          && writeAllFd(w->toWorker, &len, sizeof(len))
+          && (len == 0 || writeAllFd(w->toWorker, stockholmText.data(), stockholmText.size()));
+        if (ok) {
+            ok = readAllFd(w->fromWorker, &rFlag, 1)
+              && readAllFd(w->fromWorker, &rLen, sizeof(rLen));
+        }
+        if (ok && rLen > 0) {
+            if (rLen > (1ULL << 30)) {
+                ok = false;
+            } else {
+                payload.resize(static_cast<size_t>(rLen));
+                ok = readAllFd(w->fromWorker, &payload[0], payload.size());
+            }
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(pool->mu);
+        pool->free.push_back(idx);
+    }
+    pool->cv.notify_one();
+
+    if (!ok) {
+        error = "infernal worker IPC failure";
+        return false;
+    }
+    if (rFlag == 1) {
+        cmText = std::move(payload);
+        return true;
+    }
+    error = std::move(payload);
+    return false;
 }
 
 } // namespace InfernalBridge
