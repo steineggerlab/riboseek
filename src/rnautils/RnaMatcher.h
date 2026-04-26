@@ -19,7 +19,7 @@
 
 // RNA-calibrated E-value correction applied on top of standard ALP E-value
 inline double rnaEvalueCorrection(double evalue) {
-    return 0.0382461572658595 * pow(evalue, 0.8283631544068919);
+    return 0.0382461572658595 * pow(evalue * 2, 0.8283631544068919);
 }
 
 class RnaMatcher{
