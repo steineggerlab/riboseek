@@ -196,7 +196,7 @@ static void recalcNonCanonicalDinuc(double ** probMatrix, double ** subMatrix, i
                 }
             }
 
-            subMatrix[i][j] = std::log2(probSum / (pBack_row * pBack_col));
+            subMatrix[i][j] = std::log2(probSum / (pBack_row * pBack_col)) - std::log2(static_cast<double>(dinucs_row.size() * dinucs_col.size()));
             subMatrix[j][i] = subMatrix[i][j];
         }
     }
