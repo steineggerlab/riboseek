@@ -57,14 +57,14 @@ TARGETDB="$2"
 TMP_PATH="$4"
 MERGE_INPUT=""
 
-if [ -n "$NEEDTARGETSPLIT" ]; then
-    if notExists "$TMP_PATH/target_seqs_split.dbtype"; then
-        # shellcheck disable=SC2086
-        "$MMSEQS" splitsequence "$TARGETDB" "$TMP_PATH/target_seqs_split" ${SPLITSEQUENCE_PAR}  \
-            || fail "Split sequence died"
-    fi
-    TARGETDB="$TMP_PATH/target_seqs_split"
-fi
+# if [ -n "$NEEDTARGETSPLIT" ]; then
+#     if notExists "$TMP_PATH/target_seqs_split.dbtype"; then
+#         # shellcheck disable=SC2086
+#         "$MMSEQS" splitsequence "$TARGETDB" "$TMP_PATH/target_seqs_split" ${SPLITSEQUENCE_PAR}  \
+#             || fail "Split sequence died"
+#     fi
+#     TARGETDB="$TMP_PATH/target_seqs_split"
+# fi
 
 # Target DB stores raw nucleotide characters. Set DINUCLEOTIDE flag so
 # Sequence::mapSequence uses dinucleotide pair encoding (via auxRegistry).
