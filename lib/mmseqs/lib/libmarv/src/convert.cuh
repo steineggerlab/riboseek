@@ -208,9 +208,15 @@ struct ClampToInvalid{
     #ifdef __CUDACC__
     __host__ __device__
     #endif
+    #ifdef RIBOSEEK
+    char operator()(const char& AA) {
+        return AA < 24 ? AA : 24;
+    }
+    #else
     char operator()(const char& AA) {
         return AA < 20 ? AA : 20;
     }
+    #endif
 
     //vectorized for 4 values packed in a single int
     #ifdef __CUDACC__
@@ -218,10 +224,13 @@ struct ClampToInvalid{
     #endif
     unsigned int operator()(const unsigned int& packed4) {
         #ifdef __CUDA_ARCH__
-
+        #ifdef RIBOSEEK
+        constexpr unsigned int mask24 = 0x18181818; // decimal 24 per byte
+        return __vminu4(packed4, mask24);
+        #else
         constexpr unsigned int mask20 = 0x14141414; // decimal 20 per byte
         return __vminu4(packed4, mask20);
-
+        #endif
         #else
 
         char asChar[4];

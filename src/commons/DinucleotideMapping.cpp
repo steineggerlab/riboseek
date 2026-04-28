@@ -548,28 +548,44 @@ const unsigned char* getDinucToNucTable() {
     return dinucToNucTbl;
 }
 
+// void dinucEncodeReverse(Sequence *seq) {
+//     unsigned char *numSequence = seq->numSequence;
+//     const char *sequence = seq->getSeqData();
+//     const unsigned int dataLen = seq->L;
+//     const unsigned char *aa2num = seq->subMat->aa2num;
+//     const unsigned char *__restrict p = (const unsigned char *)sequence;
+//     unsigned int i = 0;
+//     unsigned int s_1 = (unsigned int)'X';
+//     for (; i + 3 < dataLen; i += 4) {
+//         unsigned int s_2 = p[i], s_3 = p[i+1], s_4 = p[i+2], s_5 = p[i+3];
+//         numSequence[i]   = aa2num[(s_1 << 8) | s_2];
+//         numSequence[i+1] = aa2num[(s_2 << 8) | s_3];
+//         numSequence[i+2] = aa2num[(s_3 << 8) | s_4];
+//         numSequence[i+3] = aa2num[(s_4 << 8) | s_5];
+//         s_1 = s_5;
+//     }
+//     for (; i < dataLen; i++) {
+//         unsigned int s_2 = p[i];
+//         numSequence[i] = aa2num[(s_1 << 8) | s_2];
+//         s_1 = s_2;
+//     }
+//     seq->L = i;
+// }
+
+// Only being called after seq->numSequence has mapped
 void dinucEncodeReverse(Sequence *seq) {
     unsigned char *numSequence = seq->numSequence;
-    const char *sequence = seq->getSeqData();
-    const unsigned int dataLen = seq->L;
-    const unsigned char *aa2num = seq->subMat->aa2num;
-    const unsigned char *__restrict p = (const unsigned char *)sequence;
-    unsigned int i = 0;
-    unsigned int s_1 = (unsigned int)'X';
-    for (; i + 3 < dataLen; i += 4) {
-        unsigned int s_2 = p[i], s_3 = p[i+1], s_4 = p[i+2], s_5 = p[i+3];
-        numSequence[i]   = aa2num[(s_1 << 8) | s_2];
-        numSequence[i+1] = aa2num[(s_2 << 8) | s_3];
-        numSequence[i+2] = aa2num[(s_3 << 8) | s_4];
-        numSequence[i+3] = aa2num[(s_4 << 8) | s_5];
-        s_1 = s_5;
+    unsigned int i = seq->L - 1;
+    for (; i >= 4; i -= 4) {
+        numSequence[i] = numSequence[i - 1];
+        numSequence[i - 1] = numSequence[i - 2];
+        numSequence[i - 2] = numSequence[i - 3];
+        numSequence[i - 3] = numSequence[i - 4];
     }
-    for (; i < dataLen; i++) {
-        unsigned int s_2 = p[i];
-        numSequence[i] = aa2num[(s_1 << 8) | s_2];
-        s_1 = s_2;
+    for (; i >= 1; i--) {
+        numSequence[i] = numSequence[i - 1];
     }
-    seq->L = i;
+    numSequence[0] = dinucHead[numSequence[0]];
 }
 
 void registerDinucleotideMapping() {

@@ -68,7 +68,12 @@ MERGE_INPUT=""
 
 # Target DB stores raw nucleotide characters. Set DINUCLEOTIDE flag so
 # Sequence::mapSequence uses dinucleotide pair encoding (via auxRegistry).
-if [ -n "$SPLITSTRAND" ]; then
+# Only do if the workflow doesn't use GPU
+# Also make soft-link to make the target DB dinucleotide-aware without altering the original target DB
+if [ -n "$SPLITSTRAND" ] && [ -z "$GPU" ]; then
+    # lndb
+    "$MMSEQS" lndb "$TARGETDB" "$TMP_PATH/target_db_dinuc" || fail "Link target DB died"
+    TARGETDB="$TMP_PATH/target_db_dinuc"
     # AMINO_ACIDS=0 base + DINUCLEOTIDE=64 extended => 0x00400000
     awk 'BEGIN { printf("%c%c%c%c",0,0,64,0); exit; }' > "$TARGETDB.dbtype"
 fi

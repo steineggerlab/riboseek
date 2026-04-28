@@ -25,6 +25,9 @@ int makepaddedseqdb(int argc, const char **argv, const Command &command) {
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, par.scoreBias);
 
     int dbType = DBReader<unsigned int>::setExtendedDbtype(dbr.getDbtype(), Parameters::DBTYPE_EXTENDED_GPU);
+#ifdef RIBOSEEK
+    dbType = DBReader<unsigned int>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, Parameters::DBTYPE_EXTENDED_GPU);
+#endif
     DBWriter dbsw(par.db2.c_str(), par.db2Index.c_str(), par.threads, false, dbType);
     dbsw.open();
     DBWriter dbhw(par.hdr2.c_str(), par.hdr2Index.c_str(), par.threads, false, Parameters::DBTYPE_GENERIC_DB);
@@ -44,7 +47,14 @@ int makepaddedseqdb(int argc, const char **argv, const Command &command) {
     result.reserve(par.maxSeqLen);
 
     const int ALIGN = 4;
+#ifdef RIBOSEEK
+    int dbTypeExt = DBReader<unsigned int>::getExtendedDbtype(dbr.getDbtype());
+    dbTypeExt |= 64;// LocalParameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
+    dbTypeExt = DBReader<unsigned int>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, dbTypeExt);
+    Sequence seq(dbr.getMaxSeqLen(), dbTypeExt, &subMat,  0, false, false);
+#else
     Sequence seq(dbr.getMaxSeqLen(), dbr.getDbtype(), &subMat,  0, false, false);
+#endif
 
     size_t firstIt = SIZE_MAX;
     unsigned int seqKey = 0;
@@ -86,7 +96,11 @@ int makepaddedseqdb(int argc, const char **argv, const Command &command) {
             }
         }
         const size_t sequencepadding = (seq.L % ALIGN == 0) ? 0 : ALIGN - seq.L % ALIGN;
+#ifdef RIBOSEEK
+        result.append(sequencepadding, static_cast<char>(24));
+#else
         result.append(sequencepadding, static_cast<char>(20));
+#endif
         dbsw.writeData(result.c_str(), result.size(), key, thread_idx, false, false);
 
         // + 2 is needed for newline and null character

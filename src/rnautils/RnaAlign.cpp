@@ -151,10 +151,14 @@ int rnaalign(int argc, const char **argv, const Command &command) {
         querySeqType = qdbr->getDbtype();
     }
 
+    // Check if tdbr is a GPU db
+    bool isGpuDb = (DBReader<unsigned int>::getExtendedDbtype(targetSeqType) & Parameters::DBTYPE_EXTENDED_GPU);
+
     // RNA always uses dinucleotide pair encoding.
     // Force DINUCLEOTIDE flag on both query and target so dinucMapSequence activates.
     // Keep the base types as-is (AMINO_ACIDS for sequences, HMM_PROFILE for profiles).
-    {
+    // If targetSeqType is GPU db, don't set the DINUCLEOTIDE flag
+    if (!isGpuDb) {
         uint16_t tExt = DBReader<unsigned int>::getExtendedDbtype(targetSeqType);
         tExt |= LocalParameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
         targetSeqType = DBReader<unsigned int>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, tExt);
@@ -300,13 +304,22 @@ int rnaalign(int argc, const char **argv, const Command &command) {
                     data = Util::skipLine(data);
 
                     size_t dbId = tdbr->getId(dbKey);
-                    char *dbSeqData = tdbr->getData(dbId, thread_idx);
+		    char *dbSeqData = NULL;
+                    if (isGpuDb) {
+                        // Run getDataUncompressed
+                        dbSeqData = tdbr->getDataUncompressed(dbId);
+                    } else {
+                        dbSeqData = tdbr->getData(dbId, thread_idx);
+                    }
                     if (dbSeqData == NULL) {
                         Debug(Debug::ERROR) << "Sequence " << dbKey
                                             << " is required in the prefiltering, but is not contained in the target sequence database!\n";
                         EXIT(EXIT_FAILURE);
                     }
                     dbSeq.mapSequence(dbId, dbKey, dbSeqData, tdbr->getSeqLen(dbId));
+		    if (isGpuDb) {
+			memcpy(dbSeq.numSequence, dbSeqData, tdbr->getSeqLen(dbId));
+		    }
                     if (reverse) {
                         dinucEncodeReverse(&dbSeq);
                     }
