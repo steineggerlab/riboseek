@@ -71,11 +71,17 @@ MERGE_INPUT=""
 # Only do if the workflow doesn't use GPU
 # Also make soft-link to make the target DB dinucleotide-aware without altering the original target DB
 if [ -n "$SPLITSTRAND" ] && [ -z "$GPU" ]; then
-    # lndb
-    "$MMSEQS" lndb "$TARGETDB" "$TMP_PATH/target_db_dinuc" || fail "Link target DB died"
+    if notExists "$TMP_PATH/target_db_dinuc.dbtype"; then
+        ln -s "$(abspath "$2")" "$TMP_PATH/target_db_dinuc"
+        ln -s "$(abspath "$2.index")" "$TMP_PATH/target_db_dinuc.index"
+        ln -s "$(abspath "${2}_h")" "$TMP_PATH/target_db_dinuc_h" 2>/dev/null || true
+        ln -s "$(abspath "${2}_h.index")" "$TMP_PATH/target_db_dinuc_h.index" 2>/dev/null || true
+        ln -s "$(abspath "${2}_h.dbtype")" "$TMP_PATH/target_db_dinuc_h.dbtype" 2>/dev/null || true
+        ln -s "$(abspath "${2}.lookup")" "$TMP_PATH/target_db_dinuc.lookup" 2>/dev/null || true
+        ln -s "$(abspath "${2}.source")" "$TMP_PATH/target_db_dinuc.source" 2>/dev/null || true
+        awk 'BEGIN { printf("%c%c%c%c",0,0,64,0); exit; }' > "$TMP_PATH/target_db_dinuc.dbtype"
+    fi
     TARGETDB="$TMP_PATH/target_db_dinuc"
-    # AMINO_ACIDS=0 base + DINUCLEOTIDE=64 extended => 0x00400000
-    awk 'BEGIN { printf("%c%c%c%c",0,0,64,0); exit; }' > "$TARGETDB.dbtype"
 fi
 
 STEP=0
@@ -236,7 +242,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
             # in dinucleotide space so the PSSM is built over dinucleotide codes.
             R2P_TARGET="$2"
             R2P_QUERY="$ORIQUERYDB"
-            if [ -n "$SPLITSTRAND" ]; then
+            if [ -n "$SPLITSTRAND" ] && [ -z "$GPU" ]; then
                 # Create a dinuc-flagged symlink of the original target DB (once)
                 # offsetalignment maps split coords back to original, so r2p needs the original.
                 if notExists "$TMP_PATH/target_r2p.dbtype"; then
@@ -250,6 +256,21 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
                     awk 'BEGIN { printf("%c%c%c%c",0,0,64,0); exit; }' > "$TMP_PATH/target_r2p.dbtype"
                 fi
                 R2P_TARGET="$TMP_PATH/target_r2p"
+                # For step 0, create a dinuc-flagged symlink of the original query
+                if [ "$STEP" -eq 0 ]; then
+                    if notExists "$TMP_PATH/query_r2p.dbtype"; then
+                        ln -s "$(abspath "$1")" "$TMP_PATH/query_r2p"
+                        ln -s "$(abspath "$1.index")" "$TMP_PATH/query_r2p.index"
+                        ln -s "$(abspath "${1}_h")" "$TMP_PATH/query_r2p_h" 2>/dev/null || true
+                        ln -s "$(abspath "${1}_h.index")" "$TMP_PATH/query_r2p_h.index" 2>/dev/null || true
+                        ln -s "$(abspath "${1}_h.dbtype")" "$TMP_PATH/query_r2p_h.dbtype" 2>/dev/null || true
+                        ln -s "$(abspath "${1}.lookup")" "$TMP_PATH/query_r2p.lookup" 2>/dev/null || true
+                        ln -s "$(abspath "${1}.source")" "$TMP_PATH/query_r2p.source" 2>/dev/null || true
+                        awk 'BEGIN { printf("%c%c%c%c",0,0,64,0); exit; }' > "$TMP_PATH/query_r2p.dbtype"
+                    fi
+                    R2P_QUERY="$TMP_PATH/query_r2p"
+                fi
+            else
                 # For step 0, create a dinuc-flagged symlink of the original query
                 if [ "$STEP" -eq 0 ]; then
                     if notExists "$TMP_PATH/query_r2p.dbtype"; then

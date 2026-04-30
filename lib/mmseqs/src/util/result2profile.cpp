@@ -238,6 +238,61 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
                     } else {
                         edgeSequence.mapSequence(edgeId, key, tDbr->getData(edgeId, thread_idx), tDbr->getSeqLen(edgeId));
                     }
+                    #ifdef RIBOSEEK
+                    // Remap sequence if the database is from GPU
+                    if (DBReader<unsigned int>::getExtendedDbtype(tDbr->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU) {
+                        char *dbSeqData = tDbr->getDataUncompressed(edgeId);
+                        memcpy(edgeSequence.numSequence, dbSeqData, edgeSequence.L);
+                        if (alnResults.back().qStartPos > alnResults.back().qEndPos) {
+                            unsigned char *numSequence = edgeSequence.numSequence;
+                            unsigned int i = edgeSequence.L - 1;
+                            for (; i >= 4; i -= 4) {
+                                numSequence[i] = numSequence[i - 1];
+                                numSequence[i - 1] = numSequence[i - 2];
+                                numSequence[i - 2] = numSequence[i - 3];
+                                numSequence[i - 3] = numSequence[i - 4];
+                            }
+                            for (; i >= 1; i--) {
+                                numSequence[i] = numSequence[i - 1];
+                            }
+                            // Process for the first position
+                            unsigned char *aa2num = subMat.aa2num;
+                            switch (numSequence[0]) {
+                                case 1:
+                                case 5:
+                                case 9:
+                                case 13:
+                                case 16:
+                                    numSequence[0] = aa2num[(int)'B']; // XA
+                                    break;
+                                case 2:
+                                case 4:
+                                case 8:
+                                case 14:
+                                case 17:
+                                    numSequence[0] = aa2num[(int)'J']; // XC
+                                    break;
+                                case 0:
+                                case 7:
+                                case 10:
+                                case 12:
+                                case 18:
+                                    numSequence[0] = aa2num[(int)'O']; // XG
+                                    break;
+                                case 3:
+                                case 6:
+                                case 11:
+                                case 15:
+                                case 19:
+                                    numSequence[0] = aa2num[(int)'U']; // XU/XT
+                                    break;
+                                default:
+                                    numSequence[0] = aa2num[(int)'X']; // XX
+                                    break;
+                            }
+                        }
+                    }
+                    #endif
                     seqSet.emplace_back(std::vector<unsigned char>(edgeSequence.numSequence, edgeSequence.numSequence + edgeSequence.L));
 
                     if (columns <= Matcher::ALN_RES_WITHOUT_BT_COL_CNT) {
