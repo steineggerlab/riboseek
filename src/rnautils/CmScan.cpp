@@ -1204,10 +1204,23 @@ static InfernalExactModel parseInfernalCmExactModelFromStream(std::istream &in, 
 
         const double LOG2 = std::log(2.0);
         if (m.pBegin > 0.0 && !beginHeads.empty()) {
-            const double begLin = m.pBegin / static_cast<double>(beginHeads.size());
-            const double begLog = std::log(begLin) / LOG2;
+            // Mirror Infernal cm_CalculateLocalBeginProbs (cm_modelconfig.c:397):
+            // node 1's first state (the natural first child of ROOT_S) gets
+            // log2(1 - pBegin). Other internal heads (nd >= 2) share pBegin
+            // across nstartsRest = nbegin - 1. Treating all heads uniformly
+            // costs ~10 bits at v=0 vs Infernal (verified on 2YGH_1 harness).
+            const int node1Head = (1 < static_cast<int>(firstOfNode.size())) ? firstOfNode[1] : -1;
+            int nstartsRest = 0;
             for (int h : beginHeads) {
-                m.states[static_cast<size_t>(h)].beginSc = begLog;
+                if (h != node1Head) nstartsRest++;
+            }
+            const double begLogFirst = std::log(1.0 - m.pBegin) / LOG2;
+            const double begLogRest = (nstartsRest > 0)
+                ? std::log(m.pBegin / static_cast<double>(nstartsRest)) / LOG2
+                : NEG_INF;
+            for (int h : beginHeads) {
+                m.states[static_cast<size_t>(h)].beginSc =
+                    (h == node1Head) ? begLogFirst : begLogRest;
             }
         }
         if (m.pEnd > 0.0 && !endHeads.empty()) {
@@ -2200,6 +2213,19 @@ static void runInfernalExactScan(const InfernalExactModel &model,
     std::vector<uint8_t> nbConsumeMask(static_cast<size_t>(M), 0);
     std::vector<StateId> nbTrDst4(static_cast<size_t>(M) * 4, 0);
     std::vector<float> nbTrScF4(static_cast<size_t>(M) * 4, -std::numeric_limits<float>::infinity());
+    // MMSEQS_CMSCAN_DISABLE_QDB=1 neutralizes per-state QDB1 bands so CYK fills the
+    // full d-range, mirroring Infernal cmalign's default (HMM-banded but not QDB-banded).
+    const char *envDisableQdb = std::getenv("MMSEQS_CMSCAN_DISABLE_QDB");
+    const bool disableQdb = (envDisableQdb != NULL && envDisableQdb[0] == '1');
+    // MMSEQS_CMSCAN_DROP_DMIN=1 zeros per-state dmin while preserving dmax. Targets the
+    // FG=1 collapse on short-envelope queries (e.g. 4LCK_3) where forced d=N falls below
+    // dmin at the root, without inviting qdboff's unbounded-trace regressions on large queries.
+    const char *envDropDmin = std::getenv("MMSEQS_CMSCAN_DROP_DMIN");
+    const bool dropDmin = (envDropDmin != NULL && envDropDmin[0] == '1');
+    // MMSEQS_CMSCAN_DROP_DMAX=1: zeros dmin AND removes dmax cap (sentinel -1) so no
+    // upper d-bound at any state, but still ranges from 0. Mirrors qdboff's band off.
+    const char *envDropDmax = std::getenv("MMSEQS_CMSCAN_DROP_DMAX");
+    const bool dropDmax = (envDropDmax != NULL && envDropDmax[0] == '1');
     for (int v = 0; v < M; ++v) {
         const CmState &st = model.states[static_cast<size_t>(v)];
         ExactStateExec e;
@@ -2224,8 +2250,8 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         e.splitKMax = -1;
         e.splitRMin = 0;
         e.splitRMax = -1;
-        e.dmin = st.dmin1;
-        e.dmax = st.dmax1;
+        e.dmin = (disableQdb || dropDmin || dropDmax) ? 0 : st.dmin1;
+        e.dmax = (disableQdb || dropDmax) ? -1 : st.dmax1;
         e.null2Agg[0] = 0.0;
         e.null2Agg[1] = 0.0;
         e.null2Agg[2] = 0.0;
@@ -2261,17 +2287,17 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         }
         if (st.type == CM_ST_B) {
             isBState[static_cast<size_t>(v)] = 1;
-            if (e.bLeft >= 0 && e.bLeft < M) {
+            if (!disableQdb && !dropDmax && e.bLeft >= 0 && e.bLeft < M) {
                 const CmState &l = model.states[static_cast<size_t>(e.bLeft)];
                 if (l.dmin1 >= 0 && l.dmax1 >= l.dmin1) {
-                    e.splitKMin = l.dmin1;
+                    e.splitKMin = dropDmin ? 0 : l.dmin1;
                     e.splitKMax = l.dmax1;
                 }
             }
-            if (e.bRight >= 0 && e.bRight < M) {
+            if (!disableQdb && !dropDmax && e.bRight >= 0 && e.bRight < M) {
                 const CmState &r = model.states[static_cast<size_t>(e.bRight)];
                 if (r.dmin1 >= 0 && r.dmax1 >= r.dmin1) {
-                    e.splitRMin = r.dmin1;
+                    e.splitRMin = dropDmin ? 0 : r.dmin1;
                     e.splitRMax = r.dmax1;
                 }
             }
@@ -2654,6 +2680,50 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                         std::copy(bestBuf, bestBuf + iMax, outPtr);
                     }
                 }
+
+                // EL pre-fill fusion. Mirrors Infernal cm_dpsearch.c:3389-3398:
+                // for any end-eligible state v, alpha[v][d][i] must reflect
+                // max(regular recurrence, emit_v(i,d) + el_scA[d-sd] + endsc[v]).
+                // Doing this INSIDE the (d,v) fill (not as a post-pass) is what
+                // lets parents w of v reading alpha[v] at later d-iterations see
+                // the EL-augmented value — so EL contribution propagates up the
+                // CM tree, which the prior post-pass placement could never do.
+                if (model.hasLocalCfg && model.elSelf <= 0.0) {
+                    const CmState &csEl = model.states[vi];
+                    if (csEl.endSc != NEG_INF) {
+                        int sdEl = -1;
+                        if (csEl.type == CM_ST_MP) sdEl = 2;
+                        else if (csEl.type == CM_ST_ML || csEl.type == CM_ST_MR) sdEl = 1;
+                        else if (csEl.type == CM_ST_S) sdEl = 0;
+                        if (sdEl >= 0 && d >= sdEl) {
+                            const float elContrib = static_cast<float>(model.elSelf) * static_cast<float>(d - sdEl)
+                                                  + static_cast<float>(csEl.endSc);
+                            const int8_t *scEl = ws.seqCode.data();
+                            for (int ii = 0; ii < iMax; ++ii) {
+                                const int i = ii + 1;
+                                float ef;
+                                if (consumeMask == 0u) {
+                                    ef = 0.0f;
+                                } else if (consumeMask == 1u) {
+                                    const int li = scEl[i];
+                                    if (li < 0) continue;
+                                    ef = (ep && emitSize >= 4) ? ep[li] : -1.0f;
+                                } else if (consumeMask == 2u) {
+                                    const int ri = scEl[i + d - 1];
+                                    if (ri < 0) continue;
+                                    ef = (ep && emitSize >= 4) ? ep[ri] : -1.0f;
+                                } else {
+                                    const int li = scEl[i];
+                                    const int ri = scEl[i + d - 1];
+                                    if (li < 0 || ri < 0) continue;
+                                    ef = (ep && emitSize >= 16) ? ep[li * 4 + ri] : -1.0f;
+                                }
+                                const float cand = ef + elContrib;
+                                if (outPtr[ii] < cand) outPtr[ii] = cand;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2947,6 +3017,62 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 fprintf(stderr, "DUMP_D tid=%s d=%d bestI=%d rawSc=%.4f sc=%.4f\n",
                         seqId.c_str(), d, dBestI[static_cast<size_t>(d)],
                         dBestRaw[static_cast<size_t>(d)], dBestSc[static_cast<size_t>(d)]);
+            }
+            // Cell-diff vs Infernal: dump alpha[v=0][j=jTarget][d] for j_target from env.
+            // Default jTarget = N (envelope-end at last residue) and additionally a list
+            // from MMSEQS_CMSCAN_DUMP_J="167" (comma-separated).
+            const char *dumpJList = std::getenv("MMSEQS_CMSCAN_DUMP_J");
+            std::vector<int> jTargets;
+            if (dumpJList != NULL) {
+                std::string s = dumpJList;
+                size_t pos = 0;
+                while (pos < s.size()) {
+                    size_t comma = s.find(',', pos);
+                    int jt = std::atoi(s.substr(pos, comma - pos).c_str());
+                    if (jt > 0 && jt <= N) jTargets.push_back(jt);
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
+                }
+            }
+            for (int jT : jTargets) {
+                for (int d = 1; d <= jT; ++d) {
+                    const int i = jT - d + 1;
+                    if (i < 1 || i > N) continue;
+                    if (d > maxSpan) continue;
+                    const float a = vit[rootBase + static_cast<size_t>(d) * iStride + static_cast<size_t>(i)];
+                    fprintf(stderr, "DUMP_CELL tid=%s j=%d i=%d d=%d alpha=%.4f\n",
+                            seqId.c_str(), jT, i, d, a);
+                }
+            }
+            // For each (j_target, d) of interest, dump alpha across all states v
+            // that have finite alpha. Lets us see which y is supposed to feed
+            // local-begin pickup. Gated by MMSEQS_CMSCAN_DUMP_ALL_V=1.
+            const char *dumpAllV = std::getenv("MMSEQS_CMSCAN_DUMP_ALL_V");
+            if (dumpAllV != NULL && dumpAllV[0] == '1') {
+                const char *dumpDmin = std::getenv("MMSEQS_CMSCAN_DUMP_DMIN");
+                int dMin = (dumpDmin != NULL) ? std::atoi(dumpDmin) : 100;
+                if (dMin < 1) dMin = 1;
+                for (int jT : jTargets) {
+                    for (int d = dMin; d <= std::min(jT, maxSpan); ++d) {
+                        const int i = jT - d + 1;
+                        if (i < 1 || i > N) continue;
+                        for (int v = 0; v < M; ++v) {
+                            const size_t vBase = stateBase[static_cast<size_t>(v)];
+                            const float a = vit[vBase + static_cast<size_t>(d) * iStride + static_cast<size_t>(i)];
+                            if (a == NEG_INF_F) continue;
+                            const CmState &cs = model.states[static_cast<size_t>(v)];
+                            fprintf(stderr, "DUMP_V tid=%s j=%d d=%d v=%d type=%d node=%d ndtype=%d firstOfNode=%d alpha=%.4f beginSc=%.4f endSc=%.4f\n",
+                                    seqId.c_str(), jT, d, v,
+                                    static_cast<int>(cs.type),
+                                    cs.nodeIdx,
+                                    static_cast<int>(cs.nodeType),
+                                    cs.isFirstOfNode ? 1 : 0,
+                                    a,
+                                    static_cast<float>(cs.beginSc),
+                                    static_cast<float>(cs.endSc));
+                        }
+                    }
+                }
             }
         }
         if (bestSc == NEG_INF_F) {
@@ -3646,6 +3772,70 @@ static void runInfernalExactScan(const InfernalExactModel &model,
     outHits.push_back(h);
 }
 
+// Per-envelope CYK re-scan wrapper. When MMSEQS_CMSCAN_RESCORE_ENVELOPE=1,
+// runs CYK twice: first to identify peak (i,j), then re-runs on a sub-sequence
+// of [max(1, i-pad) .. min(N, j+pad)] which mirrors Infernal's dispatch#2 behavior
+// (envelope-restricted CYK that yields ~+60 bits at the same logical cell on
+// 2YGH_1 KJ798010.1). Pad defaults to 5; override with MMSEQS_CMSCAN_RESCORE_PAD.
+static void runInfernalExactScanWithEnvelopeRescore(const InfernalExactModel &model,
+                                                    const std::string &seq,
+                                                    bool wantInside,
+                                                    std::vector<Hit> &outHits,
+                                                    const std::string &seqId,
+                                                    int maxHitLen = 0,
+                                                    int forcedI = -1,
+                                                    int forcedD = -1) {
+    static int rescoreEnabled = -1;
+    static int rescorePad = -1;
+    if (rescoreEnabled == -1) {
+        const char *env = std::getenv("MMSEQS_CMSCAN_RESCORE_ENVELOPE");
+        rescoreEnabled = (env != NULL && std::string(env) == "1") ? 1 : 0;
+    }
+    if (rescorePad == -1) {
+        const char *env = std::getenv("MMSEQS_CMSCAN_RESCORE_PAD");
+        rescorePad = (env != NULL) ? std::atoi(env) : 5;
+        if (rescorePad < 0) rescorePad = 0;
+    }
+
+    if (rescoreEnabled == 0) {
+        runInfernalExactScan(model, seq, wantInside, outHits, seqId, maxHitLen, forcedI, forcedD);
+        return;
+    }
+
+    // First pass: locate envelope peak with a CYK-only scan (faster than Inside).
+    std::vector<Hit> probeHits;
+    runInfernalExactScan(model, seq, /*wantInside=*/false, probeHits, seqId, maxHitLen, forcedI, forcedD);
+    if (probeHits.empty()) {
+        outHits = std::move(probeHits);
+        return;
+    }
+
+    const int N = static_cast<int>(seq.size());
+    for (Hit &probe : probeHits) {
+        const int lo = std::min(probe.start1, probe.end1);
+        const int hi = std::max(probe.start1, probe.end1);
+        const int wi = std::max(1, lo - rescorePad);
+        const int wj = std::min(N, hi + rescorePad);
+        if (wi >= wj) {
+            outHits.push_back(std::move(probe));
+            continue;
+        }
+        const int subLen = wj - wi + 1;
+        std::string subSeq = seq.substr(static_cast<size_t>(wi - 1), static_cast<size_t>(subLen));
+        std::vector<Hit> rescoreHits;
+        runInfernalExactScan(model, subSeq, wantInside, rescoreHits, seqId, maxHitLen);
+        if (rescoreHits.empty()) {
+            outHits.push_back(std::move(probe));
+            continue;
+        }
+        // Sub-seq positions [1..subLen] map back to absolute [wi..wj].
+        Hit &best = rescoreHits.front();
+        best.start1 += (wi - 1);
+        best.end1 += (wi - 1);
+        outHits.push_back(std::move(best));
+    }
+}
+
 
 } // namespace
 
@@ -3988,8 +4178,8 @@ int cmscan(int argc, const char **argv, const Command &command) {
                 }
                 std::vector<Hit> fwdHits, revHits;
                 if (scanFwd) {
-                    runInfernalExactScan(qm.exactModel, regionSeq, wantInside, fwdHits, fs.id,
-                                         maxHitLen, forceI, forceD);
+                    runInfernalExactScanWithEnvelopeRescore(qm.exactModel, regionSeq, wantInside, fwdHits, fs.id,
+                                                            maxHitLen, forceI, forceD);
                 }
                 if (scanRev) {
                     const std::string revSeq = reverseComplement(regionSeq);
@@ -4001,8 +4191,8 @@ int cmscan(int argc, const char **argv, const Command &command) {
                         revForceI = M_local - forceI - forceD + 2;
                         revForceD = forceD;
                     }
-                    runInfernalExactScan(qm.exactModel, revSeq, wantInside, revHits, fs.id,
-                                         maxHitLen, revForceI, revForceD);
+                    runInfernalExactScanWithEnvelopeRescore(qm.exactModel, revSeq, wantInside, revHits, fs.id,
+                                                            maxHitLen, revForceI, revForceD);
                 }
 
                 const unsigned int fullLen = static_cast<unsigned int>(fs.seq.size());
