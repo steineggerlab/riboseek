@@ -309,6 +309,16 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
 
             // Recompute if not all the backtraces are present
             MultipleAlignment::MSAResult res = aligner.computeMSA(&centerSequence, seqSet, alnResults, true);
+            #ifdef RIBOSEEK
+            // If the res[k][pos] is non-canonical letters, change it to ANY
+            for (size_t k = 0; k < res.setSize; k++) {
+                for (size_t pos = 0; pos < res.centerLength; pos++) {
+                    if (res.msaSequence[k][pos] > 15 && res.msaSequence[k][pos] < MultipleAlignment::GAP) {
+                        res.msaSequence[k][pos] = MultipleAlignment::ANY;
+                    }
+                }
+            }
+            #endif
 
             // do not count query
             size_t filteredSetSize = (isFiltering == true)  ?
