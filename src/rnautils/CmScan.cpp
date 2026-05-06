@@ -16,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -108,6 +109,10 @@ struct CmState {
     bool isFirstOfNode = false;
     double beginSc = NEG_INF;  // log2(begin prob); finite only at begin-eligible heads
     double endSc = NEG_INF;    // log2(end prob);   finite only at end-eligible heads
+    // Truncation DP: marginal emission scores for L/R modes (Infernal cm_CalcMargLikScores).
+    // For MATP_MP only, size 4 per nucleotide; empty otherwise.
+    std::vector<double> lmesc; // L-mode: keep left, marginalize right partner
+    std::vector<double> rmesc; // R-mode: keep right, marginalize left partner
 };
 
 struct ExactStateExec {
@@ -161,6 +166,25 @@ struct InfernalExactModel {
     ExpTail expGI;
     std::vector<CmState> states;
     int rootState;
+    // Truncation DP support (gated on MMSEQS_CMSCAN_TRUNC_DP=1; otherwise empty).
+    // emap mirrors Infernal CMEmitMap_t (display.c:CreateEmitMap): per-node
+    // consensus position bounds + EL-anchor position.
+    int nNodes = 0;
+    std::vector<int> nodeFirstState; // size nNodes; first state index of each node
+    std::vector<CmNodeType> nodeType;
+    std::vector<int> emapLpos;       // node -> consensus 0..clen+1 (inclusive low bound)
+    std::vector<int> emapRpos;       // node -> consensus 0..clen+1 (inclusive high bound)
+    std::vector<int> emapEpos;       // node -> consensus position EL insertion follows
+    // Expected per-state occupancy psi[v] (Infernal cm_ExpectedPositionOccupancy).
+    // Linear-space probability of state v being entered in a sample. Size states.size().
+    std::vector<double> psi;
+    // Truncation penalties (Infernal cm_tr_penalties_Create).
+    // [type][stateIdx]; type 0=5'+3', 1=5'only, 2=3'only. Indexed by global state id.
+    // Two parallel sets: trpG = global mode (no local), trpL = local mode.
+    // Stored as log2 probabilities (NEG_INF if not eligible for that truncation type).
+    std::vector<std::vector<double>> trpG;
+    std::vector<std::vector<double>> trpL;
+    bool hasTruncDp = false;
 };
 
 template <typename T>
@@ -951,6 +975,1100 @@ static CmNodeType parseCmNodeType(const std::string &tok) {
     return CM_ND_UNKNOWN;
 }
 
+// =====================================================================
+// Stage 6: native port of Infernal cm_TrCYKInsideAlign (cm_dpalign_trunc.c)
+// Fills J/L/R/T DP and shadow matrices for full-sequence trCYK alignment.
+// Not yet wired into the alignment path; integration is Stage 8.
+// =====================================================================
+struct TrCykResult {
+    double score = -1e30;
+    char   mode = 'J';
+    int    b = 0;
+    std::vector<std::vector<std::vector<int8_t>>>  Jyshadow, Lyshadow, Ryshadow;
+    std::vector<std::vector<std::vector<int>>>     Jkshadow, Lkshadow, Rkshadow, Tkshadow;
+    std::vector<std::vector<std::vector<int8_t>>>  Lkmode, Rkmode;
+    std::vector<std::vector<std::vector<float>>>   Jalpha, Lalpha, Ralpha, Talpha;
+};
+
+// TRMODE_* offset constants — match Infernal cm_alphabet.h.
+// Match Infernal infernal.h: TRMODE_T=0, TRMODE_R=1, TRMODE_L=2, TRMODE_J=3,
+// TRMODE_UNKNOWN=4. TRMODE_*_OFFSET picks DP source for shadow decoding.
+static const int8_t  TR_TRMODE_T = 0;
+static const int8_t  TR_TRMODE_R = 1;
+static const int8_t  TR_TRMODE_L = 2;
+static const int8_t  TR_TRMODE_J = 3;
+static const int8_t  TR_TRMODE_UNKNOWN = 4;
+static const int    TR_TRMODE_J_OFFSET = 0;
+static const int    TR_TRMODE_L_OFFSET = 10;
+static const int    TR_TRMODE_R_OFFSET = 20;
+static const int8_t  TR_USED_LOCAL_BEGIN = 101;
+static const int8_t  TR_USED_EL          = 102;
+static const int8_t  TR_USED_TRUNC_BEGIN = 103;
+static const int8_t  TR_USED_TRUNC_END   = 104;
+
+static inline bool trNotImpossible(double x) {
+    // Infernal NOT_IMPOSSIBLE: x > -1e8. Our endsc/trp use NEG_INF = -inf
+    // when ineligible, so any finite value qualifies.
+    return std::isfinite(x);
+}
+
+// Mirrors esl_abc_FAvgScore: arithmetic average of esc[0..K-1] over degeneracy
+// expansion class. For fully-degenerate X/N over {A,C,G,U}: avg of all four.
+template<typename T>
+static inline float trEmitDegen1(const T *esc, int8_t b) {
+    if (b >= 0 && b <= 3) return (float)esc[(size_t)b];
+    double s = 0.0;
+    for (int x = 0; x < 4; ++x) s += (double)esc[(size_t)x];
+    return (float)(s * 0.25);
+}
+
+// MP pair emission with degeneracy on either or both sides. Arithmetic avg
+// over the cartesian product of degeneracy expansions for bi and bj.
+static inline float trEmitDegenPair(const float *esc, int Kp, int8_t bi, int8_t bj) {
+    const bool degI = (bi < 0 || bi > 3);
+    const bool degJ = (bj < 0 || bj > 3);
+    if (!degI && !degJ) return esc[(size_t)((int)bi * Kp + (int)bj)];
+    int xLo = degI ? 0 : (int)bi, xHi = degI ? 3 : (int)bi;
+    int yLo = degJ ? 0 : (int)bj, yHi = degJ ? 3 : (int)bj;
+    double s = 0.0;
+    int n = 0;
+    for (int x = xLo; x <= xHi; ++x) {
+        for (int y = yLo; y <= yHi; ++y) {
+            s += (double)esc[(size_t)(x * Kp + y)];
+            ++n;
+        }
+    }
+    return (float)(s / (double)n);
+}
+
+static TrCykResult runTrCYKInsideAlign(const InfernalExactModel &m,
+                                       const std::vector<int8_t> &dsq,
+                                       int L,
+                                       char preset_mode,
+                                       int pty_idx) {
+    const float TR_IMPOSSIBLE = -1e30f;
+    const int M = (int)m.states.size();
+
+    // fill_{L,R,T} based on preset_mode (mirrors cm_TrFillFromMode).
+    bool fill_L = false, fill_R = false, fill_T = false;
+    switch (preset_mode) {
+        case 'J': fill_L = false; fill_R = false; fill_T = false; break;
+        case 'L': fill_L = true;  fill_R = false; fill_T = false; break;
+        case 'R': fill_L = false; fill_R = true;  fill_T = false; break;
+        case 'T': fill_L = true;  fill_R = true;  fill_T = true;  break;
+        default:  fill_L = true;  fill_R = true;  fill_T = true;  break; // unknown
+    }
+
+    TrCykResult r;
+    // Allocate (M+1) decks (extra slot for EL at v=M); j,d in [0..L].
+    const int LP1 = L + 1;
+    auto allocAlpha = [&](std::vector<std::vector<std::vector<float>>> &a) {
+        a.assign((size_t)M + 1,
+                 std::vector<std::vector<float>>((size_t)LP1,
+                     std::vector<float>((size_t)LP1, TR_IMPOSSIBLE)));
+    };
+    auto allocByteSh = [&](std::vector<std::vector<std::vector<int8_t>>> &a) {
+        a.assign((size_t)M + 1,
+                 std::vector<std::vector<int8_t>>((size_t)LP1,
+                     std::vector<int8_t>((size_t)LP1, TR_USED_EL)));
+    };
+    auto allocIntSh = [&](std::vector<std::vector<std::vector<int>>> &a) {
+        a.assign((size_t)M + 1,
+                 std::vector<std::vector<int>>((size_t)LP1,
+                     std::vector<int>((size_t)LP1, 0)));
+    };
+    auto allocModeSh = [&](std::vector<std::vector<std::vector<int8_t>>> &a) {
+        a.assign((size_t)M + 1,
+                 std::vector<std::vector<int8_t>>((size_t)LP1,
+                     std::vector<int8_t>((size_t)LP1, TR_TRMODE_J)));
+    };
+
+    allocAlpha(r.Jalpha);
+    if (fill_L) allocAlpha(r.Lalpha);
+    if (fill_R) allocAlpha(r.Ralpha);
+    if (fill_T) allocAlpha(r.Talpha); // Talpha only used at B states; allocate full for simplicity.
+
+    allocByteSh(r.Jyshadow);
+    if (fill_L) allocByteSh(r.Lyshadow);
+    if (fill_R) allocByteSh(r.Ryshadow);
+    allocIntSh(r.Jkshadow);
+    if (fill_L) allocIntSh(r.Lkshadow);
+    if (fill_R) allocIntSh(r.Rkshadow);
+    if (fill_T) allocIntSh(r.Tkshadow);
+    if (fill_L) allocModeSh(r.Lkmode);
+    if (fill_R) allocModeSh(r.Rkmode);
+
+    // el_scA[d] = elSelf * d. elSelf is in our model already in log2-bits.
+    std::vector<float> el_scA((size_t)LP1, 0.0f);
+    const double elSelf = m.elSelf;
+    for (int d = 0; d <= L; ++d) {
+        el_scA[(size_t)d] = (float)(elSelf * (double)d);
+    }
+
+    const bool localOn = m.hasLocalCfg;
+
+    // MMSEQS_CMSCAN_TRUNC_DISABLE_EL=1: gate End-Local pickup off in the DP.
+    // Mirrors --notrunc-style behavior where EL is unreachable, so the trace
+    // never picks an EL parsetree path. Justified because our renderer outputs
+    // fixed-CLEN columns and cannot represent EL inserts the way Infernal's
+    // Parsetrees2Alignment does (dynamic-width MSA with per-cpos EL blocks).
+    static const char *const elDisableEnv = std::getenv("MMSEQS_CMSCAN_TRUNC_DISABLE_EL");
+    const bool disableEL = (elDisableEnv != nullptr && elDisableEnv[0] == '1');
+    // MMSEQS_CMSCAN_TRUNC_NO_TRPENALTY=1: include v=0 in main recurrence and
+    // gate trunc-entry pickup off. Mirrors Infernal --notrunc behavior where
+    // alpha[0][L][L] is filled by the natural S→child recurrence at root,
+    // not via a USED_TRUNC_BEGIN pickup. Trace then walks normally from v=0.
+    static const char *const noTrPenEnv = std::getenv("MMSEQS_CMSCAN_TRUNC_NO_TRPENALTY");
+    const bool noTrPenalty = (noTrPenEnv != nullptr && noTrPenEnv[0] == '1');
+
+    // If local ends are on (and EL not disabled), EL deck (v=M) holds el_scA[d]
+    // for j,d in [0,L]. With EL disabled, leave the deck at TR_IMPOSSIBLE.
+    if (localOn && !disableEL) {
+        for (int j = 0; j <= L; ++j) {
+            for (int d = 0; d <= j; ++d) {
+                r.Jalpha[(size_t)M][(size_t)j][(size_t)d] = el_scA[(size_t)d];
+                if (fill_L) r.Lalpha[(size_t)M][(size_t)j][(size_t)d] = el_scA[(size_t)d];
+                if (fill_R) r.Ralpha[(size_t)M][(size_t)j][(size_t)d] = el_scA[(size_t)d];
+            }
+        }
+    }
+
+    // Trackers for begin states across modes.
+    int Jb = 0, Lb = 0, Rb = 0, Tb = 0;
+    // For noTrPenalty (--notrunc-equivalent): track best local-begin pickup
+    // separately, commit only at end (mirrors Infernal cm_CYKInsideAlign).
+    float bsc_local = TR_IMPOSSIBLE;
+    int   blb_local = -1;
+
+    // Helper to read transition score for state v at child yoffset.
+    auto tscOf = [&](int v, int yoffset) -> float {
+        const CmState &s = m.states[(size_t)v];
+        if (yoffset < 0 || (size_t)yoffset >= s.trans.size()) return TR_IMPOSSIBLE;
+        double t = s.trans[(size_t)yoffset];
+        if (!std::isfinite(t)) return TR_IMPOSSIBLE;
+        return (float)t;
+    };
+
+    // Main recursion: v = M-1 down to 1. v=0 (ROOT_S) handled via trpenalty hand-off below.
+    // When noTrPenalty, also include v=0 so alpha[0] is filled by the natural
+    // S-state recurrence (no truncation entry needed).
+    const int loopStop = noTrPenalty ? -1 : 0;
+    for (int v = M - 1; v > loopStop; --v) {
+        const CmState &s = m.states[(size_t)v];
+        const CmStateType st = s.type;
+        const int cfirst = s.cfirst;
+        const int cnum   = s.cnum;
+
+        int sd = 0, sdl = 0, sdr = 0;
+        switch (st) {
+            case CM_ST_MP: sd = 2; sdl = 1; sdr = 1; break;
+            case CM_ST_ML: case CM_ST_IL: sd = 1; sdl = 1; sdr = 0; break;
+            case CM_ST_MR: case CM_ST_IR: sd = 1; sdl = 0; sdr = 1; break;
+            default: sd = 0; sdl = 0; sdr = 0; break;
+        }
+
+        // Re-init this state's J/L/R deck if a local end is reachable from v.
+        // With disableEL, skip this entirely so EL is never the picked path.
+        const double endsc_v = s.endSc;
+        if (localOn && !disableEL && trNotImpossible(endsc_v)) {
+            const float endF = (float)endsc_v;
+            for (int j = 0; j <= L; ++j) {
+                for (int d = sd; d <= j; ++d) {
+                    r.Jalpha[(size_t)v][(size_t)j][(size_t)d] = el_scA[(size_t)(d - sd)] + endF;
+                }
+            }
+            if (fill_L) {
+                for (int j = 0; j <= L; ++j) {
+                    for (int d = sdl; d <= j; ++d) {
+                        r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = el_scA[(size_t)(d - sdl)] + endF;
+                    }
+                }
+            }
+            if (fill_R) {
+                for (int j = 0; j <= L; ++j) {
+                    for (int d = sdr; d <= j; ++d) {
+                        r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = el_scA[(size_t)(d - sdr)] + endF;
+                    }
+                }
+            }
+        }
+
+        // Per-state recursion by type.
+        if (st == CM_ST_E) {
+            for (int j = 0; j <= L; ++j) {
+                r.Jalpha[(size_t)v][(size_t)j][0] = 0.0f;
+                if (fill_L) r.Lalpha[(size_t)v][(size_t)j][0] = 0.0f;
+                if (fill_R) r.Ralpha[(size_t)v][(size_t)j][0] = 0.0f;
+            }
+        }
+        else if (st == CM_ST_IL || st == CM_ST_ML) {
+            const float *esc = s.emitF.data();
+            const int Ryoffset0 = (st == CM_ST_IL) ? 1 : 0;
+            for (int j = sdr; j <= L; ++j) {
+                const int j_sdr = j - sdr;
+                for (int d = sd; d <= j; ++d) {
+                    const int d_sd = d - sd;
+                    int i = j - d + 1;
+                    for (int yoff = 0; yoff < cnum; ++yoff) {
+                        const int y = cfirst + yoff;
+                        const float tsc = tscOf(v, yoff);
+                        float sc = r.Jalpha[(size_t)y][(size_t)j_sdr][(size_t)d_sd] + tsc;
+                        if (sc > r.Jalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                            r.Jalpha[(size_t)v][(size_t)j][(size_t)d] = sc;
+                            r.Jyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_J_OFFSET);
+                        }
+                        if (fill_L) {
+                            float scL = r.Lalpha[(size_t)y][(size_t)j_sdr][(size_t)d_sd] + tsc;
+                            if (scL > r.Lalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = scL;
+                                r.Lyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_L_OFFSET);
+                            }
+                        }
+                    }
+                    // Single-residue emit on left position i.
+                    const int8_t bi = (i >= 1 && i <= L) ? dsq[(size_t)i] : (int8_t)4;
+                    const float emitL = (i >= 1 && i <= L) ? trEmitDegen1(esc, bi) : TR_IMPOSSIBLE;
+                    r.Jalpha[(size_t)v][(size_t)j][(size_t)d] += emitL;
+                    if (r.Jalpha[(size_t)v][(size_t)j][(size_t)d] < TR_IMPOSSIBLE) {
+                        r.Jalpha[(size_t)v][(size_t)j][(size_t)d] = TR_IMPOSSIBLE;
+                    }
+                    if (fill_L) {
+                        if (d >= 2) {
+                            r.Lalpha[(size_t)v][(size_t)j][(size_t)d] += emitL;
+                        } else {
+                            r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = emitL;
+                            r.Lyshadow[(size_t)v][(size_t)j][(size_t)d] = TR_USED_TRUNC_END;
+                        }
+                        if (r.Lalpha[(size_t)v][(size_t)j][(size_t)d] < TR_IMPOSSIBLE) {
+                            r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = TR_IMPOSSIBLE;
+                        }
+                    }
+                    // R deck handled separately (depends on Jalpha[y][j_sdr][d], not d_sd).
+                    if (fill_R) {
+                        for (int yoff = Ryoffset0; yoff < cnum; ++yoff) {
+                            const int y = cfirst + yoff;
+                            const float tsc = tscOf(v, yoff);
+                            float scA = r.Jalpha[(size_t)y][(size_t)j_sdr][(size_t)d] + tsc;
+                            if (scA > r.Ralpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = scA;
+                                r.Ryshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_J_OFFSET);
+                            }
+                            float scB = r.Ralpha[(size_t)y][(size_t)j_sdr][(size_t)d] + tsc;
+                            if (scB > r.Ralpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = scB;
+                                r.Ryshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_R_OFFSET);
+                            }
+                        }
+                        if (r.Ralpha[(size_t)v][(size_t)j][(size_t)d] < TR_IMPOSSIBLE) {
+                            r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = TR_IMPOSSIBLE;
+                        }
+                    }
+                }
+            }
+        }
+        else if (st == CM_ST_IR || st == CM_ST_MR) {
+            const float *esc = s.emitF.data();
+            const int Lyoffset0 = (st == CM_ST_IR) ? 1 : 0;
+            for (int j = sdr; j <= L; ++j) {
+                const int j_sdr = j - sdr;
+                for (int d = sd; d <= j; ++d) {
+                    const int d_sd = d - sd;
+                    for (int yoff = 0; yoff < cnum; ++yoff) {
+                        const int y = cfirst + yoff;
+                        const float tsc = tscOf(v, yoff);
+                        float sc = r.Jalpha[(size_t)y][(size_t)j_sdr][(size_t)d_sd] + tsc;
+                        if (sc > r.Jalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                            r.Jalpha[(size_t)v][(size_t)j][(size_t)d] = sc;
+                            r.Jyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_J_OFFSET);
+                        }
+                        if (fill_R) {
+                            float scR = r.Ralpha[(size_t)y][(size_t)j_sdr][(size_t)d_sd] + tsc;
+                            if (scR > r.Ralpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = scR;
+                                r.Ryshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_R_OFFSET);
+                            }
+                        }
+                    }
+                    // Single-residue emit on right position j.
+                    const int8_t bj = (j >= 1 && j <= L) ? dsq[(size_t)j] : (int8_t)4;
+                    const float emitR = (j >= 1 && j <= L) ? trEmitDegen1(esc, bj) : TR_IMPOSSIBLE;
+                    r.Jalpha[(size_t)v][(size_t)j][(size_t)d] += emitR;
+                    if (r.Jalpha[(size_t)v][(size_t)j][(size_t)d] < TR_IMPOSSIBLE) {
+                        r.Jalpha[(size_t)v][(size_t)j][(size_t)d] = TR_IMPOSSIBLE;
+                    }
+                    if (fill_R) {
+                        if (d >= 2) {
+                            r.Ralpha[(size_t)v][(size_t)j][(size_t)d] += emitR;
+                        } else {
+                            r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = emitR;
+                            r.Ryshadow[(size_t)v][(size_t)j][(size_t)d] = TR_USED_TRUNC_END;
+                        }
+                        if (r.Ralpha[(size_t)v][(size_t)j][(size_t)d] < TR_IMPOSSIBLE) {
+                            r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = TR_IMPOSSIBLE;
+                        }
+                    }
+                    // L deck handled separately (uses j, d not j_sdr, d_sd).
+                    if (fill_L) {
+                        for (int yoff = Lyoffset0; yoff < cnum; ++yoff) {
+                            const int y = cfirst + yoff;
+                            const float tsc = tscOf(v, yoff);
+                            float scA = r.Jalpha[(size_t)y][(size_t)j][(size_t)d] + tsc;
+                            if (scA > r.Lalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = scA;
+                                r.Lyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_J_OFFSET);
+                            }
+                            float scB = r.Lalpha[(size_t)y][(size_t)j][(size_t)d] + tsc;
+                            if (scB > r.Lalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = scB;
+                                r.Lyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_L_OFFSET);
+                            }
+                        }
+                        if (r.Lalpha[(size_t)v][(size_t)j][(size_t)d] < TR_IMPOSSIBLE) {
+                            r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = TR_IMPOSSIBLE;
+                        }
+                    }
+                }
+            }
+        }
+        else if (st == CM_ST_MP) {
+            const float *esc = s.emitF.data();
+            const int escSize = (int)s.emitF.size();
+            const int Kp = 4; // our MP emit table is 4x4 (no degeneracies stored).
+            // Recurrence over children.
+            for (int yoff = 0; yoff < cnum; ++yoff) {
+                const int y = cfirst + yoff;
+                const float tsc = tscOf(v, yoff);
+                for (int j = sdr; j <= L; ++j) {
+                    const int j_sdr = j - sdr;
+                    for (int d = sd; d <= j; ++d) {
+                        const int d_sd = d - sd;
+                        float sc = r.Jalpha[(size_t)y][(size_t)j_sdr][(size_t)d_sd] + tsc;
+                        if (sc > r.Jalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                            r.Jalpha[(size_t)v][(size_t)j][(size_t)d] = sc;
+                            r.Jyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_J_OFFSET);
+                        }
+                    }
+                    if (fill_L) {
+                        for (int d = sdl; d <= j; ++d) {
+                            const int d_sdl = d - sdl;
+                            float scA = r.Jalpha[(size_t)y][(size_t)j][(size_t)d_sdl] + tsc;
+                            if (scA > r.Lalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = scA;
+                                r.Lyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_J_OFFSET);
+                            }
+                            float scB = r.Lalpha[(size_t)y][(size_t)j][(size_t)d_sdl] + tsc;
+                            if (scB > r.Lalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = scB;
+                                r.Lyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_L_OFFSET);
+                            }
+                        }
+                    }
+                    if (fill_R) {
+                        for (int d = sdr; d <= j; ++d) {
+                            const int d_sdr = d - sdr;
+                            float scA = r.Jalpha[(size_t)y][(size_t)j_sdr][(size_t)d_sdr] + tsc;
+                            if (scA > r.Ralpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = scA;
+                                r.Ryshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_J_OFFSET);
+                            }
+                            float scB = r.Ralpha[(size_t)y][(size_t)j_sdr][(size_t)d_sdr] + tsc;
+                            if (scB > r.Ralpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = scB;
+                                r.Ryshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_R_OFFSET);
+                            }
+                        }
+                    }
+                }
+            }
+            // Add emission scores; lmesc/rmesc for marginal modes.
+            const float *lme = (s.lmesc.size() >= 4) ? nullptr : nullptr; (void)lme;
+            for (int j = 0; j <= L; ++j) {
+                int i = j;
+                if (j >= 1) {
+                    r.Jalpha[(size_t)v][(size_t)j][1] = TR_IMPOSSIBLE;
+                    if (fill_L) {
+                        const int8_t bi = (i >= 1 && i <= L) ? dsq[(size_t)i] : (int8_t)4;
+                        float em = ((int)s.lmesc.size() >= 4 && i >= 1 && i <= L)
+                                   ? trEmitDegen1(s.lmesc.data(), bi) : TR_IMPOSSIBLE;
+                        r.Lalpha[(size_t)v][(size_t)j][1] = em;
+                        r.Lyshadow[(size_t)v][(size_t)j][1] = TR_USED_TRUNC_END;
+                    }
+                    if (fill_R) {
+                        const int8_t bj = (j >= 1 && j <= L) ? dsq[(size_t)j] : (int8_t)4;
+                        float em = ((int)s.rmesc.size() >= 4 && j >= 1 && j <= L)
+                                   ? trEmitDegen1(s.rmesc.data(), bj) : TR_IMPOSSIBLE;
+                        r.Ralpha[(size_t)v][(size_t)j][1] = em;
+                        r.Ryshadow[(size_t)v][(size_t)j][1] = TR_USED_TRUNC_END;
+                    }
+                }
+                i--;
+                for (int d = 2; d <= j; ++d) {
+                    const int8_t bi = (i >= 1 && i <= L) ? dsq[(size_t)i] : (int8_t)4;
+                    const int8_t bj = (j >= 1 && j <= L) ? dsq[(size_t)j] : (int8_t)4;
+                    float pairEm = (escSize >= Kp * Kp && i >= 1 && i <= L && j >= 1 && j <= L)
+                                   ? trEmitDegenPair(esc, Kp, bi, bj) : TR_IMPOSSIBLE;
+                    r.Jalpha[(size_t)v][(size_t)j][(size_t)d] += pairEm;
+                    if (fill_L) {
+                        float em = ((int)s.lmesc.size() >= 4 && i >= 1 && i <= L)
+                                   ? trEmitDegen1(s.lmesc.data(), bi) : TR_IMPOSSIBLE;
+                        r.Lalpha[(size_t)v][(size_t)j][(size_t)d] += em;
+                    }
+                    if (fill_R) {
+                        float em = ((int)s.rmesc.size() >= 4 && j >= 1 && j <= L)
+                                   ? trEmitDegen1(s.rmesc.data(), bj) : TR_IMPOSSIBLE;
+                        r.Ralpha[(size_t)v][(size_t)j][(size_t)d] += em;
+                    }
+                    i--;
+                }
+            }
+            // Clamp to IMPOSSIBLE for d>=1.
+            for (int j = 0; j <= L; ++j) {
+                for (int d = 1; d <= j; ++d) {
+                    if (r.Jalpha[(size_t)v][(size_t)j][(size_t)d] < TR_IMPOSSIBLE) {
+                        r.Jalpha[(size_t)v][(size_t)j][(size_t)d] = TR_IMPOSSIBLE;
+                    }
+                    if (fill_L && r.Lalpha[(size_t)v][(size_t)j][(size_t)d] < TR_IMPOSSIBLE) {
+                        r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = TR_IMPOSSIBLE;
+                    }
+                    if (fill_R && r.Ralpha[(size_t)v][(size_t)j][(size_t)d] < TR_IMPOSSIBLE) {
+                        r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = TR_IMPOSSIBLE;
+                    }
+                }
+            }
+        }
+        else if (st != CM_ST_B) {
+            // D, S — non-self, non-emitting.
+            for (int yoff = 0; yoff < cnum; ++yoff) {
+                const int y = cfirst + yoff;
+                const float tsc = tscOf(v, yoff);
+                for (int j = sdr; j <= L; ++j) {
+                    const int j_sdr = j - sdr;
+                    for (int d = sd; d <= j; ++d) {
+                        const int d_sd = d - sd;
+                        float sc = r.Jalpha[(size_t)y][(size_t)j_sdr][(size_t)d_sd] + tsc;
+                        if (sc > r.Jalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                            r.Jalpha[(size_t)v][(size_t)j][(size_t)d] = sc;
+                            r.Jyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_J_OFFSET);
+                        }
+                        if (fill_L) {
+                            float scL = r.Lalpha[(size_t)y][(size_t)j_sdr][(size_t)d_sd] + tsc;
+                            if (scL > r.Lalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = scL;
+                                r.Lyshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_L_OFFSET);
+                            }
+                        }
+                        if (fill_R) {
+                            float scR = r.Ralpha[(size_t)y][(size_t)j_sdr][(size_t)d_sd] + tsc;
+                            if (scR > r.Ralpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = scR;
+                                r.Ryshadow[(size_t)v][(size_t)j][(size_t)d] = (int8_t)(yoff + TR_TRMODE_R_OFFSET);
+                            }
+                        }
+                    }
+                    if (fill_L) r.Lalpha[(size_t)v][(size_t)j][0] = TR_IMPOSSIBLE;
+                    if (fill_R) r.Ralpha[(size_t)v][(size_t)j][0] = TR_IMPOSSIBLE;
+                    if (st == CM_ST_S) {
+                        if (fill_L) r.Lyshadow[(size_t)v][(size_t)j][0] = TR_USED_TRUNC_END;
+                        if (fill_R) r.Ryshadow[(size_t)v][(size_t)j][0] = TR_USED_TRUNC_END;
+                    }
+                }
+            }
+        }
+        else {
+            // B state: BIF.
+            const int y = cfirst; // left subtree
+            const int z = cnum;   // right subtree (encoded in cnum field)
+            for (int j = 0; j <= L; ++j) {
+                for (int d = 0; d <= j; ++d) {
+                    for (int k = 0; k <= d; ++k) {
+                        float scJ = r.Jalpha[(size_t)y][(size_t)(j - k)][(size_t)(d - k)]
+                                  + r.Jalpha[(size_t)z][(size_t)j][(size_t)k];
+                        if (scJ > r.Jalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                            r.Jalpha[(size_t)v][(size_t)j][(size_t)d] = scJ;
+                            r.Jkshadow[(size_t)v][(size_t)j][(size_t)d] = k;
+                        }
+                        if (fill_L) {
+                            float scL = r.Jalpha[(size_t)y][(size_t)(j - k)][(size_t)(d - k)]
+                                      + r.Lalpha[(size_t)z][(size_t)j][(size_t)k];
+                            if (scL > r.Lalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = scL;
+                                r.Lkshadow[(size_t)v][(size_t)j][(size_t)d] = k;
+                                r.Lkmode[(size_t)v][(size_t)j][(size_t)d] = TR_TRMODE_J;
+                            }
+                        }
+                        if (fill_R) {
+                            float scR = r.Ralpha[(size_t)y][(size_t)(j - k)][(size_t)(d - k)]
+                                      + r.Jalpha[(size_t)z][(size_t)j][(size_t)k];
+                            if (scR > r.Ralpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = scR;
+                                r.Rkshadow[(size_t)v][(size_t)j][(size_t)d] = k;
+                                r.Rkmode[(size_t)v][(size_t)j][(size_t)d] = TR_TRMODE_J;
+                            }
+                        }
+                    }
+                    if (fill_T) {
+                        for (int k = 1; k < d; ++k) {
+                            float scT = r.Ralpha[(size_t)y][(size_t)(j - k)][(size_t)(d - k)]
+                                      + r.Lalpha[(size_t)z][(size_t)j][(size_t)k];
+                            if (scT > r.Talpha[(size_t)v][(size_t)j][(size_t)d]) {
+                                r.Talpha[(size_t)v][(size_t)j][(size_t)d] = scT;
+                                r.Tkshadow[(size_t)v][(size_t)j][(size_t)d] = k;
+                            }
+                        }
+                    }
+                    // Special case 1: full sequence aligns to BEGL_S left child (k=0).
+                    if (fill_L) {
+                        float scA = r.Jalpha[(size_t)y][(size_t)j][(size_t)d];
+                        if (scA > r.Lalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                            r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = scA;
+                            r.Lkshadow[(size_t)v][(size_t)j][(size_t)d] = 0;
+                            r.Lkmode[(size_t)v][(size_t)j][(size_t)d] = TR_TRMODE_J;
+                        }
+                        float scB = r.Lalpha[(size_t)y][(size_t)j][(size_t)d];
+                        if (scB > r.Lalpha[(size_t)v][(size_t)j][(size_t)d]) {
+                            r.Lalpha[(size_t)v][(size_t)j][(size_t)d] = scB;
+                            r.Lkshadow[(size_t)v][(size_t)j][(size_t)d] = 0;
+                            r.Lkmode[(size_t)v][(size_t)j][(size_t)d] = TR_TRMODE_L;
+                        }
+                    }
+                    // Special case 2: full sequence aligns to BEGR_S right child (k=d).
+                    if (fill_R) {
+                        float scA = r.Jalpha[(size_t)z][(size_t)j][(size_t)d];
+                        if (scA > r.Ralpha[(size_t)v][(size_t)j][(size_t)d]) {
+                            r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = scA;
+                            r.Rkshadow[(size_t)v][(size_t)j][(size_t)d] = d;
+                            r.Rkmode[(size_t)v][(size_t)j][(size_t)d] = TR_TRMODE_J;
+                        }
+                        float scB = r.Ralpha[(size_t)z][(size_t)j][(size_t)d];
+                        if (scB > r.Ralpha[(size_t)v][(size_t)j][(size_t)d]) {
+                            r.Ralpha[(size_t)v][(size_t)j][(size_t)d] = scB;
+                            r.Rkshadow[(size_t)v][(size_t)j][(size_t)d] = d;
+                            r.Rkmode[(size_t)v][(size_t)j][(size_t)d] = TR_TRMODE_R;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Truncated begin into v: only update [0][L][L] cells.
+        double trpenalty = NEG_INF;
+        if (pty_idx >= 0 && pty_idx < (int)m.trpL.size() && (int)m.trpL[(size_t)pty_idx].size() == M
+            && (int)m.trpG.size() > pty_idx && (int)m.trpG[(size_t)pty_idx].size() == M) {
+            trpenalty = localOn ? m.trpL[(size_t)pty_idx][(size_t)v]
+                                : m.trpG[(size_t)pty_idx][(size_t)v];
+        }
+        if (noTrPenalty) trpenalty = NEG_INF;  // disable trunc entry
+        if (trNotImpossible(trpenalty)) {
+            const float trF = (float)trpenalty;
+            float scJ = r.Jalpha[(size_t)v][(size_t)L][(size_t)L] + trF;
+            if (scJ > r.Jalpha[0][(size_t)L][(size_t)L]) {
+                r.Jalpha[0][(size_t)L][(size_t)L] = scJ;
+                Jb = v;
+            }
+            if (fill_L) {
+                float scL = r.Lalpha[(size_t)v][(size_t)L][(size_t)L] + trF;
+                if (scL > r.Lalpha[0][(size_t)L][(size_t)L]) {
+                    r.Lalpha[0][(size_t)L][(size_t)L] = scL;
+                    Lb = v;
+                }
+            }
+            if (fill_R) {
+                float scR = r.Ralpha[(size_t)v][(size_t)L][(size_t)L] + trF;
+                if (scR > r.Ralpha[0][(size_t)L][(size_t)L]) {
+                    r.Ralpha[0][(size_t)L][(size_t)L] = scR;
+                    Rb = v;
+                }
+            }
+            if (fill_T && st == CM_ST_B) {
+                float scT = r.Talpha[(size_t)v][(size_t)L][(size_t)L] + trF;
+                if (scT > r.Talpha[0][(size_t)L][(size_t)L]) {
+                    r.Talpha[0][(size_t)L][(size_t)L] = scT;
+                    Tb = v;
+                }
+            }
+        }
+
+        // Local-begin pickup (Infernal cm_CYKInsideAlign:1028-1033). Only
+        // active when noTrPenalty (mirrors --notrunc). beginSc[v] is finite
+        // for begin-eligible heads (MATP/MATL/MATR/BIF firsts) with values
+        // from cm_CalculateLocalBeginProbs. Track separately, commit at end.
+        if (noTrPenalty && localOn && v > 0 && trNotImpossible(s.beginSc)) {
+            float cand = r.Jalpha[(size_t)v][(size_t)L][(size_t)L] + (float)s.beginSc;
+            if (cand > bsc_local) {
+                bsc_local = cand;
+                blb_local = v;
+            }
+        }
+    } /* end loop v = M-1..1 */
+
+    // Commit local-begin pickup to root (Infernal cm_CYKInsideAlign:1040-1043).
+    if (noTrPenalty && bsc_local > r.Jalpha[0][(size_t)L][(size_t)L]) {
+        r.Jalpha[0][(size_t)L][(size_t)L] = bsc_local;
+        // Use TR_USED_TRUNC_BEGIN sentinel since trace already handles it
+        // (jumps to b without consuming residues, then continues normally).
+        r.Jyshadow[0][(size_t)L][(size_t)L] = TR_USED_TRUNC_BEGIN;
+        Jb = blb_local;
+    }
+    // DEBUG: dump alpha[v][j][d] for specific (v,j,d) tuples.
+    // Set MMSEQS_CMSCAN_DUMP_CELLS="v:j:d,v:j:d,..." to enable.
+    if (const char *cellEnv = std::getenv("MMSEQS_CMSCAN_DUMP_CELLS")) {
+        std::string spec = cellEnv;
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t comma = spec.find(',', pos);
+            if (comma == std::string::npos) comma = spec.size();
+            std::string tok = spec.substr(pos, comma - pos);
+            int vv = -1, jj = -1, dd = -1;
+            std::sscanf(tok.c_str(), "%d:%d:%d", &vv, &jj, &dd);
+            if (vv >= 0 && vv < M && jj >= 0 && jj <= L && dd >= 0 && dd <= jj) {
+                float aJ = r.Jalpha[(size_t)vv][(size_t)jj][(size_t)dd];
+                std::fprintf(stderr, "[CELL_DBG] v=%d j=%d d=%d type=%d J=%.4f\n",
+                             vv, jj, dd, (int)m.states[(size_t)vv].type, aJ);
+            }
+            pos = comma + 1;
+        }
+    }
+    // DEBUG: dump alpha[v][j][d] for matching Infernal CM_DUMP_CYK_J output.
+    // Set MMSEQS_CMSCAN_DUMP_CYK_J="<j>,<j>,..." to enable.
+    if (const char *jenv = std::getenv("MMSEQS_CMSCAN_DUMP_CYK_J")) {
+        const char *p = jenv;
+        while (*p) {
+            char *endp = nullptr;
+            long jt = std::strtol(p, &endp, 10);
+            if (endp == p) break;
+            if (jt > 0 && jt <= L) {
+                for (int dd = 0; dd <= (int)jt; ++dd) {
+                    for (int vv = 0; vv < M; ++vv) {
+                        float a = r.Jalpha[(size_t)vv][(size_t)jt][(size_t)dd];
+                        if (a <= -1e29f) continue;
+                        std::fprintf(stderr, "DUMP_CYK_RIBO j=%ld d=%d v=%d type=%d alpha=%.6f\n",
+                                     jt, dd, vv, (int)m.states[(size_t)vv].type, a);
+                    }
+                }
+            }
+            p = endp;
+            if (*p == ',') p++;
+            else if (*p) break;
+        }
+    }
+    // DEBUG: dump root-level decision values when MMSEQS_CMSCAN_DUMP_ROOT=1.
+    if (std::getenv("MMSEQS_CMSCAN_DUMP_ROOT") != nullptr) {
+        const CmState &s0 = m.states[0];
+        std::fprintf(stderr, "[ROOT_DBG] L=%d cnum=%d cfirst=%d alpha[0][L][L]=%.4f Jb=%d\n",
+                     L, s0.cnum, s0.cfirst, (double)r.Jalpha[0][(size_t)L][(size_t)L], Jb);
+        for (int yoff = 0; yoff < s0.cnum; ++yoff) {
+            int y = s0.cfirst + yoff;
+            float tsc = (yoff < (int)s0.trans.size()) ? (float)s0.trans[yoff] : -1e30f;
+            float ay = (y >= 0 && y < M) ? r.Jalpha[(size_t)y][(size_t)L][(size_t)L] : -1e30f;
+            float bgs = (y >= 0 && y < M) ? (float)m.states[(size_t)y].beginSc : -1e30f;
+            std::fprintf(stderr, "[ROOT_DBG]   yoff=%d y=%d type=%d tsc=%.4f alpha[y]=%.4f beginSc=%.4f sum=%.4f\n",
+                         yoff, y, (int)m.states[(size_t)y].type, tsc, ay, bgs, ay+tsc);
+        }
+        // Also dump state 3 (MP at node 1) transitions for cell-diff vs Infernal
+        if (M > 12) {
+            const CmState &s3 = m.states[3];
+            std::fprintf(stderr, "[ROOT_DBG] state 3 (MP) cnum=%d cfirst=%d alpha[3][L][L]=%.4f endSc=%.4f\n",
+                         s3.cnum, s3.cfirst, (double)r.Jalpha[3][(size_t)L][(size_t)L], s3.endSc);
+            for (int yoff = 0; yoff < s3.cnum && yoff < (int)s3.trans.size(); ++yoff) {
+                int y = s3.cfirst + yoff;
+                float tsc = (float)s3.trans[yoff];
+                float ay = (y < M) ? r.Jalpha[(size_t)y][(size_t)(L-1)][(size_t)(L-2)] : -1e30f;
+                std::fprintf(stderr, "[ROOT_DBG]   3->yoff=%d y=%d type=%d tsc=%.4f alpha[y][L-1][L-2]=%.4f\n",
+                             yoff, y, (int)m.states[(size_t)y].type, tsc, ay);
+            }
+        }
+    }
+
+    // All valid alignments use a truncated begin: stamp the root shadow.
+    // With noTrPenalty, leave the regular yshadow set by the v=0 recurrence so
+    // the trace walks normally (no TRUNC_BEGIN jump).
+    if (!noTrPenalty) {
+        r.Jyshadow[0][(size_t)L][(size_t)L] = TR_USED_TRUNC_BEGIN;
+        if (fill_L) r.Lyshadow[0][(size_t)L][(size_t)L] = TR_USED_TRUNC_BEGIN;
+        if (fill_R) r.Ryshadow[0][(size_t)L][(size_t)L] = TR_USED_TRUNC_BEGIN;
+    }
+
+    // Choose the optimal mode/score/b.
+    double sc;
+    char mode;
+    int b;
+    if (preset_mode == 'J') {
+        sc = r.Jalpha[0][(size_t)L][(size_t)L]; mode = 'J'; b = Jb;
+    } else if (preset_mode == 'L') {
+        sc = r.Lalpha[0][(size_t)L][(size_t)L]; mode = 'L'; b = Lb;
+    } else if (preset_mode == 'R') {
+        sc = r.Ralpha[0][(size_t)L][(size_t)L]; mode = 'R'; b = Rb;
+    } else if (preset_mode == 'T') {
+        sc = r.Talpha[0][(size_t)L][(size_t)L]; mode = 'T'; b = Tb;
+    } else {
+        sc = r.Jalpha[0][(size_t)L][(size_t)L]; mode = 'J'; b = Jb;
+        if (fill_L && r.Lalpha[0][(size_t)L][(size_t)L] > sc) {
+            sc = r.Lalpha[0][(size_t)L][(size_t)L]; mode = 'L'; b = Lb;
+        }
+        if (fill_R && r.Ralpha[0][(size_t)L][(size_t)L] > sc) {
+            sc = r.Ralpha[0][(size_t)L][(size_t)L]; mode = 'R'; b = Rb;
+        }
+        if (fill_T && r.Talpha[0][(size_t)L][(size_t)L] > sc) {
+            sc = r.Talpha[0][(size_t)L][(size_t)L]; mode = 'T'; b = Tb;
+        }
+    }
+    r.score = sc;
+    r.mode  = mode;
+    r.b     = b;
+    return r;
+}
+
+static void dumpTrCykAlphaFor(const TrCykResult &r, int M, int L, int v_focus) {
+    const char *flag = std::getenv("MMSEQS_CMSCAN_DUMP_TRDP");
+    if (flag == nullptr || std::string(flag) != "1") return;
+    (void)M;
+    auto cellOr = [&](const std::vector<std::vector<std::vector<float>>> &a, int v, int j, int d) -> double {
+        if ((int)a.size() <= v) return -1e30;
+        if ((int)a[(size_t)v].size() <= j) return -1e30;
+        if ((int)a[(size_t)v][(size_t)j].size() <= d) return -1e30;
+        return (double)a[(size_t)v][(size_t)j][(size_t)d];
+    };
+    std::fprintf(stderr,
+                 "[TRDP_DUMP] v=%d L=%d  J[L][L]=%.4f  L[L][L]=%.4f  R[L][L]=%.4f  T[L][L]=%.4f\n",
+                 v_focus, L,
+                 cellOr(r.Jalpha, v_focus, L, L),
+                 cellOr(r.Lalpha, v_focus, L, L),
+                 cellOr(r.Ralpha, v_focus, L, L),
+                 cellOr(r.Talpha, v_focus, L, L));
+    for (int dj = 0; dj <= 3 && dj <= L; ++dj) {
+        const int j = L - dj;
+        for (int dd = 0; dd <= 3 && dd <= j; ++dd) {
+            const int d = j - dd;
+            std::fprintf(stderr,
+                         "[TRDP_DUMP]   v=%d j=%d d=%d  J=%.4f L=%.4f R=%.4f T=%.4f\n",
+                         v_focus, j, d,
+                         cellOr(r.Jalpha, v_focus, j, d),
+                         cellOr(r.Lalpha, v_focus, j, d),
+                         cellOr(r.Ralpha, v_focus, j, d),
+                         cellOr(r.Talpha, v_focus, j, d));
+        }
+    }
+    std::fprintf(stderr, "[TRDP_DUMP] result: score=%.4f mode=%c b=%d\n", r.score, r.mode, r.b);
+}
+
+// =====================================================================
+// Stage 7: native port of Infernal cm_tr_alignT (cm_dpalign_trunc.c:178).
+// Walks J/L/R/T shadow matrices produced by Stage 6 to recover the trCYK
+// parsetree (state sequence with mode tags). Mirrors Infernal exactly:
+// TRMODE_*_OFFSET decoding, USED_TRUNC_BEGIN/END/EL sentinels, BIF stack.
+// =====================================================================
+struct TrParseNode {
+    int v;            // state index in CM (or M for EL)
+    int8_t mode;      // TR_TRMODE_J/L/R/T
+    int emitl;        // i-coordinate (1-based)
+    int emitr;        // j-coordinate (1-based)
+    int parent;       // index in trace, -1 for root
+    int nxtl;         // left child trace index, -1 if none
+    int nxtr;         // right child trace index, -1 if none
+    bool is_right_child; // attach side relative to parent
+};
+
+struct TrParsetree {
+    std::vector<TrParseNode> nodes;
+    bool ok = false;
+    char err[256] = {0};
+    char optimal_mode = 'J';
+    int  b = 0;       // local-entry state
+    double trpenalty = 0.0;
+    double score = 0.0;
+};
+
+// Append a node to the parsetree, attaching it under `parent` on the
+// indicated side. Returns the new node's index. Mirrors InsertTraceNodewithMode.
+static int trInsertTraceNode(TrParsetree &tr, int parent, bool is_right_child,
+                             int i, int j, int v, int8_t mode) {
+    TrParseNode n;
+    n.v = v;
+    n.mode = mode;
+    n.emitl = i;
+    n.emitr = j;
+    n.parent = parent;
+    n.nxtl = -1;
+    n.nxtr = -1;
+    n.is_right_child = is_right_child;
+    int idx = (int)tr.nodes.size();
+    tr.nodes.push_back(n);
+    if (parent >= 0) {
+        if (is_right_child) tr.nodes[(size_t)parent].nxtr = idx;
+        else                tr.nodes[(size_t)parent].nxtl = idx;
+    }
+    return idx;
+}
+
+static TrParsetree runTrCYKAlignT(const InfernalExactModel &m,
+                                  const TrCykResult &r,
+                                  int L,
+                                  int pty_idx) {
+    TrParsetree tr;
+    const int M = (int)m.states.size();
+    char mode = TR_TRMODE_J;
+    switch (r.mode) {
+        case 'J': mode = TR_TRMODE_J; break;
+        case 'L': mode = TR_TRMODE_L; break;
+        case 'R': mode = TR_TRMODE_R; break;
+        case 'T': mode = TR_TRMODE_T; break;
+        default:  mode = TR_TRMODE_J; break;
+    }
+    tr.optimal_mode = r.mode;
+    tr.b = r.b;
+    tr.score = r.score;
+
+    // Trpenalty for the chosen entry state b (local-mode mirrors
+    // cm_tr_alignT line 233; we always use local pty since CMH_LOCAL_BEGIN
+    // is implied by truncation DP being enabled).
+    if (pty_idx >= 0 && r.b >= 0 && r.b < M
+        && pty_idx < (int)m.trpL.size()
+        && r.b < (int)m.trpL[(size_t)pty_idx].size()) {
+        tr.trpenalty = m.trpL[(size_t)pty_idx][(size_t)r.b];
+    }
+
+    // Root S: attach state 0 spanning [1..L] in the optimal mode.
+    int rootIdx = trInsertTraceNode(tr, -1, false, 1, L, 0, mode);
+    (void)rootIdx;
+
+    // Stacks for bifurcation right-child resumption.
+    struct PdaEntry { int j; int k; int bifparent; int8_t mode; };
+    std::vector<PdaEntry> pda;
+
+    int v = 0;
+    int i = 1;
+    int j = L;
+    int d = L;
+
+    auto getJyshadow = [&](int v, int j, int d) -> int8_t {
+        return r.Jyshadow[(size_t)v][(size_t)j][(size_t)d];
+    };
+    auto getLyshadow = [&](int v, int j, int d) -> int8_t {
+        return r.Lyshadow[(size_t)v][(size_t)j][(size_t)d];
+    };
+    auto getRyshadow = [&](int v, int j, int d) -> int8_t {
+        return r.Ryshadow[(size_t)v][(size_t)j][(size_t)d];
+    };
+    auto getJkshadow = [&](int v, int j, int d) -> int {
+        return r.Jkshadow[(size_t)v][(size_t)j][(size_t)d];
+    };
+    auto getLkshadow = [&](int v, int j, int d) -> int {
+        return r.Lkshadow[(size_t)v][(size_t)j][(size_t)d];
+    };
+    auto getRkshadow = [&](int v, int j, int d) -> int {
+        return r.Rkshadow[(size_t)v][(size_t)j][(size_t)d];
+    };
+    auto getTkshadow = [&](int v, int j, int d) -> int {
+        return r.Tkshadow[(size_t)v][(size_t)j][(size_t)d];
+    };
+    auto getLkmode = [&](int v, int j, int d) -> int8_t {
+        return r.Lkmode[(size_t)v][(size_t)j][(size_t)d];
+    };
+    auto getRkmode = [&](int v, int j, int d) -> int8_t {
+        return r.Rkmode[(size_t)v][(size_t)j][(size_t)d];
+    };
+
+    const int MAX_STEPS = 8 * (L + 1) * (M + 1) + 1000;
+    int steps = 0;
+
+    while (true) {
+        if (++steps > MAX_STEPS) {
+            std::snprintf(tr.err, sizeof(tr.err),
+                          "trace step limit exceeded at v=%d j=%d d=%d", v, j, d);
+            return tr;
+        }
+        if (v < 0 || v > M) {
+            std::snprintf(tr.err, sizeof(tr.err),
+                          "trace v=%d out of [0..M=%d]", v, M);
+            return tr;
+        }
+
+        const CmStateType st = (v == M) ? CM_ST_UNKNOWN : m.states[(size_t)v].type;
+        const bool is_E_or_EL = (v == M) || (st == CM_ST_E);
+
+        if (v != M && st == CM_ST_B) {
+            // Bifurcation: pick k from kshadow per mode.
+            int k = 0;
+            if      (mode == TR_TRMODE_J) k = getJkshadow(v, j, d);
+            else if (mode == TR_TRMODE_L) k = getLkshadow(v, j, d);
+            else if (mode == TR_TRMODE_R) k = getRkshadow(v, j, d);
+            else if (mode == TR_TRMODE_T) k = getTkshadow(v, j, d);
+            else { std::snprintf(tr.err, sizeof(tr.err), "bogus mode at B v=%d", v); return tr; }
+
+            int8_t prvmode = mode;
+            int8_t rightmode;
+            if      (prvmode == TR_TRMODE_J) rightmode = TR_TRMODE_J;
+            else if (prvmode == TR_TRMODE_L) rightmode = TR_TRMODE_L;
+            else if (prvmode == TR_TRMODE_R) rightmode = getRkmode(v, j, d);
+            else                              rightmode = TR_TRMODE_L; // TRMODE_T
+
+            // Stash right-child state.
+            PdaEntry e;
+            e.j = j;
+            e.k = k;
+            e.bifparent = (int)tr.nodes.size() - 1;
+            e.mode = rightmode;
+            pda.push_back(e);
+
+            // Determine left-child mode.
+            int8_t leftmode;
+            if      (prvmode == TR_TRMODE_J) leftmode = TR_TRMODE_J;
+            else if (prvmode == TR_TRMODE_L) leftmode = getLkmode(v, j, d);
+            else if (prvmode == TR_TRMODE_R) leftmode = TR_TRMODE_R;
+            else                              leftmode = TR_TRMODE_R; // TRMODE_T
+
+            // Descend to BEGL_S (left child).
+            j = j - k;
+            d = d - k;
+            i = j - d + 1;
+            int y = m.states[(size_t)v].cfirst;
+            mode = leftmode;
+            trInsertTraceNode(tr, (int)tr.nodes.size() - 1, false, i, j, y, mode);
+            v = y;
+            continue;
+        }
+
+        if (is_E_or_EL) {
+            // Pop a right-start off the stack, attach as right child.
+            if (pda.empty()) break; // done
+            PdaEntry e = pda.back(); pda.pop_back();
+            int bifparent = e.bifparent;
+            int kk = e.k;
+            int jj = e.j;
+            mode = e.mode;
+            int parent_v = tr.nodes[(size_t)bifparent].v;
+            // Right child y = cnum of bif state (cnum holds index of right child S).
+            int y = m.states[(size_t)parent_v].cnum;
+            d = kk;
+            j = jj;
+            i = j - d + 1;
+            trInsertTraceNode(tr, bifparent, true, i, j, y, mode);
+            v = y;
+            continue;
+        }
+
+        // Standard state: read yshadow per mode.
+        int yoffset_raw = 0;
+        if      (mode == TR_TRMODE_J) yoffset_raw = (int)getJyshadow(v, j, d);
+        else if (mode == TR_TRMODE_L) yoffset_raw = (int)getLyshadow(v, j, d);
+        else if (mode == TR_TRMODE_R) yoffset_raw = (int)getRyshadow(v, j, d);
+        else if (mode == TR_TRMODE_T) {
+            if (v == 0) yoffset_raw = TR_USED_TRUNC_BEGIN;
+            else { std::snprintf(tr.err, sizeof(tr.err),
+                                 "TRMODE_T at non-root non-B v=%d", v); return tr; }
+        }
+        else { std::snprintf(tr.err, sizeof(tr.err), "bogus mode %d", (int)mode); return tr; }
+
+        int yoffset = yoffset_raw;
+        int8_t nxtmode = mode;
+        if      (yoffset == TR_USED_TRUNC_BEGIN) { nxtmode = mode; }
+        else if (yoffset == TR_USED_TRUNC_END)   { /* irrelevant */ }
+        else if (yoffset == TR_USED_EL)          { /* irrelevant */ }
+        else if (yoffset >= TR_TRMODE_R_OFFSET)  { nxtmode = TR_TRMODE_R; yoffset -= TR_TRMODE_R_OFFSET; }
+        else if (yoffset >= TR_TRMODE_L_OFFSET)  { nxtmode = TR_TRMODE_L; yoffset -= TR_TRMODE_L_OFFSET; }
+        else if (yoffset >= TR_TRMODE_J_OFFSET)  { nxtmode = TR_TRMODE_J; yoffset -= TR_TRMODE_J_OFFSET; }
+        else { std::snprintf(tr.err, sizeof(tr.err),
+                             "yoffset=%d out of bounds at v=%d j=%d d=%d", yoffset_raw, v, j, d); return tr; }
+
+        // Advance i/j based on state-type emission and current mode.
+        switch (st) {
+            case CM_ST_D: case CM_ST_S: case CM_ST_B: case CM_ST_E:
+                break;
+            case CM_ST_MP:
+                if (mode == TR_TRMODE_J)              i++;
+                if (mode == TR_TRMODE_L && d > 0)     i++;
+                if (mode == TR_TRMODE_J)              j--;
+                if (mode == TR_TRMODE_R && d > 0)     j--;
+                break;
+            case CM_ST_ML: case CM_ST_IL:
+                if (mode == TR_TRMODE_J)              i++;
+                if (mode == TR_TRMODE_L && d > 0)     i++;
+                break;
+            case CM_ST_MR: case CM_ST_IR:
+                if (mode == TR_TRMODE_J)              j--;
+                if (mode == TR_TRMODE_R && d > 0)     j--;
+                break;
+            default:
+                std::snprintf(tr.err, sizeof(tr.err), "bogus state-type %d at v=%d", (int)st, v); return tr;
+        }
+        d = j - i + 1;
+
+        if (yoffset == TR_USED_EL || yoffset == TR_USED_TRUNC_END) {
+            if (yoffset == TR_USED_EL) {
+                trInsertTraceNode(tr, (int)tr.nodes.size() - 1, false, i, j, M, mode);
+            }
+            v = M; // EL or pseudo-EL
+            continue;
+        }
+        if (yoffset == TR_USED_TRUNC_BEGIN) {
+            trInsertTraceNode(tr, (int)tr.nodes.size() - 1, false, i, j, r.b, mode);
+            v = r.b;
+            continue;
+        }
+
+        // Standard descent.
+        mode = nxtmode;
+        int y = m.states[(size_t)v].cfirst + yoffset;
+        trInsertTraceNode(tr, (int)tr.nodes.size() - 1, false, i, j, y, mode);
+        v = y;
+    }
+
+    tr.ok = true;
+    return tr;
+}
+
+static void dumpTrParsetree(const TrParsetree &tr, const InfernalExactModel &m) {
+    const char *flag = std::getenv("MMSEQS_CMSCAN_DUMP_TRPT");
+    if (flag == nullptr || std::string(flag) != "1") return;
+    std::fprintf(stderr, "[TRPT_DUMP] mode=%c b=%d score=%.4f trpenalty=%.4f ok=%d %s\n",
+                 tr.optimal_mode, tr.b, tr.score, tr.trpenalty, tr.ok ? 1 : 0,
+                 tr.ok ? "" : tr.err);
+    std::fprintf(stderr, "[TRPT_DUMP] %4s %4s %4s %4s %4s %4s %4s\n",
+                 "idx", "v", "mode", "emitl", "emitr", "parent", "type");
+    auto modeChar = [](int8_t md) -> char {
+        if (md == TR_TRMODE_J) return 'J';
+        if (md == TR_TRMODE_L) return 'L';
+        if (md == TR_TRMODE_R) return 'R';
+        if (md == TR_TRMODE_T) return 'T';
+        return '?';
+    };
+    auto stChar = [&](int v) -> const char* {
+        if (v == (int)m.states.size()) return "EL";
+        switch (m.states[(size_t)v].type) {
+            case CM_ST_MP: return "MP";
+            case CM_ST_ML: return "ML";
+            case CM_ST_MR: return "MR";
+            case CM_ST_IL: return "IL";
+            case CM_ST_IR: return "IR";
+            case CM_ST_D:  return "D";
+            case CM_ST_S:  return "S";
+            case CM_ST_B:  return "B";
+            case CM_ST_E:  return "E";
+            default:       return "?";
+        }
+    };
+    for (size_t k = 0; k < tr.nodes.size(); ++k) {
+        const TrParseNode &n = tr.nodes[k];
+        std::fprintf(stderr, "[TRPT_DUMP] %4zu %4d:%-3s %3c   %4d %4d %4d %4s\n",
+                     k, n.v, stChar(n.v), modeChar(n.mode),
+                     n.emitl, n.emitr, n.parent,
+                     (n.parent < 0) ? "ROOT" : (n.is_right_child ? "RGT" : "LFT"));
+    }
+}
+
+// Flatten a TrParsetree into the same trace-state list that the J-only CYK
+// emits (DFS pre-order; nodes were already inserted in that order by
+// runTrCYKAlignT). EL pseudo-states (v == M) are kept; downstream consumers
+// (modelTraceCigarQueryCoord) skip them via "sid >= states.size()".
+static std::vector<int> trParsetreeStates(const TrParsetree &tr) {
+    std::vector<int> out;
+    out.reserve(tr.nodes.size());
+    for (const TrParseNode &n : tr.nodes) {
+        out.push_back(n.v);
+    }
+    return out;
+}
+
 static InfernalExactModel parseInfernalCmExactModelFromStream(std::istream &in, const std::string &srcLabel) {
     int clen = -1;
     int statesN = -1;
@@ -1241,11 +2359,595 @@ static InfernalExactModel parseInfernalCmExactModelFromStream(std::istream &in, 
                 s.endSc = endLog;
             }
         }
+        // Mirror Infernal cm_modelconfig.c:491 — in local mode, ROOT_S has no
+        // standard outgoing transitions; the only way out of node 0 is via the
+        // local-begin pickup. Zero ROOT_S transitions to avoid double-counting.
+        const char *envZeroRoot = std::getenv("MMSEQS_CMSCAN_ZERO_ROOT_TRANS");
+        const bool zeroRootTrans = (envZeroRoot != NULL && envZeroRoot[0] == '1');
+        if (zeroRootTrans && m.pBegin > 0.0 && !m.states.empty()) {
+            CmState &rootS = m.states[0];
+            for (size_t k = 0; k < rootS.trans.size(); ++k) {
+                rootS.trans[k] = NEG_INF;
+            }
+        }
         Debug(Debug::INFO) << "Infernal CM local cfg: PBEGIN=" << m.pBegin
                            << " PEND=" << m.pEnd
                            << " ELSELF=" << m.elSelf
                            << " beginHeads=" << beginHeads.size()
                            << " endHeads=" << endHeads.size() << "\n";
+    }
+
+    // Truncation DP support tables (gated on MMSEQS_CMSCAN_TRUNC_DP=1).
+    // Mirrors Infernal display.c:CreateEmitMap and cm_trunc.c:cm_tr_penalties_Create.
+    {
+        const char *envTrunc = std::getenv("MMSEQS_CMSCAN_TRUNC_DP");
+        const bool enableTruncDp = (envTrunc != NULL && envTrunc[0] == '1');
+        if (enableTruncDp) {
+            // Build node table: count nodes, record first-state and type per node.
+            int maxNode = -1;
+            for (const CmState &s : m.states) {
+                if (s.nodeIdx > maxNode) maxNode = s.nodeIdx;
+            }
+            const int nNodes = maxNode + 1;
+            m.nNodes = nNodes;
+            m.nodeFirstState.assign(static_cast<size_t>(nNodes), -1);
+            m.nodeType.assign(static_cast<size_t>(nNodes), CM_ND_UNKNOWN);
+            for (const CmState &s : m.states) {
+                if (s.nodeIdx >= 0 && s.isFirstOfNode) {
+                    m.nodeFirstState[static_cast<size_t>(s.nodeIdx)] = s.idx;
+                    m.nodeType[static_cast<size_t>(s.nodeIdx)] = s.nodeType;
+                }
+            }
+            // For each BIF node, derive left/right child node indices from its
+            // first-state's cfirst (-> BEGL state) and cnum (-> BEGR state).
+            std::vector<int> bifLeftChild(static_cast<size_t>(nNodes), -1);
+            std::vector<int> bifRightChild(static_cast<size_t>(nNodes), -1);
+            for (int n = 0; n < nNodes; ++n) {
+                if (m.nodeType[static_cast<size_t>(n)] != CM_ND_BIF) continue;
+                const int firstSt = m.nodeFirstState[static_cast<size_t>(n)];
+                if (firstSt < 0) continue;
+                const CmState &bs = m.states[static_cast<size_t>(firstSt)];
+                if (bs.cfirst >= 0 && bs.cfirst < (int)m.states.size()) {
+                    bifLeftChild[static_cast<size_t>(n)] = m.states[static_cast<size_t>(bs.cfirst)].nodeIdx;
+                }
+                if (bs.cnum >= 0 && bs.cnum < (int)m.states.size()) {
+                    bifRightChild[static_cast<size_t>(n)] = m.states[static_cast<size_t>(bs.cnum)].nodeIdx;
+                }
+            }
+
+            // CreateEmitMap: stack-based DFS in left/right pass order.
+            m.emapLpos.assign(static_cast<size_t>(nNodes), -1);
+            m.emapRpos.assign(static_cast<size_t>(nNodes), -1);
+            m.emapEpos.assign(static_cast<size_t>(nNodes), -1);
+            // Stack entries: pairs of (on_right, nodeIdx). Mirror esl_stack push order.
+            std::vector<std::pair<int,int>> pda;
+            int cpos = 0;
+            pda.emplace_back(0, 0); // start: left side of node 0
+            while (!pda.empty()) {
+                const int on_right = pda.back().first;
+                const int nd = pda.back().second;
+                pda.pop_back();
+                const CmNodeType nt = (nd >= 0 && nd < nNodes)
+                    ? m.nodeType[static_cast<size_t>(nd)]
+                    : CM_ND_UNKNOWN;
+                if (on_right) {
+                    m.emapRpos[static_cast<size_t>(nd)] = cpos + 1;
+                    if (nt == CM_ND_MATP || nt == CM_ND_MATR) cpos++;
+                } else {
+                    if (nt == CM_ND_MATP || nt == CM_ND_MATL) cpos++;
+                    m.emapLpos[static_cast<size_t>(nd)] = cpos;
+                    if (nt == CM_ND_BIF) {
+                        // Push BIF for right side, then right child, then left child.
+                        pda.emplace_back(1, nd);
+                        pda.emplace_back(0, bifRightChild[static_cast<size_t>(nd)]);
+                        pda.emplace_back(0, bifLeftChild[static_cast<size_t>(nd)]);
+                    } else {
+                        pda.emplace_back(1, nd);
+                        if (nt != CM_ND_END) {
+                            pda.emplace_back(0, nd + 1);
+                        }
+                    }
+                }
+            }
+            // epos pass: from end of model back, propagate consensus position
+            // an EL insertion follows.
+            int eposCur = 0;
+            for (int nd = nNodes - 1; nd >= 0; --nd) {
+                const CmNodeType nt = m.nodeType[static_cast<size_t>(nd)];
+                if (nt == CM_ND_END) {
+                    eposCur = m.emapLpos[static_cast<size_t>(nd)];
+                } else if (nt == CM_ND_BIF) {
+                    const int rc = bifRightChild[static_cast<size_t>(nd)];
+                    if (rc >= 0) eposCur = m.emapEpos[static_cast<size_t>(rc)];
+                }
+                m.emapEpos[static_cast<size_t>(nd)] = eposCur;
+            }
+            // Sanity: rpos[0] - 1 must equal clen.
+            if (nNodes > 0 && m.emapRpos[0] - 1 != m.clen) {
+                Debug(Debug::WARNING) << "TRUNC_DP emap: rpos[0]-1=" << (m.emapRpos[0]-1)
+                                      << " differs from clen=" << m.clen << "\n";
+            }
+            for (int nd = 0; nd < nNodes; ++nd) {
+                if (m.emapLpos[static_cast<size_t>(nd)] < 0
+                 || m.emapRpos[static_cast<size_t>(nd)] < 0
+                 || m.emapEpos[static_cast<size_t>(nd)] < 0) {
+                    Debug(Debug::WARNING) << "TRUNC_DP emap: node " << nd << " unfilled\n";
+                }
+            }
+            Debug(Debug::INFO) << "TRUNC_DP emap built: nNodes=" << nNodes
+                               << " clen=" << m.clen
+                               << " (rpos[0]-1=" << (nNodes ? m.emapRpos[0]-1 : -1) << ")\n";
+
+            // Stage 3 + 4: compute psi[v] (cm_ExpectedStateOccupancy) and trp tables
+            // (cm_tr_penalties_Create). Mirrors cm.c:cm_ExpectedStateOccupancy and
+            // cm_trunc.c:cm_tr_penalties_Create.
+            const int M = (int)m.states.size();
+
+            // Linearize transitions; renormalize for end-eligible heads (Infernal
+            // CMH_LOCAL_END branch in cm_ExpectedStateOccupancy renormalizes
+            // t_copy[v] to discount the local-end probability mass).
+            std::vector<std::vector<double>> transLin((size_t)M);
+            for (int v = 0; v < M; ++v) {
+                const CmState &vs = m.states[(size_t)v];
+                transLin[(size_t)v].resize(vs.trans.size(), 0.0);
+                double sum = 0.0;
+                for (size_t k = 0; k < vs.trans.size(); ++k) {
+                    transLin[(size_t)v][k] = (vs.trans[k] == NEG_INF)
+                        ? 0.0 : std::pow(2.0, vs.trans[k]);
+                    sum += transLin[(size_t)v][k];
+                }
+                if (vs.endSc != NEG_INF && sum > 1e-12 && std::fabs(sum - 1.0) > 1e-9) {
+                    for (size_t k = 0; k < transLin[(size_t)v].size(); ++k) {
+                        transLin[(size_t)v][k] /= sum;
+                    }
+                }
+            }
+            // ROOT_S: under ZRT=1 all trans are NEG_INF (sum=0). Warn — psi will
+            // collapse to 0 for non-root states. Bit-exact requires ZRT=0.
+            if (M > 0 && transLin[0].size() > 0) {
+                double rootSum = 0.0;
+                for (double t : transLin[0]) rootSum += t;
+                if (rootSum < 1e-12) {
+                    Debug(Debug::WARNING) << "TRUNC_DP: ROOT_S trans zeroed (ZRT=1?); "
+                                          << "psi will be degenerate. Disable ZRT for bit-exact.\n";
+                }
+            }
+
+            // psi[v] = expected number of times state v is entered (linear).
+            // Topological order: states are in CM order (parents always have smaller
+            // idx than children for non-S parents). Enumerate parents from cfirst/cnum.
+            // For S_st: psi=1.0 directly. For non-S: sum psi[parent]*t[parent->v].
+            // For IL/IR: add geometric self-loop term t/(1-t).
+            std::vector<double> psi((size_t)M, 0.0);
+            std::vector<std::vector<std::pair<int,int>>> parents((size_t)M);
+            for (int x = 0; x < M; ++x) {
+                const CmState &xs = m.states[(size_t)x];
+                if (xs.type == CM_ST_B || xs.type == CM_ST_E) continue;
+                if (xs.cnum <= 0 || xs.cfirst < 0) continue;
+                for (int k = 0; k < xs.cnum; ++k) {
+                    int v = xs.cfirst + k;
+                    if (v < 0 || v >= M) continue;
+                    parents[(size_t)v].push_back({x, k});
+                }
+            }
+            for (int v = 0; v < M; ++v) {
+                const CmState &vs = m.states[(size_t)v];
+                if (vs.type == CM_ST_S) { psi[(size_t)v] = 1.0; continue; }
+                const bool is_insert = (vs.type == CM_ST_IL || vs.type == CM_ST_IR);
+                for (const auto &pp : parents[(size_t)v]) {
+                    int x = pp.first;
+                    int kIdx = pp.second;
+                    if (is_insert && x == v) continue; // skip self-loop
+                    if (kIdx < 0 || kIdx >= (int)transLin[(size_t)x].size()) continue;
+                    psi[(size_t)v] += psi[(size_t)x] * transLin[(size_t)x][(size_t)kIdx];
+                }
+                if (is_insert && !transLin[(size_t)v].empty()) {
+                    double t0 = transLin[(size_t)v][0];
+                    if (t0 < 1.0) {
+                        psi[(size_t)v] += psi[(size_t)v] * (t0 / (1.0 - t0));
+                    }
+                }
+            }
+            m.psi = psi;
+
+            // begin[v] = local-begin probability per state (linear). Mirror
+            // cm_modelconfig.c:cm_CalculateLocalBeginProbs.
+            std::vector<double> begin((size_t)M, 0.0);
+            int nstartsBegin = 0;
+            for (int nd = 2; nd < nNodes; ++nd) {
+                const CmNodeType nt = m.nodeType[(size_t)nd];
+                if (nt == CM_ND_MATP || nt == CM_ND_MATL ||
+                    nt == CM_ND_MATR || nt == CM_ND_BIF) nstartsBegin++;
+            }
+            const double pBeginEff = (m.pBegin > 0.0) ? m.pBegin : 0.05;
+            if (nNodes >= 2) {
+                int v1 = m.nodeFirstState[1];
+                if (v1 >= 0) begin[(size_t)v1] = 1.0 - pBeginEff;
+            }
+            if (nstartsBegin > 0) {
+                double pp = pBeginEff / (double)nstartsBegin;
+                for (int nd = 2; nd < nNodes; ++nd) {
+                    const CmNodeType nt = m.nodeType[(size_t)nd];
+                    if (nt == CM_ND_MATP || nt == CM_ND_MATL ||
+                        nt == CM_ND_MATR || nt == CM_ND_BIF) {
+                        int v = m.nodeFirstState[(size_t)nd];
+                        if (v >= 0) begin[(size_t)v] = pp;
+                    }
+                }
+            }
+
+            // trp tables: per-state truncation penalty for {5'+3', 5' only, 3' only}.
+            // Storage: trpG[type][v] global, trpL[type][v] local (both log2).
+            // Linear-space computation, convert to log2 at the end.
+            std::vector<std::vector<double>> trpGlin(3, std::vector<double>((size_t)M, 0.0));
+            std::vector<std::vector<double>> trpLlin(3, std::vector<double>((size_t)M, 0.0));
+
+            const double g_5and3 = 2.0 / ((double)m.clen * (double)(m.clen + 1));
+            const double g_5or3  = 1.0 / (double)m.clen;
+            double prv5 = 0.0, prv3 = 0.0, prv53 = 0.0;
+
+            for (int nd = 0; nd < nNodes; ++nd) {
+                const CmNodeType nt = m.nodeType[(size_t)nd];
+                int lpos = m.emapLpos[(size_t)nd];
+                int rpos = m.emapRpos[(size_t)nd];
+                if (!(nt == CM_ND_MATP || nt == CM_ND_MATL)) lpos += 1;
+                if (!(nt == CM_ND_MATP || nt == CM_ND_MATR)) rpos -= 1;
+
+                if (nt == CM_ND_END) {
+                    prv5 = prv3 = prv53 = 0.0;
+                } else if (nt == CM_ND_BEGL || nt == CM_ND_BEGR) {
+                    int begS = m.nodeFirstState[(size_t)nd];
+                    int parentB = -1;
+                    for (int x = 0; x < M; ++x) {
+                        const CmState &xs = m.states[(size_t)x];
+                        if (xs.type != CM_ST_B) continue;
+                        if (nt == CM_ND_BEGL && xs.cfirst == begS) { parentB = x; break; }
+                        if (nt == CM_ND_BEGR && xs.cnum   == begS) { parentB = x; break; }
+                    }
+                    if (parentB >= 0) {
+                        prv5  = (nt == CM_ND_BEGL) ? 0.0 : trpLlin[1][(size_t)parentB];
+                        prv3  = (nt == CM_ND_BEGR) ? 0.0 : trpLlin[2][(size_t)parentB];
+                        prv53 = trpLlin[0][(size_t)parentB];
+                    } else {
+                        prv5 = prv3 = prv53 = 0.0;
+                    }
+                } else if (nt == CM_ND_MATP || nt == CM_ND_MATL ||
+                           nt == CM_ND_MATR || nt == CM_ND_BIF) {
+                    int mState = m.nodeFirstState[(size_t)nd];
+                    int i1 = -1, i2 = -1;
+                    if (nd >= 1) {
+                        const CmNodeType prevNt = m.nodeType[(size_t)(nd - 1)];
+                        int prevFirst = m.nodeFirstState[(size_t)(nd - 1)];
+                        if (prevFirst >= 0) {
+                            switch (prevNt) {
+                                case CM_ND_MATP: i1 = prevFirst + 4; i2 = prevFirst + 5; break;
+                                case CM_ND_MATL: i1 = prevFirst + 2; break;
+                                case CM_ND_MATR: i1 = prevFirst + 2; break;
+                                case CM_ND_BEGR: i1 = prevFirst + 1; break;
+                                case CM_ND_ROOT: i1 = prevFirst + 1; i2 = prevFirst + 2; break;
+                                default: break;
+                            }
+                        }
+                    }
+
+                    double m_psi = psi[(size_t)mState];
+                    if (nt == CM_ND_MATP) {
+                        m_psi += psi[(size_t)(mState + 1)] + psi[(size_t)(mState + 2)];
+                    }
+                    double i1_psi = (i1 == -1) ? 0.0 : psi[(size_t)i1];
+                    double i2_psi = (i2 == -1) ? 0.0 : psi[(size_t)i2];
+                    double summed_psi = m_psi + i1_psi + i2_psi;
+                    if (summed_psi <= 1e-30) summed_psi = 1.0;
+
+                    trpGlin[0][(size_t)mState] = (m_psi  / summed_psi) * g_5and3;
+                    if (i1 != -1) trpGlin[0][(size_t)i1] = (i1_psi / summed_psi) * g_5and3;
+                    if (i2 != -1) trpGlin[0][(size_t)i2] = (i2_psi / summed_psi) * g_5and3;
+                    if (rpos == m.clen) {
+                        trpGlin[1][(size_t)mState] = (m_psi  / summed_psi) * g_5or3;
+                        if (i1 != -1) trpGlin[1][(size_t)i1] = (i1_psi / summed_psi) * g_5or3;
+                        if (i2 != -1) trpGlin[1][(size_t)i2] = (i2_psi / summed_psi) * g_5or3;
+                    }
+                    if (lpos == 1) {
+                        trpGlin[2][(size_t)mState] = (m_psi  / summed_psi) * g_5or3;
+                        if (i1 != -1) trpGlin[2][(size_t)i1] = (i1_psi / summed_psi) * g_5or3;
+                        if (i2 != -1) trpGlin[2][(size_t)i2] = (i2_psi / summed_psi) * g_5or3;
+                    }
+
+                    int subtree_clen = rpos - lpos + 1;
+                    int nfrag5 = subtree_clen;
+                    int nfrag3 = subtree_clen;
+                    int nfrag53 = (subtree_clen * (subtree_clen + 1)) / 2;
+                    if (nfrag5 <= 0) nfrag5 = 1;
+                    if (nfrag3 <= 0) nfrag3 = 1;
+                    if (nfrag53 <= 0) nfrag53 = 1;
+
+                    double cur5  = begin[(size_t)mState] / (double)nfrag5  + prv5;
+                    double cur3  = begin[(size_t)mState] / (double)nfrag3  + prv3;
+                    double cur53 = begin[(size_t)mState] / (double)nfrag53 + prv53;
+
+                    trpLlin[0][(size_t)mState] = (m_psi  / summed_psi) * cur53;
+                    if (i1 != -1) trpLlin[0][(size_t)i1] = (i1_psi / summed_psi) * cur53;
+                    if (i2 != -1) trpLlin[0][(size_t)i2] = (i2_psi / summed_psi) * cur53;
+                    trpLlin[1][(size_t)mState] = (m_psi  / summed_psi) * cur5;
+                    if (i1 != -1) trpLlin[1][(size_t)i1] = (i1_psi / summed_psi) * cur5;
+                    if (i2 != -1) trpLlin[1][(size_t)i2] = (i2_psi / summed_psi) * cur5;
+                    trpLlin[2][(size_t)mState] = (m_psi  / summed_psi) * cur3;
+                    if (i1 != -1) trpLlin[2][(size_t)i1] = (i1_psi / summed_psi) * cur3;
+                    if (i2 != -1) trpLlin[2][(size_t)i2] = (i2_psi / summed_psi) * cur3;
+
+                    prv5  = (nt == CM_ND_MATL) ? cur5 : 0.0;
+                    prv3  = (nt == CM_ND_MATR) ? cur3 : 0.0;
+                    prv53 = cur53;
+                }
+            }
+
+            // Convert linear -> log2; non-set entries (still 0.0) become NEG_INF.
+            const double LN2 = std::log(2.0);
+            m.trpG.assign(3, std::vector<double>((size_t)M, NEG_INF));
+            m.trpL.assign(3, std::vector<double>((size_t)M, NEG_INF));
+            for (int v = 0; v < M; ++v) {
+                for (int t = 0; t < 3; ++t) {
+                    if (trpGlin[t][(size_t)v] > 0.0)
+                        m.trpG[t][(size_t)v] = std::log(trpGlin[t][(size_t)v]) / LN2;
+                    if (trpLlin[t][(size_t)v] > 0.0)
+                        m.trpL[t][(size_t)v] = std::log(trpLlin[t][(size_t)v]) / LN2;
+                }
+            }
+
+            // cm_CalcMargLikScores: per-state lmesc/rmesc for L/R modes.
+            // MP: marginal sum over partner * null. ML/IL: lmesc=esc; rmesc=0.
+            // MR/IR: rmesc=esc; lmesc=0. Other states: leave empty.
+            for (size_t v = 0; v < m.states.size(); ++v) {
+                CmState &s = m.states[v];
+                s.lmesc.clear();
+                s.rmesc.clear();
+                if (s.type == CM_ST_MP && s.emit.size() >= 16) {
+                    s.lmesc.assign(4, NEG_INF);
+                    s.rmesc.assign(4, NEG_INF);
+                    for (int x = 0; x < 4; ++x) {
+                        double sumL = 0.0;
+                        double sumR = 0.0;
+                        for (int y = 0; y < 4; ++y) {
+                            // emit[a*4+b] = log2(e[a,b] / (null[a]*null[b]))
+                            // lmesc[x] = log2(sum_y e[x,y] / null[x])
+                            //          = log2(sum_y null[y] * 2^emit[x*4+y])
+                            const double lEsc = s.emit[(size_t)(x * 4 + y)];
+                            const double rEsc = s.emit[(size_t)(y * 4 + x)];
+                            sumL += m.nullProb[(size_t)y] * std::pow(2.0, lEsc);
+                            sumR += m.nullProb[(size_t)y] * std::pow(2.0, rEsc);
+                        }
+                        s.lmesc[(size_t)x] = (sumL > 0.0) ? std::log(sumL) / std::log(2.0) : NEG_INF;
+                        s.rmesc[(size_t)x] = (sumR > 0.0) ? std::log(sumR) / std::log(2.0) : NEG_INF;
+                    }
+                } else if ((s.type == CM_ST_ML || s.type == CM_ST_IL) && s.emit.size() >= 4) {
+                    s.lmesc.assign(4, 0.0);
+                    s.rmesc.assign(4, 0.0);
+                    for (int x = 0; x < 4; ++x) s.lmesc[(size_t)x] = s.emit[(size_t)x];
+                } else if ((s.type == CM_ST_MR || s.type == CM_ST_IR) && s.emit.size() >= 4) {
+                    s.lmesc.assign(4, 0.0);
+                    s.rmesc.assign(4, 0.0);
+                    for (int x = 0; x < 4; ++x) s.rmesc[(size_t)x] = s.emit[(size_t)x];
+                }
+            }
+
+            m.hasTruncDp = true;
+
+            const char *envDumpEmap = std::getenv("MMSEQS_CMSCAN_DUMP_EMAP");
+            if (envDumpEmap != NULL && envDumpEmap[0] == '1') {
+                fprintf(stderr, "EMAP_DUMP nNodes=%d clen=%d\n", nNodes, m.clen);
+                fprintf(stderr, "%4s %7s %9s %4s %4s %4s\n",
+                        "Node", "State1", "Type", "lpos", "rpos", "epos");
+                static const char *ntStr[] = {
+                    "?", "ROOT", "MATP", "MATL", "MATR", "BEGL", "BEGR", "BIF", "END"
+                };
+                for (int nd = 0; nd < nNodes; ++nd) {
+                    int t = (int)m.nodeType[(size_t)nd];
+                    if (t < 0 || t > 8) t = 0;
+                    fprintf(stderr, "%4d %7d %9s %4d %4d %4d\n",
+                            nd, m.nodeFirstState[(size_t)nd], ntStr[t],
+                            m.emapLpos[(size_t)nd], m.emapRpos[(size_t)nd],
+                            m.emapEpos[(size_t)nd]);
+                }
+            }
+            const char *envDumpMesc = std::getenv("MMSEQS_CMSCAN_DUMP_MESC");
+            if (envDumpMesc != NULL && envDumpMesc[0] == '1') {
+                fprintf(stderr, "MESC_DUMP M=%d (MP-only rows shown for brevity)\n", M);
+                fprintf(stderr, "%4s %4s  %10s %10s %10s %10s   %10s %10s %10s %10s\n",
+                        "v", "type", "lmA", "lmC", "lmG", "lmU", "rmA", "rmC", "rmG", "rmU");
+                for (int v = 0; v < M; ++v) {
+                    const CmState &s = m.states[(size_t)v];
+                    if (s.type != CM_ST_MP) continue;
+                    if (s.lmesc.size() < 4 || s.rmesc.size() < 4) continue;
+                    fprintf(stderr, "%4d %4d  %10.6f %10.6f %10.6f %10.6f   %10.6f %10.6f %10.6f %10.6f\n",
+                            v, (int)s.type,
+                            s.lmesc[0], s.lmesc[1], s.lmesc[2], s.lmesc[3],
+                            s.rmesc[0], s.rmesc[1], s.rmesc[2], s.rmesc[3]);
+                }
+            }
+            const char *envDumpTrp = std::getenv("MMSEQS_CMSCAN_DUMP_TRP");
+            if (envDumpTrp != NULL && envDumpTrp[0] == '1') {
+                fprintf(stderr, "TRP_DUMP M=%d clen=%d\n", M, m.clen);
+                fprintf(stderr, "%4s %4s  %12s %12s %12s   %12s %12s %12s\n",
+                        "v", "type", "g_5+3", "g_5", "g_3", "l_5+3", "l_5", "l_3");
+                for (int v = 0; v < M; ++v) {
+                    if (m.trpG[0][(size_t)v] == NEG_INF
+                     && m.trpL[0][(size_t)v] == NEG_INF) continue;
+                    fprintf(stderr, "%4d %4d  %12.6f %12.6f %12.6f   %12.6f %12.6f %12.6f\n",
+                            v, (int)m.states[(size_t)v].type,
+                            m.trpG[0][(size_t)v], m.trpG[1][(size_t)v], m.trpG[2][(size_t)v],
+                            m.trpL[0][(size_t)v], m.trpL[1][(size_t)v], m.trpL[2][(size_t)v]);
+                }
+            }
+        }
+        // Stage 6+7 verification: when MMSEQS_CMSCAN_TRUNC_TEST_FASTA points
+        // to a single-record FASTA, run the truncated CYK + trace dispatcher
+        // on it and dump the parsetree (gated by MMSEQS_CMSCAN_DUMP_TRPT=1).
+        // Decoupled from the production scan path; pure verification harness.
+        const char *envTestFasta = std::getenv("MMSEQS_CMSCAN_TRUNC_TEST_FASTA");
+        const bool enableTruncDpHarness = (std::getenv("MMSEQS_CMSCAN_TRUNC_DP") != NULL
+                                           && std::getenv("MMSEQS_CMSCAN_TRUNC_DP")[0] == '1');
+        if (enableTruncDpHarness && envTestFasta != NULL && envTestFasta[0] != '\0') {
+            std::ifstream fin(envTestFasta);
+            if (!fin.good()) {
+                std::fprintf(stderr, "[TRUNC_TEST] cannot open FASTA: %s\n", envTestFasta);
+            } else {
+                std::string fline, hdr, seq;
+                while (std::getline(fin, fline)) {
+                    if (fline.empty()) continue;
+                    if (fline[0] == '>') {
+                        if (!hdr.empty()) break;
+                        hdr = fline.substr(1);
+                    } else {
+                        for (char c : fline) {
+                            if (!std::isspace(static_cast<unsigned char>(c))) seq.push_back(c);
+                        }
+                    }
+                }
+                if (seq.empty()) {
+                    std::fprintf(stderr, "[TRUNC_TEST] empty sequence in %s\n", envTestFasta);
+                } else {
+                    const int L = (int)seq.size();
+                    std::vector<int8_t> dsq((size_t)(L + 2), -1); // 1-based, [0] sentinel
+                    for (int p = 1; p <= L; ++p) {
+                        char c = seq[(size_t)(p - 1)];
+                        if      (c=='A'||c=='a') dsq[(size_t)p] = 0;
+                        else if (c=='C'||c=='c') dsq[(size_t)p] = 1;
+                        else if (c=='G'||c=='g') dsq[(size_t)p] = 2;
+                        else if (c=='T'||c=='t'||c=='U'||c=='u') dsq[(size_t)p] = 3;
+                        else dsq[(size_t)p] = -1;
+                    }
+                    const int pty_idx = 0; // TRPENALTY_5P_AND_3P (matches cmsearch glocal/local)
+                    const char preset_mode = 'U'; // unknown — fill J/L/R/T
+                    std::fprintf(stderr, "[TRUNC_TEST] hdr=%s L=%d pty_idx=%d preset=%c\n",
+                                 hdr.c_str(), L, pty_idx, preset_mode);
+                    TrCykResult res = runTrCYKInsideAlign(m, dsq, L, preset_mode, pty_idx);
+                    std::fprintf(stderr, "[TRUNC_TEST] DP done: score=%.4f mode=%c b=%d\n",
+                                 res.score, res.mode, res.b);
+                    TrParsetree tr = runTrCYKAlignT(m, res, L, pty_idx);
+                    std::fprintf(stderr, "[TRUNC_TEST] trace done: ok=%d nodes=%zu err=%s\n",
+                                 tr.ok ? 1 : 0, tr.nodes.size(), tr.err);
+                    dumpTrParsetree(tr, m);
+                    dumpTrCykAlphaFor(res, (int)m.states.size(), L, /*v_focus=*/0);
+                    dumpTrCykAlphaFor(res, (int)m.states.size(), L, /*v_focus=*/84);
+                    dumpTrCykAlphaFor(res, (int)m.states.size(), L, /*v_focus=*/9);
+                    // Specifically: BEGL_S=85 left subtree of BIF v=84,
+                    // BEGR_S=165 right subtree. Expect Ralpha[85][90][90]≈-9.13,
+                    // Lalpha[165][103][13]≈-2.05 from Infernal trace breakdown.
+                    if (std::getenv("MMSEQS_CMSCAN_DUMP_TRDP") != NULL
+                        && std::getenv("MMSEQS_CMSCAN_DUMP_TRDP")[0] == '1') {
+                        auto cellOr = [&](const std::vector<std::vector<std::vector<float>>> &a,
+                                          int v, int j, int d) -> double {
+                            if ((int)a.size() <= v) return -1e30;
+                            if ((int)a[(size_t)v].size() <= j) return -1e30;
+                            if ((int)a[(size_t)v][(size_t)j].size() <= d) return -1e30;
+                            return (double)a[(size_t)v][(size_t)j][(size_t)d];
+                        };
+                        std::fprintf(stderr, "[TRDP_BIF] v=85 (BEGL_S, left of BIF v=84):\n");
+                        for (int dd : {88, 89, 90, 91, 92}) {
+                            for (int jj : {90}) {
+                                if (dd > jj) continue;
+                                std::fprintf(stderr, "[TRDP_BIF]   v=85 j=%d d=%d  J=%.4f L=%.4f R=%.4f\n",
+                                             jj, dd,
+                                             cellOr(res.Jalpha, 85, jj, dd),
+                                             cellOr(res.Lalpha, 85, jj, dd),
+                                             cellOr(res.Ralpha, 85, jj, dd));
+                            }
+                        }
+                        // Walk down the broken left subtree to find where the gap appears.
+                        // Chain (Infernal trace): v=86 MP → 92 MP → 98 MP → 104 ML → 107 ML →
+                        // 110 ML → 113 MR → 116 MR → 119 MR → 122 MR → 125 MR → 299 EL
+                        // Inside-score reaching v=86 from the leaf side should be ≈ -9 + tsc(85→86).
+                        // Probe v=86, v=125 in J/L/R modes at relevant cells.
+                        std::fprintf(stderr, "[TRDP_BIF] v=86 (first MP after BEGL_S):\n");
+                        for (int dd : {88, 89, 90}) {
+                            for (int jj : {90}) {
+                                if (dd > jj) continue;
+                                std::fprintf(stderr, "[TRDP_BIF]   v=86 j=%d d=%d  J=%.4f L=%.4f R=%.4f\n",
+                                             jj, dd,
+                                             cellOr(res.Jalpha, 86, jj, dd),
+                                             cellOr(res.Lalpha, 86, jj, dd),
+                                             cellOr(res.Ralpha, 86, jj, dd));
+                            }
+                        }
+                        // v=125 is the MR that local-end-pops into EL absorbing 79 residues.
+                        // Infernal trace: tsc=-17.50, then EL spans residues 4..82 = 79 res.
+                        // Inside score at v=125 j=82 d=80 should be ≈ -17.50 + esc(MR@A) + elSelf*79.
+                        std::fprintf(stderr, "[TRDP_BIF] v=125 (MR with local-end pop in J trace):\n");
+                        for (int dd : {78, 79, 80, 81}) {
+                            for (int jj : {82, 83}) {
+                                if (dd > jj) continue;
+                                std::fprintf(stderr, "[TRDP_BIF]   v=125 j=%d d=%d  J=%.4f L=%.4f R=%.4f\n",
+                                             jj, dd,
+                                             cellOr(res.Jalpha, 125, jj, dd),
+                                             cellOr(res.Lalpha, 125, jj, dd),
+                                             cellOr(res.Ralpha, 125, jj, dd));
+                            }
+                        }
+                        // EL deck (state index = M).
+                        std::fprintf(stderr, "[TRDP_BIF] v=M (EL deck):\n");
+                        for (int dd : {0, 1, 79, 80}) {
+                            std::fprintf(stderr, "[TRDP_BIF]   v=%d j=%d d=%d  J=%.4f L=%.4f R=%.4f\n",
+                                         (int)m.states.size(), dd, dd,
+                                         cellOr(res.Jalpha, (int)m.states.size(), dd, dd),
+                                         cellOr(res.Lalpha, (int)m.states.size(), dd, dd),
+                                         cellOr(res.Ralpha, (int)m.states.size(), dd, dd));
+                        }
+                        // Print key model parameters: elSelf, endsc[125], state types.
+                        std::fprintf(stderr, "[TRDP_BIF] elSelf=%.4f localOn=%d pBegin=%.4f pEnd=%.4f\n",
+                                     m.elSelf, (int)m.hasLocalCfg, m.pBegin, m.pEnd);
+                        if (125 < (int)m.states.size()) {
+                            std::fprintf(stderr, "[TRDP_BIF] state[125] type=%d endSc=%.4f beginSc=%.4f cfirst=%d cnum=%d\n",
+                                         (int)m.states[125].type, m.states[125].endSc, m.states[125].beginSc,
+                                         m.states[125].cfirst, m.states[125].cnum);
+                        }
+                        std::fprintf(stderr, "[TRDP_BIF] v=165 (BEGR_S, right of BIF v=84):\n");
+                        for (int dd : {11, 12, 13, 14, 15}) {
+                            for (int jj : {103}) {
+                                if (dd > jj) continue;
+                                std::fprintf(stderr, "[TRDP_BIF]   v=165 j=%d d=%d  J=%.4f L=%.4f R=%.4f\n",
+                                             jj, dd,
+                                             cellOr(res.Jalpha, 165, jj, dd),
+                                             cellOr(res.Lalpha, 165, jj, dd),
+                                             cellOr(res.Ralpha, 165, jj, dd));
+                            }
+                        }
+                    }
+                    // Per-state argmax(J,L,R,T)+trpenalty, including all candidate b values.
+                    if (std::getenv("MMSEQS_CMSCAN_DUMP_TRDP") != NULL
+                        && std::getenv("MMSEQS_CMSCAN_DUMP_TRDP")[0] == '1') {
+                        std::fprintf(stderr, "[TRDP_BCAND] v   J+pty5+3   L+pty5    R+pty3    T+pty5+3\n");
+                        for (size_t v = 0; v < m.states.size(); ++v) {
+                            const CmState &s = m.states[v];
+                            if (s.type != CM_ST_MP && s.type != CM_ST_ML
+                                && s.type != CM_ST_MR && s.type != CM_ST_B
+                                && s.type != CM_ST_S) continue;
+                            if (pty_idx >= (int)m.trpL.size()) continue;
+                            double pJ = (m.trpL[0].size() > v && m.trpL[0][v] > -1e29) ? m.trpL[0][v] : 0.0;
+                            double pL = (m.trpL[1].size() > v && m.trpL[1][v] > -1e29) ? m.trpL[1][v] : 0.0;
+                            double pR = (m.trpL[2].size() > v && m.trpL[2][v] > -1e29) ? m.trpL[2][v] : 0.0;
+                            double j = (res.Jalpha.size() > v && res.Jalpha[v].size() > (size_t)L
+                                        && res.Jalpha[v][(size_t)L].size() > (size_t)L)
+                                       ? res.Jalpha[v][(size_t)L][(size_t)L] : -1e30;
+                            double l = (res.Lalpha.size() > v && res.Lalpha[v].size() > (size_t)L
+                                        && res.Lalpha[v][(size_t)L].size() > (size_t)L)
+                                       ? res.Lalpha[v][(size_t)L][(size_t)L] : -1e30;
+                            double rr = (res.Ralpha.size() > v && res.Ralpha[v].size() > (size_t)L
+                                         && res.Ralpha[v][(size_t)L].size() > (size_t)L)
+                                        ? res.Ralpha[v][(size_t)L][(size_t)L] : -1e30;
+                            double t = (res.Talpha.size() > v && res.Talpha[v].size() > (size_t)L
+                                        && res.Talpha[v][(size_t)L].size() > (size_t)L)
+                                       ? res.Talpha[v][(size_t)L][(size_t)L] : -1e30;
+                            std::fprintf(stderr, "[TRDP_BCAND] %3zu  %10.4f %10.4f %10.4f %10.4f\n",
+                                         v,
+                                         (j > -1e29) ? j + pJ : -999.0,
+                                         (l > -1e29) ? l + pL : -999.0,
+                                         (rr > -1e29) ? rr + pR : -999.0,
+                                         (t > -1e29) ? t + pJ : -999.0);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Debug(Debug::INFO) << "Infernal CM exact parser: CLEN=" << m.clen
@@ -1454,7 +3156,19 @@ static std::string modelTraceCigarQueryCoord(const InfernalExactModel &model,
                                              int *outQStart, int *outQEnd,
                                              int *outAlnLen,
                                              int *outLeadingInsertTargets,
-                                             int *outTrailingInsertTargets) {
+                                             int *outTrailingInsertTargets,
+                                             const std::vector<int8_t> *traceModes = nullptr) {
+    // Mode-aware emit semantics (Infernal cm_dpalign_trunc.c ModeEmits):
+    //   J: MP both, ML left, MR right
+    //   L: MP left, ML left, MR silent
+    //   R: MP right, ML silent, MR right
+    //   T: MP/ML/MR all silent (T only legal at root/BIF)
+    auto emitsLeft  = [](int8_t mode) {
+        return mode == TR_TRMODE_J || mode == TR_TRMODE_L;
+    };
+    auto emitsRight = [](int8_t mode) {
+        return mode == TR_TRMODE_J || mode == TR_TRMODE_R;
+    };
     if (outQStart) *outQStart = -1;
     if (outQEnd) *outQEnd = -1;
     if (outAlnLen) *outAlnLen = 0;
@@ -1498,19 +3212,25 @@ static std::string modelTraceCigarQueryCoord(const InfernalExactModel &model,
             continue;
         }
         const CmState &s = model.states[static_cast<size_t>(sid)];
+        // Mode-aware emit (truncation modes). Without modes, treat as J.
+        const int8_t md = (traceModes && i < traceModes->size())
+                          ? (*traceModes)[i]
+                          : (int8_t)TR_TRMODE_J;
+        const bool emL = emitsLeft(md);
+        const bool emR = emitsRight(md);
         if (s.type == CM_ST_MP) {
-            if (s.mapLeft > 0 && s.mapLeft <= maxMap) {
+            if (emL && s.mapLeft > 0 && s.mapLeft <= maxMap) {
                 mop[static_cast<size_t>(s.mapLeft)] = 'M';
             }
-            if (s.mapRight > 0 && s.mapRight <= maxMap) {
+            if (emR && s.mapRight > 0 && s.mapRight <= maxMap) {
                 mop[static_cast<size_t>(s.mapRight)] = 'M';
             }
         } else if (s.type == CM_ST_ML) {
-            if (s.mapLeft > 0 && s.mapLeft <= maxMap) {
+            if (emL && s.mapLeft > 0 && s.mapLeft <= maxMap) {
                 mop[static_cast<size_t>(s.mapLeft)] = 'M';
             }
         } else if (s.type == CM_ST_MR) {
-            if (s.mapRight > 0 && s.mapRight <= maxMap) {
+            if (emR && s.mapRight > 0 && s.mapRight <= maxMap) {
                 mop[static_cast<size_t>(s.mapRight)] = 'M';
             }
         } else if (s.type == CM_ST_D) {
@@ -1523,24 +3243,32 @@ static std::string modelTraceCigarQueryCoord(const InfernalExactModel &model,
         } else if (s.type == CM_ST_IL) {
             // IL inserts AFTER its left consensus column. ROOT_IL has mapLeft==0
             // and conceptually inserts before col 1 → bin as prefix.
-            int anchor = s.mapLeft;
-            if (anchor <= 0) {
-                prefixIns += 1;
-            } else if (anchor > maxMap) {
-                suffixIns += 1;
-            } else {
-                insAfter[static_cast<size_t>(anchor)] += 1;
+            // Mode-aware: IL only emits in mode J or L (silent in R/T).
+            if (!emL) { /* silent */ }
+            else {
+                int anchor = s.mapLeft;
+                if (anchor <= 0) {
+                    prefixIns += 1;
+                } else if (anchor > maxMap) {
+                    suffixIns += 1;
+                } else {
+                    insAfter[static_cast<size_t>(anchor)] += 1;
+                }
             }
         } else if (s.type == CM_ST_IR) {
             // IR inserts BEFORE its right consensus column → anchor at mapRight-1.
             // ROOT_IR has mapRight==CLEN+1 (=maxMap+1) so anchor==maxMap (valid).
-            int anchor = (s.mapRight > 0) ? s.mapRight - 1 : 0;
-            if (anchor <= 0) {
-                prefixIns += 1;
-            } else if (anchor > maxMap) {
-                suffixIns += 1;
-            } else {
-                insAfter[static_cast<size_t>(anchor)] += 1;
+            // Mode-aware: IR only emits in mode J or R (silent in L/T).
+            if (!emR) { /* silent */ }
+            else {
+                int anchor = (s.mapRight > 0) ? s.mapRight - 1 : 0;
+                if (anchor <= 0) {
+                    prefixIns += 1;
+                } else if (anchor > maxMap) {
+                    suffixIns += 1;
+                } else {
+                    insAfter[static_cast<size_t>(anchor)] += 1;
+                }
             }
         }
     }
@@ -2103,7 +3831,10 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                                  const std::string &seqId,
                                  int maxHitLen = 0,
                                  int forcedI = -1,
-                                 int forcedD = -1) {
+                                 int forcedD = -1,
+                                 int anchorI = -1,
+                                 int anchorD = -1,
+                                 int forceDisableQdb = -1) {
     const int N = static_cast<int>(seq.size());
     const int M = static_cast<int>(model.states.size());
     if (N <= 0 || M <= 0) {
@@ -2215,8 +3946,15 @@ static void runInfernalExactScan(const InfernalExactModel &model,
     std::vector<float> nbTrScF4(static_cast<size_t>(M) * 4, -std::numeric_limits<float>::infinity());
     // MMSEQS_CMSCAN_DISABLE_QDB=1 neutralizes per-state QDB1 bands so CYK fills the
     // full d-range, mirroring Infernal cmalign's default (HMM-banded but not QDB-banded).
-    const char *envDisableQdb = std::getenv("MMSEQS_CMSCAN_DISABLE_QDB");
-    const bool disableQdb = (envDisableQdb != NULL && envDisableQdb[0] == '1');
+    // forceDisableQdb param overrides env var for per-call gating (used by envelope rescan
+    // to run pass 1 with QDB on and pass 2 with QDB off).
+    bool disableQdb;
+    if (forceDisableQdb >= 0) {
+        disableQdb = (forceDisableQdb != 0);
+    } else {
+        const char *envDisableQdb = std::getenv("MMSEQS_CMSCAN_DISABLE_QDB");
+        disableQdb = (envDisableQdb != NULL && envDisableQdb[0] == '1');
+    }
     // MMSEQS_CMSCAN_DROP_DMIN=1 zeros per-state dmin while preserving dmax. Targets the
     // FG=1 collapse on short-envelope queries (e.g. 4LCK_3) where forced d=N falls below
     // dmin at the root, without inviting qdboff's unbounded-trace regressions on large queries.
@@ -2781,34 +4519,9 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             }
         }
 
-        // Local-begin pass (Infernal cm_dpsearch.c:576-610). After all states
-        // are filled, the root cell can also be reached by jumping directly to
-        // any begin-eligible state y at score `alpha[y][d][i] + beginSc[y]`.
-        // We *add* these alternatives on top of the regular ROOT_S recurrence
-        // (we do not zero ROOT_S transitions); this is more permissive than
-        // Infernal's cm_localize (which zeros root transitions) but cannot make
-        // any cell worse. Glocal CMs leave beginSc=NEG_INF and skip this loop.
-        if (model.hasLocalCfg) {
-            const size_t rootBaseLB = stateBase[static_cast<size_t>(root)];
-            for (int y = 1; y < M; ++y) {
-                const CmState &cs = model.states[static_cast<size_t>(y)];
-                if (cs.beginSc == NEG_INF) {
-                    continue;
-                }
-                const float bsc = static_cast<float>(cs.beginSc);
-                const size_t yBase = stateBase[static_cast<size_t>(y)];
-                for (int d = 0; d <= N; ++d) {
-                    const int iMax = (d == 0) ? (N + 1) : (N - d + 1);
-                    float *rootRow = &vit[rootBaseLB + static_cast<size_t>(d) * iStride + 1];
-                    const float *yRow = &vit[yBase + static_cast<size_t>(d) * iStride + 1];
-                    for (int i = 0; i < iMax; ++i) {
-                        const float cand = yRow[i] + bsc;
-                        if (rootRow[i] < cand) rootRow[i] = cand;
-                    }
-                }
-            }
-        }
-
+        // Hoisted: maxSpan/minSpan/forceEnv must be computed BEFORE the
+        // local-begin pass below, so the FG=1 corner-only branch can
+        // address the same trace-seed cell that the selection block reads.
         int maxSpan = N;
         // Fix A diagnostic: W cap can be disabled via MMSEQS_CMSCAN_WCAP=0 to
         // probe whether Infernal-length envelopes (d > W) become reachable.
@@ -2849,6 +4562,147 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         if (forceEnv) {
             minSpan = forcedD;
             maxSpan = forcedD;
+        }
+
+        // Hoisted: MMSEQS_CMSCAN_FORCE_GLOBAL env-cache. Read once here so the
+        // local-begin pass below and the selection block further down both see
+        // the same value. Selection block uses this same `forceGlobal`.
+        static int forceGlobal = -1;
+        if (forceGlobal == -1) {
+            const char *env = std::getenv("MMSEQS_CMSCAN_FORCE_GLOBAL");
+            if (env != NULL) {
+                if (std::string(env) == "1") forceGlobal = 1;
+                else if (std::string(env) == "2") forceGlobal = 2;
+                else if (std::string(env) == "3") forceGlobal = 3;
+                else if (std::string(env) == "4") forceGlobal = 4;
+                else forceGlobal = 0;
+            } else {
+                forceGlobal = 0;
+            }
+        }
+
+        // Local-begin pass (Infernal cm_dpsearch.c:576-610). After all states
+        // are filled, the root cell can also be reached by jumping directly to
+        // any begin-eligible state y at score `alpha[y][d][i] + beginSc[y]`.
+        //
+        // FG=0/2/3/4: spray local-begin alternates across every (i, d) ROOT_S
+        //   cell. Default mode picks argmax over the row, so the per-cell
+        //   pickup is harmless (every cell is internally consistent with its
+        //   own argmax y). FG=2 sweeps i at fixed d; FG=3/4 scan a band.
+        //
+        // FG=1: trace is forced to seed at (i=1, d=min(maxSpan,N)). Per-cell
+        //   pickup pollutes other root cells with values whose argmax y has
+        //   nothing to do with that corner — see project_4LCK_FG1_collapse_
+        //   decomposed.md and project_cyk_celldiff_root_local_begin.md (102
+        //   polluted cells). Apply local-begin only at the trace-seed corner,
+        //   mirroring Inside DP at lines 3683-3691 (bit-exact to Infernal).
+        //
+        // Glocal CMs leave beginSc=NEG_INF and skip the loop body either way.
+        if (model.hasLocalCfg) {
+            const size_t rootBaseLB = stateBase[static_cast<size_t>(root)];
+            if (forceGlobal == 1) {
+                // Corner-OVERWRITE: clear ROOT_S at the trace-seed corner
+                // before applying local-begin. Mirrors Infernal cm_localize
+                // (cm_modelconfig.c:491) which zeros ROOT_S→child transitions
+                // so the only path to ROOT_S is via local-begin. Differs from
+                // the per-cell max-update branch below: there we *add*
+                // local-begin alternates on top of the regular ROOT_S
+                // recurrence, which inflates the cell score above what the
+                // local-begin trace can actually produce. Under TRACE_LBO=1 +
+                // FG=1 the trace is forced to descend via local-begin, so
+                // the cell value must reflect the local-begin path only —
+                // otherwise score-vs-trace is inconsistent and bad alignments
+                // get scored as if they took the regular-recurrence path.
+                const int cornerD = std::min(maxSpan, N);
+                const int cornerI = 1;
+                if (cornerD >= 1 && cornerI + cornerD - 1 <= N) {
+                    float &rootCell = vit[rootBaseLB
+                        + static_cast<size_t>(cornerD) * iStride
+                        + static_cast<size_t>(cornerI)];
+                    rootCell = NEG_INF_F;
+                    for (int y = 1; y < M; ++y) {
+                        const CmState &cs = model.states[static_cast<size_t>(y)];
+                        if (cs.beginSc == NEG_INF) continue;
+                        const float bsc = static_cast<float>(cs.beginSc);
+                        const float yVal = vit[stateBase[static_cast<size_t>(y)]
+                            + static_cast<size_t>(cornerD) * iStride
+                            + static_cast<size_t>(cornerI)];
+                        if (yVal == NEG_INF_F) continue;
+                        const float cand = yVal + bsc;
+                        if (rootCell < cand) rootCell = cand;
+                    }
+                }
+            } else if (forceGlobal == 5) {
+                // FG=5 hybrid: only the corner cell (FG=1 candidate) and the
+                // midpoint-span cells (FG=3 candidates) are read by the
+                // selection logic below. Skip the O(M*N²) per-cell loop and
+                // touch only those cells (O(M*span) work), yielding
+                // FG=1-class wall time even though we maintain both
+                // candidates. Both pickups are corner-OVERWRITE-style for
+                // consistency with FG=1.
+                const int cornerD = std::min(maxSpan, N);
+                if (cornerD >= 1 && cornerD <= N) {
+                    float &rootCell = vit[rootBaseLB
+                        + static_cast<size_t>(cornerD) * iStride
+                        + 1];
+                    rootCell = NEG_INF_F;
+                    for (int y = 1; y < M; ++y) {
+                        const CmState &cs = model.states[static_cast<size_t>(y)];
+                        if (cs.beginSc == NEG_INF) continue;
+                        const float bsc = static_cast<float>(cs.beginSc);
+                        const float yVal = vit[stateBase[static_cast<size_t>(y)]
+                            + static_cast<size_t>(cornerD) * iStride
+                            + 1];
+                        if (yVal == NEG_INF_F) continue;
+                        const float cand = yVal + bsc;
+                        if (rootCell < cand) rootCell = cand;
+                    }
+                }
+                if (anchorI > 0 && anchorD > 0
+                    && anchorI <= N && anchorI + anchorD - 1 <= N) {
+                    const int midpoint = anchorI + (anchorD - 1) / 2;
+                    for (int d = minSpan; d <= maxSpan; ++d) {
+                        const int iMax = N - d + 1;
+                        const int iLo = std::max(1, midpoint - d + 1);
+                        const int iHi = std::min(iMax, midpoint);
+                        for (int i = iLo; i <= iHi; ++i) {
+                            float &rootCell = vit[rootBaseLB
+                                + static_cast<size_t>(d) * iStride
+                                + static_cast<size_t>(i)];
+                            rootCell = NEG_INF_F;
+                            for (int y = 1; y < M; ++y) {
+                                const CmState &cs = model.states[static_cast<size_t>(y)];
+                                if (cs.beginSc == NEG_INF) continue;
+                                const float bsc = static_cast<float>(cs.beginSc);
+                                const float yVal = vit[stateBase[static_cast<size_t>(y)]
+                                    + static_cast<size_t>(d) * iStride
+                                    + static_cast<size_t>(i)];
+                                if (yVal == NEG_INF_F) continue;
+                                const float cand = yVal + bsc;
+                                if (rootCell < cand) rootCell = cand;
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (int y = 1; y < M; ++y) {
+                    const CmState &cs = model.states[static_cast<size_t>(y)];
+                    if (cs.beginSc == NEG_INF) {
+                        continue;
+                    }
+                    const float bsc = static_cast<float>(cs.beginSc);
+                    const size_t yBase = stateBase[static_cast<size_t>(y)];
+                    for (int d = 0; d <= N; ++d) {
+                        const int iMax = (d == 0) ? (N + 1) : (N - d + 1);
+                        float *rootRow = &vit[rootBaseLB + static_cast<size_t>(d) * iStride + 1];
+                        const float *yRow = &vit[yBase + static_cast<size_t>(d) * iStride + 1];
+                        for (int i = 0; i < iMax; ++i) {
+                            const float cand = yRow[i] + bsc;
+                            if (rootRow[i] < cand) rootRow[i] = cand;
+                        }
+                    }
+                }
+            }
         }
         float bestSc = NEG_INF_F;
         int bestI = 1;
@@ -2955,18 +4809,18 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         // MMSEQS_CMSCAN_FORCE_GLOBAL=2: pin d=min(N, maxSpan), pick i = argmax alpha[ROOT_S][d][i].
         //   Full-length subspan, but slid to wherever score is best — handles 4LCK_3-style
         //   envelopes where the conserved region is not at i=1.
+        // MMSEQS_CMSCAN_FORCE_GLOBAL=3: midpoint-anchor. argmax over (i, d) where
+        //   i <= prefilter-midpoint <= i+d-1. Free d (adapts per hit), but envelope
+        //   must straddle the prefilter's most-confident point.
+        // MMSEQS_CMSCAN_FORCE_GLOBAL=4: span-contain. argmax over (i, d) where the
+        //   prefilter [anchorI..anchorI+anchorD-1] is fully contained in [i..i+d-1].
+        //   Strictest gate; equivalent to "envelope must cover the prefilter span".
+        // MMSEQS_CMSCAN_FORCE_GLOBAL=5: per-target hybrid. Try FG=1 corner first; if its
+        //   null3-corrected score < MMSEQS_CMSCAN_FG_HYBRID_THRESHOLD (default 0 bits),
+        //   fall back to FG=3 midpoint anchor. Preserves column stability for hits where
+        //   FG=1 works, recovers FG=3 alignment for targets where FG=1 picks junk.
         {
-            static int forceGlobal = -1;
-            if (forceGlobal == -1) {
-                const char *env = std::getenv("MMSEQS_CMSCAN_FORCE_GLOBAL");
-                if (env != NULL) {
-                    if (std::string(env) == "1") forceGlobal = 1;
-                    else if (std::string(env) == "2") forceGlobal = 2;
-                    else forceGlobal = 0;
-                } else {
-                    forceGlobal = 0;
-                }
-            }
+            // forceGlobal is hoisted above the local-begin pass; reuse it here.
             if (forceGlobal == 1) {
                 const int gD = std::min(maxSpan, N);
                 const int gI = 1;
@@ -3006,6 +4860,115 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                         bestMode = 'T';
                         bestNull3Corr = bestCorrGlob;
                     }
+                }
+            } else if ((forceGlobal == 3 || forceGlobal == 4) && anchorI > 0 && anchorD > 0
+                       && anchorI <= N && anchorI + anchorD - 1 <= N) {
+                const int anchorEnd = anchorI + anchorD - 1;
+                const int midpoint = anchorI + (anchorD - 1) / 2;
+                int bestIa = -1, bestDa = -1;
+                float bestScA = NEG_INF_F;
+                double bestCorrA = 0.0;
+                for (int d = minSpan; d <= maxSpan; ++d) {
+                    const int iMax = N - d + 1;
+                    int iLo, iHi;
+                    if (forceGlobal == 3) {
+                        // envelope must contain midpoint: i <= midpoint <= i+d-1
+                        iLo = std::max(1, midpoint - d + 1);
+                        iHi = std::min(iMax, midpoint);
+                    } else {
+                        // envelope must contain [anchorI..anchorEnd]:
+                        // i <= anchorI and i+d-1 >= anchorEnd
+                        iLo = std::max(1, anchorEnd - d + 1);
+                        iHi = std::min(iMax, anchorI);
+                    }
+                    for (int i = iLo; i <= iHi; ++i) {
+                        const float raw = vit[rootBase + static_cast<size_t>(d) * iStride + static_cast<size_t>(i)];
+                        if (raw == NEG_INF_F) continue;
+                        const double corr = null3CorrByInterval(i, i + d - 1);
+                        const float sc = static_cast<float>(static_cast<double>(raw) - corr);
+                        if (sc > bestScA) {
+                            bestScA = sc;
+                            bestIa = i;
+                            bestDa = d;
+                            bestCorrA = corr;
+                        }
+                    }
+                }
+                if (bestIa > 0) {
+                    bestSc = bestScA;
+                    bestI = bestIa;
+                    bestD = bestDa;
+                    bestMode = 'J';
+                    bestNull3Corr = bestCorrA;
+                }
+            } else if (forceGlobal == 5) {
+                // Margin-gated fallback: keep FG=1 corner unless FG=3 best is
+                // meaningfully better. Preserves FG=1 column stability across
+                // targets where corner is a reasonable choice; only switches
+                // to FG=3 when corner is dramatically worse (e.g., CP150205.1
+                // case: corner=-19, fg3=+50, gap=69 bits → fall back).
+                // MMSEQS_CMSCAN_FG_HYBRID_MARGIN: gap (bits) above which we
+                // fall back. Default 10. Higher value biases toward FG=1.
+                static const float fgHybridMargin = []() -> float {
+                    const char *e = std::getenv("MMSEQS_CMSCAN_FG_HYBRID_MARGIN");
+                    if (e == NULL || *e == '\0') return 10.0f;
+                    return static_cast<float>(std::atof(e));
+                }();
+                const int gD1 = std::min(maxSpan, N);
+                const int gI1 = 1;
+                float fg1Sc = NEG_INF_F;
+                double fg1Corr = 0.0;
+                if (gD1 >= minSpan && gI1 + gD1 - 1 <= N) {
+                    const float raw = vit[rootBase + static_cast<size_t>(gD1) * iStride + static_cast<size_t>(gI1)];
+                    if (raw != NEG_INF_F) {
+                        fg1Corr = null3CorrByInterval(gI1, gI1 + gD1 - 1);
+                        fg1Sc = static_cast<float>(static_cast<double>(raw) - fg1Corr);
+                    }
+                }
+                int fg3I = -1, fg3D = -1;
+                float fg3Sc = NEG_INF_F;
+                double fg3Corr = 0.0;
+                if (anchorI > 0 && anchorD > 0
+                    && anchorI <= N && anchorI + anchorD - 1 <= N) {
+                    const int midpoint = anchorI + (anchorD - 1) / 2;
+                    for (int d = minSpan; d <= maxSpan; ++d) {
+                        const int iMax = N - d + 1;
+                        const int iLo = std::max(1, midpoint - d + 1);
+                        const int iHi = std::min(iMax, midpoint);
+                        for (int i = iLo; i <= iHi; ++i) {
+                            const float raw = vit[rootBase + static_cast<size_t>(d) * iStride + static_cast<size_t>(i)];
+                            if (raw == NEG_INF_F) continue;
+                            const double corr = null3CorrByInterval(i, i + d - 1);
+                            const float sc = static_cast<float>(static_cast<double>(raw) - corr);
+                            if (sc > fg3Sc) {
+                                fg3Sc = sc;
+                                fg3I = i;
+                                fg3D = d;
+                                fg3Corr = corr;
+                            }
+                        }
+                    }
+                }
+                bool useFg3 = false;
+                if (fg3Sc != NEG_INF_F) {
+                    if (fg1Sc == NEG_INF_F) {
+                        useFg3 = true;
+                    } else if ((fg3Sc - fg1Sc) > fgHybridMargin) {
+                        useFg3 = true;
+                    }
+                }
+                if (useFg3) {
+                    bestSc = fg3Sc;
+                    bestI = fg3I;
+                    bestD = fg3D;
+                    bestMode = 'J';
+                    bestNull3Corr = fg3Corr;
+                } else if (fg1Sc != NEG_INF_F) {
+                    bestSc = fg1Sc;
+                    bestI = gI1;
+                    bestD = gD1;
+                    bestMode = 'T';
+                    bestNull3Corr = fg1Corr;
                 }
             }
         }
@@ -3091,10 +5054,24 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         std::vector<TbCell> st;
         st.reserve(static_cast<size_t>(M + N));
         st.push_back(TbCell{root, bestI, bestD});
+        // MMSEQS_CMSCAN_DUMP_TRACE_TID=<seqId>: per-step trace dump for cell-diff
+        // vs Infernal --tfile. Format mirrors parsetree idx/emitl/emitr/state.
+        const char *dumpTraceTid = std::getenv("MMSEQS_CMSCAN_DUMP_TRACE_TID");
+        const bool dumpThisTrace = (dumpTraceTid != NULL && seqId == dumpTraceTid);
+        int traceIdxCounter = 0;
+        if (dumpThisTrace) {
+            fprintf(stderr, "DUMP_TRACE_HDR tid=%s bestI=%d bestD=%d bestSc=%.4f bestMode=%c\n",
+                    seqId.c_str(), bestI, bestD, bestSc, bestMode);
+        }
         while (!st.empty()) {
             TbCell c = st.back();
             st.pop_back();
             const ExactStateExec &sv = exec[static_cast<size_t>(c.v)];
+            if (dumpThisTrace) {
+                const int j_dbg = c.i + c.d - 1;
+                fprintf(stderr, "DUMP_TRACE idx=%d v=%d type=%d i=%d j=%d d=%d\n",
+                        traceIdxCounter++, c.v, (int)sv.type, c.i, j_dbg, c.d);
+            }
             if (sv.type == CM_ST_E) {
                 continue;
             }
@@ -3186,10 +5163,27 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             int bestY = -1;
             float bestCand = NEG_INF_F;
             const int trCount = sv.trCount;
-            if (trCount <= 4) {
+            const bool dumpCand = (dumpThisTrace && c.v == root);
+            // MMSEQS_CMSCAN_TRACE_LBO=1: at root, mirror Infernal cm_localize
+            // (cm_modelconfig.c:491) which zeroes cm->t[0] when local mode is on,
+            // making ROOT_S→child via trDst NEG_INF in cm_alignT. Only local-begin
+            // can leave the root. Equivalent at trace time without poisoning DP fill.
+            static const char *const lboEnv = std::getenv("MMSEQS_CMSCAN_TRACE_LBO");
+            const bool traceLBO = (lboEnv != NULL && lboEnv[0] == '1');
+            const bool skipTrDstAtRoot = traceLBO && (c.v == root) && model.hasLocalCfg;
+            if (skipTrDstAtRoot) {
+                if (dumpCand) {
+                    fprintf(stderr, "DUMP_TRACE_CAND v=%d kind=tr_skipped reason=LBO\n", c.v);
+                }
+            } else if (trCount <= 4) {
                 for (int t = 0; t < trCount; ++t) {
                     const int y = sv.trDst4[t];
                     const float n = vit[stateBase[static_cast<size_t>(y)] + ndBase];
+                    if (dumpCand) {
+                        fprintf(stderr, "DUMP_TRACE_CAND v=%d kind=tr t=%d y=%d trSc=%.6f n=%.6f cand=%.6f\n",
+                                c.v, t, y, sv.trScF4[t], n,
+                                (n == NEG_INF_F) ? -INFINITY : (ef + sv.trScF4[t]) + n);
+                    }
                     if (n == NEG_INF_F) {
                         continue;
                     }
@@ -3205,6 +5199,11 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                     const int y = trDst[ti];
                     const float trF = static_cast<float>(trSc[ti]);
                     const float n = vit[stateBase[static_cast<size_t>(y)] + ndBase];
+                    if (dumpCand) {
+                        fprintf(stderr, "DUMP_TRACE_CAND v=%d kind=tr t=%d y=%d trSc=%.6f n=%.6f cand=%.6f\n",
+                                c.v, t, y, trF, n,
+                                (n == NEG_INF_F) ? -INFINITY : (ef + trF) + n);
+                    }
                     if (n == NEG_INF_F) {
                         continue;
                     }
@@ -3215,8 +5214,84 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                     }
                 }
             }
+            // Local-begin trace: at ROOT_S, alpha[root][i][d] may have been
+            // reached via a direct local-begin jump to some begin-eligible y
+            // (the per-cell pickup at CmScan.cpp:2807-2826 mirrors cmsearch
+            // search semantics). Without considering those candidates here the
+            // trace walks ROOT_S→child recurrence even when local-begin won at
+            // the chart, producing a misaligned CIGAR. Cell-diff bug:
+            // project_cyk_celldiff_root_local_begin.md.
+            if (c.v == root && model.hasLocalCfg) {
+                for (int y = 1; y < M; ++y) {
+                    const CmState &cs = model.states[static_cast<size_t>(y)];
+                    if (cs.beginSc == NEG_INF) {
+                        continue;
+                    }
+                    const float bsc = static_cast<float>(cs.beginSc);
+                    const float n = vit[stateBase[static_cast<size_t>(y)] + ndBase];
+                    if (dumpCand) {
+                        fprintf(stderr, "DUMP_TRACE_CAND v=%d kind=lb y=%d bsc=%.6f n=%.6f cand=%.6f\n",
+                                c.v, y, bsc, n,
+                                (n == NEG_INF_F) ? -INFINITY : (ef + bsc) + n);
+                    }
+                    if (n == NEG_INF_F) {
+                        continue;
+                    }
+                    const float cand = (ef + bsc) + n;  // ef=0 for ROOT_S
+                    if (cand > bestCand) {
+                        bestCand = cand;
+                        bestY = y;
+                    }
+                }
+            }
+            // EL pop-out candidate (mirrors yshadow=USED_EL in Infernal cm_alignT).
+            // At any end-eligible state v (endSc[v] != NEG_INF, local mode on),
+            // alpha[v][j][d] may have been reached via the EL pre-fill at line
+            // 2700-2742: emit_v(i,d) + elSelf*(d-sd) + endSc[v]. If that beats
+            // every trDst-via-children candidate above, record EL pop-out: skip
+            // pushing children. The CIGAR builder is column-driven (line 1593:
+            // any unwalked col = D op), so the right subtree's columns become
+            // gaps automatically. Residues popped to EL are accounted for via
+            // minUsed/maxUsed expansion so the alignment span covers them.
+            // Gated by MMSEQS_CMSCAN_TRACE_EL=1 for diagnostic A/B.
+            static const char *const elTraceEnv = std::getenv("MMSEQS_CMSCAN_TRACE_EL");
+            const bool traceEL = (elTraceEnv != NULL && elTraceEnv[0] == '1');
+            bool pickEL = false;
+            if (traceEL && model.hasLocalCfg && model.elSelf <= 0.0) {
+                const CmState &csEL = model.states[static_cast<size_t>(c.v)];
+                if (csEL.endSc != NEG_INF) {
+                    const float elCand = ef
+                        + static_cast<float>(model.elSelf) * static_cast<float>(nd)
+                        + static_cast<float>(csEL.endSc);
+                    if (dumpCand) {
+                        fprintf(stderr, "DUMP_TRACE_CAND v=%d kind=el endSc=%.6f elContrib=%.6f cand=%.6f\n",
+                                c.v, (float)csEL.endSc,
+                                static_cast<float>(model.elSelf) * static_cast<float>(nd),
+                                elCand);
+                    }
+                    if (elCand > bestCand) {
+                        bestCand = elCand;
+                        pickEL = true;
+                    }
+                }
+            }
+            if (dumpThisTrace && c.v == root) {
+                fprintf(stderr, "DUMP_TRACE_PICK v=%d bestY=%d bestCand=%.6f%s\n",
+                        c.v, bestY, bestCand, pickEL ? " EL" : "");
+            }
             (void)cur;  // cur is only used for the NEG_INF_F early-skip above.
-            if (bestY >= 0) {
+            if (pickEL) {
+                // EL pops `nd` residues without column consumption. Update span
+                // accounting; do not push children.
+                if (nd > 0) {
+                    minUsed = std::min(minUsed, ni);
+                    maxUsed = std::max(maxUsed, ni + nd - 1);
+                }
+                if (dumpThisTrace) {
+                    fprintf(stderr, "DUMP_TRACE_EL v=%d popped_residues=%d at_i=%d..%d\n",
+                            c.v, nd, ni, ni + nd - 1);
+                }
+            } else if (bestY >= 0) {
                 st.push_back(TbCell{bestY, ni, nd});
             }
         }
@@ -3321,6 +5396,13 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                         }
                         continue;
                     }
+                    {
+                        const char *probeV = std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_V");
+                        if (probeV != NULL && v == std::atoi(probeV)) {
+                            fprintf(stderr, "DUMP_TRANS_PROBE v=%d d=%d type=%d dConsume=%d trCount=%d trOff=%zu emitSize=%d emitPtr=%p niShift=%d\n",
+                                    v, d, (int)st.type, st.dConsume, st.trCount, st.trOff, st.emitSize, (void*)st.emitPtr, st.niShift);
+                        }
+                    }
                     if (d < st.dConsume) { continue; }
                     const int nd = d - st.dConsume;
                     const int niShift = st.niShift;
@@ -3355,16 +5437,51 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                                     ef = (bi >= 0) ? ep[bi] : -1.0f;
                                 }
                             }
+                            const char *trDumpV = std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_V");
+                            const int trDumpD = (std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_D") != NULL) ? std::atoi(std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_D")) : -1;
+                            const int trDumpJ = (std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_J") != NULL) ? std::atoi(std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_J")) : -1;
+                            const bool dumpV = (trDumpV != NULL) && (v == std::atoi(trDumpV));
+                            const bool doDump = dumpV && (d == trDumpD) && (trDumpJ < 0 || li == (trDumpJ - d));
+                            if (doDump) {
+                                fprintf(stderr, "DUMP_TRANS_LIENTRY v=%d d=%d li=%d ef=%.6f bestI=%d niShift=%d\n",
+                                        v, d, li, ef, bestI, niShift);
+                            }
                             if (ef == NEG_INF_F) { continue; }
                             const int nli = li + niShift;
                             bool has = false;
                             float acc = NEG_INF_F;
+                            // LOCAL-mode EL pre-init (Infernal cm_dpalign.c:1600-1604).
+                            // For end-eligible v with finite endsc[v], seed alpha with
+                            // ef + el_scA[d-sd] + endsc[v] before children FLogsum.
+                            if (model.hasLocalCfg && model.elSelf <= 0.0) {
+                                const CmState &csEl = model.states[static_cast<size_t>(v)];
+                                if (csEl.endSc != NEG_INF) {
+                                    int sdEl = -1;
+                                    if (csEl.type == CM_ST_MP) sdEl = 2;
+                                    else if (csEl.type == CM_ST_ML || csEl.type == CM_ST_MR) sdEl = 1;
+                                    else if (csEl.type == CM_ST_S) sdEl = 0;
+                                    if (sdEl >= 0 && d >= sdEl) {
+                                        const float elTerm = ef
+                                            + static_cast<float>(model.elSelf) * static_cast<float>(d - sdEl)
+                                            + static_cast<float>(csEl.endSc);
+                                        log2AccFastAddF(elTerm, has, acc);
+                                    }
+                                }
+                            }
                             for (int t = 0; t < st.trCount; ++t) {
                                 const size_t ti = st.trOff + static_cast<size_t>(t);
                                 const double n = nxtSlice[static_cast<size_t>(trDstPtr[ti]) * vStride + static_cast<size_t>(nli)];
+                                if (doDump) {
+                                    fprintf(stderr, "DUMP_TRANS v=%d d=%d t=%d trDst=%d trSc=%.6f ef=%.6f childAlpha=%.6f sum=%.6f\n",
+                                            v, d, t, (int)trDstPtr[ti], trScPtr[ti], ef, n,
+                                            (n != NEG_INF) ? (ef + static_cast<float>(trScPtr[ti]) + static_cast<float>(n)) : NEG_INF);
+                                }
                                 if (n != NEG_INF) {
                                     log2AccFastAddF(ef + static_cast<float>(trScPtr[ti]) + static_cast<float>(n), has, acc);
                                 }
+                            }
+                            if (doDump) {
+                                fprintf(stderr, "DUMP_TRANS v=%d d=%d FINAL acc=%.6f\n", v, d, has ? acc : NEG_INF);
                             }
                             dst[li] = has ? static_cast<double>(acc) : NEG_INF;
                         }
@@ -3395,26 +5512,116 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                                     ef = (bi >= 0) ? ep[bi] : -1.0f;
                                 }
                             }
+                            const char *trDumpV2 = std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_V");
+                            const int trDumpD2 = (std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_D") != NULL) ? std::atoi(std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_D")) : -1;
+                            const int trDumpJ2 = (std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_J") != NULL) ? std::atoi(std::getenv("MMSEQS_CMSCAN_DUMP_TRANS_J")) : -1;
+                            const bool dumpV2 = (trDumpV2 != NULL) && (v == std::atoi(trDumpV2));
+                            const bool doDump2 = dumpV2 && (d == trDumpD2) && (trDumpJ2 < 0 || li == (trDumpJ2 - d));
+                            if (doDump2) {
+                                fprintf(stderr, "DUMP_TRANS_LIENTRY v=%d d=%d li=%d ef=%.6f bestI=%d niShift=%d (exact)\n",
+                                        v, d, li, ef, bestI, niShift);
+                            }
                             if (ef == NEG_INF_F) { continue; }
                             const int nli = li + niShift;
                             bool has = false;
                             double maxVal = NEG_INF;
                             double scaledSum = 0.0;
+                            // LOCAL-mode EL pre-init (Infernal cm_dpalign.c:1600-1604).
+                            if (model.hasLocalCfg && model.elSelf <= 0.0) {
+                                const CmState &csEl = model.states[static_cast<size_t>(v)];
+                                if (csEl.endSc != NEG_INF) {
+                                    int sdEl = -1;
+                                    if (csEl.type == CM_ST_MP) sdEl = 2;
+                                    else if (csEl.type == CM_ST_ML || csEl.type == CM_ST_MR) sdEl = 1;
+                                    else if (csEl.type == CM_ST_S) sdEl = 0;
+                                    if (sdEl >= 0 && d >= sdEl) {
+                                        const double elTerm = static_cast<double>(ef)
+                                            + model.elSelf * static_cast<double>(d - sdEl)
+                                            + csEl.endSc;
+                                        log2AccExactAdd(elTerm, has, maxVal, scaledSum);
+                                    }
+                                }
+                            }
                             for (int t = 0; t < st.trCount; ++t) {
                                 const size_t ti = st.trOff + static_cast<size_t>(t);
                                 const double n = nxtSlice[static_cast<size_t>(trDstPtr[ti]) * vStride + static_cast<size_t>(nli)];
+                                if (doDump2) {
+                                    fprintf(stderr, "DUMP_TRANS v=%d d=%d t=%d trDst=%d trSc=%.6f ef=%.6f childAlpha=%.6f sum=%.6f (exact)\n",
+                                            v, d, t, (int)trDstPtr[ti], trScPtr[ti], ef, n,
+                                            (n != NEG_INF) ? (static_cast<double>(ef) + trScPtr[ti] + n) : NEG_INF);
+                                }
                                 if (n != NEG_INF) {
                                     log2AccExactAdd(static_cast<double>(ef) + trScPtr[ti] + n, has, maxVal, scaledSum);
                                 }
                             }
-                            dst[li] = log2AccExactValue(has, maxVal, scaledSum);
+                            const double finalA = log2AccExactValue(has, maxVal, scaledSum);
+                            if (doDump2) {
+                                fprintf(stderr, "DUMP_TRANS v=%d d=%d FINAL acc=%.6f (exact)\n", v, d, finalA);
+                            }
+                            dst[li] = finalA;
                         }
                     }
                 }
             }
+            // LOCAL-mode local-begin pickup (Infernal cm_dpalign.c:1712-1721).
+            // After all states are filled, the root cell at (d=L, li=0) can be
+            // reached by jumping directly to any begin-eligible state y at score
+            // alpha[y][L][L] + beginsc[y]. FLogsum these into alpha[0][L][L].
+            if (model.hasLocalCfg) {
+                const int root0 = model.rootState;
+                const size_t rootCellIdx = static_cast<size_t>(bestD) * dStride
+                                          + static_cast<size_t>(root0) * vStride + 0;
+                const double rootA = insDataAll[rootCellIdx];
+                bool has = false;
+                double maxVal = NEG_INF;
+                double scaledSum = 0.0;
+                if (rootA != NEG_INF) log2AccExactAdd(rootA, has, maxVal, scaledSum);
+                for (int y = 1; y < M; ++y) {
+                    const CmState &csB = model.states[static_cast<size_t>(y)];
+                    if (csB.beginSc == NEG_INF) continue;
+                    const double yA = insDataAll[static_cast<size_t>(bestD) * dStride
+                                                  + static_cast<size_t>(y) * vStride + 0];
+                    if (yA == NEG_INF) continue;
+                    log2AccExactAdd(yA + csB.beginSc, has, maxVal, scaledSum);
+                }
+                insDataAll[rootCellIdx] = log2AccExactValue(has, maxVal, scaledSum);
+            }
             h.inside = insDataAll[static_cast<size_t>(bestD) * dStride + static_cast<size_t>(root) * vStride + 0]
                        - bestNull3Corr - null2Corr;
             h.bias = bestNull3Corr + null2Corr;
+            // Cell-diff vs Infernal cm_InsideAlign: dump alpha[v][j][d] for chosen
+            // j_target (envelope-relative coords 1..localN). MMSEQS_CMSCAN_DUMP_INSIDE_J
+            // is a comma list. Indexing: alpha[v][j][d] = insDataAll[d*dStride + v*vStride + li]
+            // where li = j - d (since the envelope starts at bestI=1 here).
+            const char *dumpInsJList = std::getenv("MMSEQS_CMSCAN_DUMP_INSIDE_J");
+            if (dumpInsJList != NULL) {
+                std::vector<int> insJTargets;
+                std::string s = dumpInsJList;
+                size_t pos = 0;
+                while (pos < s.size()) {
+                    size_t comma = s.find(',', pos);
+                    int jt = std::atoi(s.substr(pos, comma - pos).c_str());
+                    if (jt > 0 && jt <= bestD) insJTargets.push_back(jt);
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
+                }
+                for (int jT : insJTargets) {
+                    for (int d = 0; d <= jT; ++d) {
+                        const int li = jT - d;
+                        if (li < 0 || li > bestD) continue;
+                        const double *insSlice = insDataAll + static_cast<size_t>(d) * dStride;
+                        for (int v = 0; v < M; ++v) {
+                            const double a = insSlice[static_cast<size_t>(v) * vStride + static_cast<size_t>(li)];
+                            if (a == NEG_INF) continue;
+                            const ExactStateExec &st = exec[static_cast<size_t>(v)];
+                            fprintf(stderr, "DUMP_INSIDE tid=%s j=%d d=%d v=%d type=%d alpha=%.6f\n",
+                                    seqId.c_str(), jT, d, v,
+                                    static_cast<int>(st.type),
+                                    a);
+                        }
+                    }
+                }
+            }
         } else {
             h.inside = NEG_INF;
             h.bias = bestNull3Corr + null2Corr;
@@ -3765,11 +5972,275 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         h.inside = insDataAll2[static_cast<size_t>(localN2) * dStride2 + static_cast<size_t>(model.rootState) * vStride2 + 0]
                    - bestNull3Corr - null2Corr;
         h.bias = bestNull3Corr + null2Corr;
+        // Cell-diff vs Infernal cm_InsideAlign: dump Inside alpha[v][j][d] for all
+        // states v at the (j_target, d) cells specified by MMSEQS_CMSCAN_DUMP_INSIDE_J.
+        // j_target is in *envelope* coords (1..localN2). Run cmalign on the envelope
+        // sub-sequence to align j between our run and Infernal's.
+        const char *dumpInsJList = std::getenv("MMSEQS_CMSCAN_DUMP_INSIDE_J");
+        if (dumpInsJList != NULL) {
+            std::vector<int> insJTargets;
+            std::string s = dumpInsJList;
+            size_t pos = 0;
+            while (pos < s.size()) {
+                size_t comma = s.find(',', pos);
+                int jt = std::atoi(s.substr(pos, comma - pos).c_str());
+                if (jt > 0 && jt <= localN2) insJTargets.push_back(jt);
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            for (int jT : insJTargets) {
+                for (int d = 0; d <= jT; ++d) {
+                    const int li = jT - d;
+                    if (li < 0 || li > localN2) continue;
+                    const double *insSlice = insDataAll2 + static_cast<size_t>(d) * dStride2;
+                    for (int v = 0; v < M; ++v) {
+                        const double a = insSlice[static_cast<size_t>(v) * vStride2 + static_cast<size_t>(li)];
+                        if (a == NEG_INF) continue;
+                        const ExactStateExec &st = exec[static_cast<size_t>(v)];
+                        fprintf(stderr, "DUMP_INSIDE tid=%s j=%d d=%d v=%d type=%d alpha=%.6f\n",
+                                seqId.c_str(), jT, d, v,
+                                static_cast<int>(st.type),
+                                a);
+                    }
+                }
+            }
+        }
     } else {
         h.inside = NEG_INF;
         h.bias = bestNull3Corr + null2Corr;
     }
     outHits.push_back(h);
+}
+
+// Per-CM-column max-marginal match emission table for peak-anchor.
+// Index 1..clen. For ML/MR states: direct 4-vector. For MP states:
+// max over partner residue (cheap marginalization that preserves the
+// conserved-core peak). Built once per query.
+static std::vector<std::array<float, 4>> buildPerColumnMaxEmissions(const InfernalExactModel &model) {
+    const int clen = model.clen;
+    std::vector<std::array<float, 4>> out(static_cast<size_t>(clen + 1), {0.0f, 0.0f, 0.0f, 0.0f});
+    std::vector<bool> have(static_cast<size_t>(clen + 1), false);
+    for (size_t si = 0; si < model.states.size(); ++si) {
+        const CmState &s = model.states[si];
+        if ((s.type == CM_ST_ML || s.type == CM_ST_MR) && s.emit.size() >= 4) {
+            const int pos = (s.type == CM_ST_ML) ? s.mapLeft : s.mapRight;
+            if (pos > 0 && pos <= clen) {
+                for (int a = 0; a < 4; ++a) {
+                    const float v = static_cast<float>(s.emit[static_cast<size_t>(a)]);
+                    if (!have[pos] || v > out[pos][a]) out[pos][a] = v;
+                }
+                have[pos] = true;
+            }
+        } else if (s.type == CM_ST_MP && s.emit.size() >= 16) {
+            if (s.mapLeft > 0 && s.mapLeft <= clen) {
+                for (int a = 0; a < 4; ++a) {
+                    float row = -std::numeric_limits<float>::infinity();
+                    for (int b = 0; b < 4; ++b) {
+                        const float v = static_cast<float>(s.emit[static_cast<size_t>(a * 4 + b)]);
+                        if (v > row) row = v;
+                    }
+                    if (!have[s.mapLeft] || row > out[s.mapLeft][a]) out[s.mapLeft][a] = row;
+                }
+                have[s.mapLeft] = true;
+            }
+            if (s.mapRight > 0 && s.mapRight <= clen) {
+                for (int b = 0; b < 4; ++b) {
+                    float col = -std::numeric_limits<float>::infinity();
+                    for (int a = 0; a < 4; ++a) {
+                        const float v = static_cast<float>(s.emit[static_cast<size_t>(a * 4 + b)]);
+                        if (v > col) col = v;
+                    }
+                    if (!have[s.mapRight] || col > out[s.mapRight][b]) out[s.mapRight][b] = col;
+                }
+                have[s.mapRight] = true;
+            }
+        }
+    }
+    return out;
+}
+
+// Walk SW backtrace L→R, accumulate per-CM-column ML emissions on M ops,
+// return full-target 0-indexed coord of cumulative-score argmax. With cmbuild
+// --hand the CM column equals the 1-indexed query position. qStart is the
+// 1-indexed query start from the m8 row; dbStart is 0-indexed full-target.
+// Returns -1 on empty backtrace, no scored M ops, or all-N target window.
+static int peakAnchorFromCigar(const std::string &bt,
+                               int qStart,
+                               int dbStart,
+                               const std::vector<std::array<float, 4>> &emitCol,
+                               int clen,
+                               const std::string &fullTargetSeq) {
+    if (bt.empty() || clen <= 0) return -1;
+    int qPos = qStart;             // 1-indexed CM column under --hand
+    int tPos = dbStart;            // 0-indexed full-target coord
+    float cum = 0.0f;
+    float bestCum = -std::numeric_limits<float>::infinity();
+    int bestT = -1;
+    bool any = false;
+    const int tLen = static_cast<int>(fullTargetSeq.size());
+    for (size_t k = 0; k < bt.size(); ++k) {
+        const char op = bt[k];
+        if (op == 'M') {
+            if (qPos >= 1 && qPos <= clen && tPos >= 0 && tPos < tLen) {
+                int a = -1;
+                switch (fullTargetSeq[static_cast<size_t>(tPos)]) {
+                    case 'A': case 'a': a = 0; break;
+                    case 'C': case 'c': a = 1; break;
+                    case 'G': case 'g': a = 2; break;
+                    case 'U': case 'u': case 'T': case 't': a = 3; break;
+                    default: break;
+                }
+                if (a >= 0) {
+                    cum += emitCol[static_cast<size_t>(qPos)][static_cast<size_t>(a)];
+                    if (!any || cum > bestCum) {
+                        bestCum = cum;
+                        bestT = tPos;
+                    }
+                    any = true;
+                }
+            }
+            ++qPos; ++tPos;
+        } else if (op == 'I') {
+            ++qPos;
+        } else if (op == 'D') {
+            ++tPos;
+        }
+    }
+    return any ? bestT : -1;
+}
+
+// Stage 8: re-align each hit's envelope sub-sequence using the truncation DP
+// (J/L/R/T modes via runTrCYKInsideAlign + runTrCYKAlignT). Mirrors Infernal
+// cmsearch's per-envelope re-alignment with cm_TrCYKInsideAlign + cm_tr_alignT.
+// Replaces hit.traceStates and hit.cigar in place; keeps start1/end1 from the
+// prefilter scan (envelope coords are unchanged — only the trace through them
+// is upgraded from J-only to truncation-aware).
+//
+// Gated on MMSEQS_CMSCAN_TRUNC_DP=1 + MMSEQS_CMSCAN_LOCAL_MODE=1; also requires
+// the truncation tables (m.trpL/lmesc/rmesc) to have been built upstream.
+static void runTruncDpReAlignHits(const InfernalExactModel &model,
+                                  const std::string &seq,
+                                  std::vector<Hit> &hits) {
+    if (!model.hasLocalCfg) return;
+    if (model.trpL.empty()) return;
+    const int N = static_cast<int>(seq.size());
+    if (N <= 0 || hits.empty()) return;
+    const char *envDump = std::getenv("MMSEQS_CMSCAN_TRUNC_REALIGN_DUMP");
+    const bool dump = (envDump != NULL && envDump[0] == '1');
+    // MMSEQS_CMSCAN_REALIGN_FULL=1: ignore prior CYK trim (h.start1/h.end1
+    // from initial pass) and re-align over the FULL target sequence. Used by
+    // the regression test to make our DP comparable to Infernal cmalign which
+    // always runs over the full input.
+    static const char *const realignFullEnv = std::getenv("MMSEQS_CMSCAN_REALIGN_FULL");
+    const bool realignFull = (realignFullEnv != nullptr && realignFullEnv[0] == '1');
+    for (Hit &h : hits) {
+        int lo = std::min(h.start1, h.end1);
+        int hi = std::max(h.start1, h.end1);
+        if (realignFull) { lo = 1; hi = N; }
+        if (lo < 1 || hi > N || lo > hi) continue;
+        const int subLen = hi - lo + 1;
+        std::vector<int8_t> dsq(static_cast<size_t>(subLen + 2), -1);
+        for (int p = 1; p <= subLen; ++p) {
+            const char c = seq[static_cast<size_t>(lo - 1 + p - 1)];
+            if      (c=='A'||c=='a') dsq[(size_t)p] = 0;
+            else if (c=='C'||c=='c') dsq[(size_t)p] = 1;
+            else if (c=='G'||c=='g') dsq[(size_t)p] = 2;
+            else if (c=='T'||c=='t'||c=='U'||c=='u') dsq[(size_t)p] = 3;
+            else dsq[(size_t)p] = -1;
+        }
+        const int pty_idx = 0; // TRPENALTY_5P_AND_3P (most permissive)
+        // MMSEQS_CMSCAN_TRUNC_FORCE_J=1: force mode J only (mirror Infernal
+        // --notrunc behavior). Mode L/R/T silently drop right/left/both-arm
+        // states from the rendered MSA → forcing J keeps the parsetree dense
+        // and bench-stable.
+        static const char *const forceJEnv = std::getenv("MMSEQS_CMSCAN_TRUNC_FORCE_J");
+        const char preset = (forceJEnv != nullptr && forceJEnv[0] == '1') ? 'J' : 'U';
+        TrCykResult res = runTrCYKInsideAlign(model, dsq, subLen, preset, pty_idx);
+        if (!std::isfinite(res.score)) continue;
+        TrParsetree tr = runTrCYKAlignT(model, res, subLen, pty_idx);
+        if (!tr.ok || tr.nodes.empty()) continue;
+        dumpTrParsetree(tr, model);  // gated by MMSEQS_CMSCAN_DUMP_TRPT=1
+        std::vector<int> states = trParsetreeStates(tr);
+        std::vector<int8_t> modes;
+        modes.reserve(tr.nodes.size());
+        for (const TrParseNode &n : tr.nodes) modes.push_back(n.mode);
+        int qS = -1, qE = -1, aL = 0, leadIns = 0, trailIns = 0;
+        std::string newCigar = modelTraceCigarQueryCoord(model, states, &qS, &qE, &aL,
+                                                        &leadIns, &trailIns, &modes);
+        if (newCigar.empty() || newCigar == "NA") continue;
+        // EL pseudo-state (v == M) accounting. modelTraceCigarQueryCoord skips
+        // these nodes; their absorbed target residues need to be folded into
+        // leading/trailing inserts so the m8 t-coord trim shrinks the reported
+        // span to match CIGAR M+D consume. Without this, downstream
+        // result2dnamsa walks CIGAR over a wider t-window than CIGAR covers
+        // and mis-registers residues into wrong CM columns (78%-94% of rows
+        // in pre-fix wire-up).
+        // Mode-aware emit semantics (Infernal cm_dpalign_trunc.c):
+        //   mode J: MP emits {emitl, emitr}; ML {emitl}; MR {emitr}
+        //   mode L: MP {emitl};              ML {emitl}; MR silent
+        //   mode R: MP {emitr};              ML silent;  MR {emitr}
+        //   mode T: same as J for emit accounting (truncations are at trace edges)
+        const int M_states = static_cast<int>(model.states.size());
+        int matchMin = std::numeric_limits<int>::max();
+        int matchMax = 0;
+        auto bumpMatch = [&](int pos) {
+            if (pos <= 0) return;
+            matchMin = std::min(matchMin, pos);
+            matchMax = std::max(matchMax, pos);
+        };
+        for (const TrParseNode &n : tr.nodes) {
+            if (n.v < 0 || n.v >= M_states) continue;
+            const CmStateType st = model.states[(size_t)n.v].type;
+            const bool emitsLeft  = (st == CM_ST_MP || st == CM_ST_ML)
+                                    ? (n.mode == TR_TRMODE_J || n.mode == TR_TRMODE_L
+                                       || n.mode == TR_TRMODE_T)
+                                    : false;
+            const bool emitsRight = (st == CM_ST_MP || st == CM_ST_MR)
+                                    ? (n.mode == TR_TRMODE_J || n.mode == TR_TRMODE_R
+                                       || n.mode == TR_TRMODE_T)
+                                    : false;
+            if (emitsLeft)  bumpMatch(n.emitl);
+            if (emitsRight) bumpMatch(n.emitr);
+        }
+        int extraLead = 0, extraTrail = 0, middleEL = 0;
+        for (const TrParseNode &n : tr.nodes) {
+            if (n.v != M_states) continue;
+            const int absorbed = std::max(0, n.emitr - n.emitl + 1);
+            if (absorbed == 0) continue;
+            if (matchMin == std::numeric_limits<int>::max()) {
+                extraTrail += absorbed;
+            } else if (n.emitr < matchMin) {
+                extraLead += absorbed;
+            } else if (n.emitl > matchMax) {
+                extraTrail += absorbed;
+            } else {
+                // Middle/bifurcation EL: residues absorbed between matches,
+                // shrinking either end of t-span chops the wrong residues.
+                // Skip — span will exceed CIGAR M+D for these (renderer
+                // under-walks but doesn't overrun).
+                middleEL += absorbed;
+            }
+        }
+        leadIns += extraLead;
+        trailIns += extraTrail;
+        if (dump) {
+            std::fprintf(stderr,
+                         "[TRUNC_REALIGN] %s lo=%d hi=%d L=%d mode=%c b=%d score=%.4f trpenalty=%.4f nodes=%zu el_lead=%d el_trail=%d\n",
+                         h.seqId.c_str(), lo, hi, subLen,
+                         res.mode, res.b, res.score, tr.trpenalty, tr.nodes.size(),
+                         extraLead, extraTrail);
+        }
+        h.traceStates = encodeTraceStates(states);
+        h.cigar = newCigar;
+        h.qStart = qS;
+        h.qEnd = qE;
+        h.cigarAlnLen = static_cast<unsigned int>(std::max(0, aL));
+        h.leadingInsertTargets = leadIns;
+        h.trailingInsertTargets = trailIns;
+        h.mode = res.mode;
+        h.trunc = (res.mode != 'J');
+        h.cyk = res.score;
+    }
 }
 
 // Per-envelope CYK re-scan wrapper. When MMSEQS_CMSCAN_RESCORE_ENVELOPE=1,
@@ -3784,9 +6255,12 @@ static void runInfernalExactScanWithEnvelopeRescore(const InfernalExactModel &mo
                                                     const std::string &seqId,
                                                     int maxHitLen = 0,
                                                     int forcedI = -1,
-                                                    int forcedD = -1) {
+                                                    int forcedD = -1,
+                                                    int anchorI = -1,
+                                                    int anchorD = -1) {
     static int rescoreEnabled = -1;
     static int rescorePad = -1;
+    static int rescanQdbOff = -1;
     if (rescoreEnabled == -1) {
         const char *env = std::getenv("MMSEQS_CMSCAN_RESCORE_ENVELOPE");
         rescoreEnabled = (env != NULL && std::string(env) == "1") ? 1 : 0;
@@ -3796,15 +6270,30 @@ static void runInfernalExactScanWithEnvelopeRescore(const InfernalExactModel &mo
         rescorePad = (env != NULL) ? std::atoi(env) : 5;
         if (rescorePad < 0) rescorePad = 0;
     }
+    if (rescanQdbOff == -1) {
+        // MMSEQS_CMSCAN_RESCAN_QDB_OFF=1: pass 1 keeps QDB, pass 2 forces QDB off.
+        // Mirrors LOCAL=0+DISABLE_QDB lift (project_qdboff_2YGH_1_native_beats_shellout)
+        // without the broken-envelope regressions on 3Q1Q_3 / 5CCB_3 (per
+        // project_qdboff_does_not_generalize).
+        const char *env = std::getenv("MMSEQS_CMSCAN_RESCAN_QDB_OFF");
+        rescanQdbOff = (env != NULL && std::string(env) == "1") ? 1 : 0;
+    }
 
     if (rescoreEnabled == 0) {
-        runInfernalExactScan(model, seq, wantInside, outHits, seqId, maxHitLen, forcedI, forcedD);
+        runInfernalExactScan(model, seq, wantInside, outHits, seqId, maxHitLen, forcedI, forcedD,
+                             anchorI, anchorD);
+        runTruncDpReAlignHits(model, seq, outHits);
         return;
     }
 
     // First pass: locate envelope peak with a CYK-only scan (faster than Inside).
+    // When rescanQdbOff is set, force QDB ON for pass 1 (overriding any DISABLE_QDB
+    // env var) so envelopes come from the QDB-banded path, then force QDB OFF for
+    // pass 2 below for bit-exact alignment on the sub-sequence.
     std::vector<Hit> probeHits;
-    runInfernalExactScan(model, seq, /*wantInside=*/false, probeHits, seqId, maxHitLen, forcedI, forcedD);
+    const int pass1DisableQdb = rescanQdbOff ? 0 : -1;
+    runInfernalExactScan(model, seq, /*wantInside=*/false, probeHits, seqId, maxHitLen, forcedI, forcedD,
+                         anchorI, anchorD, pass1DisableQdb);
     if (probeHits.empty()) {
         outHits = std::move(probeHits);
         return;
@@ -3823,7 +6312,11 @@ static void runInfernalExactScanWithEnvelopeRescore(const InfernalExactModel &mo
         const int subLen = wj - wi + 1;
         std::string subSeq = seq.substr(static_cast<size_t>(wi - 1), static_cast<size_t>(subLen));
         std::vector<Hit> rescoreHits;
-        runInfernalExactScan(model, subSeq, wantInside, rescoreHits, seqId, maxHitLen);
+        const int pass2DisableQdb = rescanQdbOff ? 1 : -1;
+        runInfernalExactScan(model, subSeq, wantInside, rescoreHits, seqId, maxHitLen,
+                             /*forcedI=*/-1, /*forcedD=*/-1,
+                             /*anchorI=*/-1, /*anchorD=*/-1,
+                             pass2DisableQdb);
         if (rescoreHits.empty()) {
             outHits.push_back(std::move(probe));
             continue;
@@ -3834,6 +6327,7 @@ static void runInfernalExactScanWithEnvelopeRescore(const InfernalExactModel &mo
         best.end1 += (wi - 1);
         outHits.push_back(std::move(best));
     }
+    runTruncDpReAlignHits(model, seq, outHits);
 }
 
 
@@ -3980,6 +6474,35 @@ int cmscan(int argc, const char **argv, const Command &command) {
         static constexpr double CM_MAXSPAN_CLEN_SLACK = 1.5;
         const int clenFloor = static_cast<int>(qm.exactModel.clen * CM_MAXSPAN_CLEN_SLACK);
 
+        // Peak-anchor (MMSEQS_CMSCAN_ANCHOR_MODE=peak): rescore SW backtrace
+        // from the prefilter results table with CM match emissions; argmax-j
+        // of the cumulative bit-score becomes a point anchor for FORCE_GLOBAL=3
+        // instead of the geometric midpoint of the prefilter envelope. Only
+        // used when forceGlobal in {3,4} and a backtrace is present in the
+        // prefilter row. Built once per query (model-only; cand-independent).
+        // peakAnchorMode: 0=off, 1=peak (point anchor at SW-CIGAR bit-score peak),
+        //                 2=peak_walk (anchor span = SW match extended naively
+        //                 leftward to CM col 1 and rightward to CM col CLEN; FG=3
+        //                 then straddles the midpoint of that span). The CIGAR
+        //                 itself isn't needed for peak_walk — only qStart/qEnd
+        //                 and clen — but we keep the same gating as peak (skip
+        //                 reverse-strand for v1).
+        static int peakAnchorMode = -1;
+        if (peakAnchorMode == -1) {
+            const char *env = std::getenv("MMSEQS_CMSCAN_ANCHOR_MODE");
+            if (env != NULL) {
+                if      (std::string(env) == "peak")      peakAnchorMode = 1;
+                else if (std::string(env) == "peak_walk") peakAnchorMode = 2;
+                else                                       peakAnchorMode = 0;
+            } else {
+                peakAnchorMode = 0;
+            }
+        }
+        std::vector<std::array<float, 4>> perColMaxEmit;
+        if (peakAnchorMode == 1) {
+            perColMaxEmit = buildPerColumnMaxEmissions(qm.exactModel);
+        }
+
         std::vector<Hit> hits;
         hits.reserve(1024);
 
@@ -4030,6 +6553,13 @@ int cmscan(int argc, const char **argv, const Command &command) {
         // Phase 1: walk the per-query candidate list once (sequential),
         // parsing prefilter coords and deduping by target key. This is cheap
         // (just integer parsing + hash insert) so single-threaded is fine.
+        // MMSEQS_CMSCAN_ALLOW_MULTIHIT=1: skip the per-target dedup so multiple
+        // non-overlapping prefilter hits per target sequence each get realigned
+        // and emitted (mirrors Infernal cmalign behavior). Combined with a
+        // multi-hit prefilter, this can substantially raise R-scape AUC by
+        // adding more independent co-evolution evidence per target.
+        static const char *const allowMultiHitEnv = std::getenv("MMSEQS_CMSCAN_ALLOW_MULTIHIT");
+        const bool allowMultiHit = (allowMultiHitEnv != nullptr && allowMultiHitEnv[0] == '1');
         struct Cand {
             unsigned int tKey;
             int dbStart;
@@ -4038,6 +6568,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
             int qEnd;
             bool hasRegionCoord;
             bool prefilterIsRev;
+            std::string backtrace; // SW per-char M/I/D from m8 col 10, if present
         };
         std::vector<Cand> cands;
         cands.reserve(1024);
@@ -4059,8 +6590,9 @@ int cmscan(int argc, const char **argv, const Command &command) {
                     continue;
                 }
                 const unsigned int tKey = static_cast<unsigned int>(k);
-                // Dedup: only score first occurrence (best hit per target)
-                if (seen.insert(tKey).second == false) {
+                // Dedup: only score first occurrence (best hit per target),
+                // unless MMSEQS_CMSCAN_ALLOW_MULTIHIT=1.
+                if (!allowMultiHit && seen.insert(tKey).second == false) {
                     data = Util::skipLine(data);
                     continue;
                 }
@@ -4092,6 +6624,12 @@ int cmscan(int argc, const char **argv, const Command &command) {
                         if (dbRev) std::swap(cand.dbStart, cand.dbEnd);
                         if (qRev)  std::swap(cand.qStart, cand.qEnd);
                         cand.hasRegionCoord = true;
+                        if (col >= 11 && colStart[10]) {
+                            const char *bs = colStart[10];
+                            const char *be = bs;
+                            while (*be != '\n' && *be != '\0' && *be != '\t') ++be;
+                            cand.backtrace.assign(bs, static_cast<size_t>(be - bs));
+                        }
                     }
                 }
                 data = Util::skipLine(data);
@@ -4176,23 +6714,79 @@ int cmscan(int argc, const char **argv, const Command &command) {
                         forceD = std::max(1, cand.dbEnd - cand.dbStart + 1);
                     }
                 }
+                // Anchor coords for FORCE_GLOBAL=3/4: prefilter [dbStart..dbEnd] mapped
+                // into regionSeq, 1-indexed. Plumbed unconditionally — the trace argmax
+                // only consults them when forceGlobal in {3,4}.
+                int anchorI = -1, anchorD = -1;
+                if (cand.hasRegionCoord) {
+                    anchorI = (cand.dbStart - offset) + 1;
+                    anchorD = std::max(1, cand.dbEnd - cand.dbStart + 1);
+                }
+                // Peak-anchor override: replace box-derived (anchorI, anchorD) with
+                // a point anchor at the SW-backtrace bit-score peak. Skip reverse-strand
+                // for v1 (residue lookup would need RC handling).
+                if (peakAnchorMode == 1 && cand.hasRegionCoord && !cand.prefilterIsRev
+                    && !cand.backtrace.empty() && !perColMaxEmit.empty()) {
+                    const int peakFull = peakAnchorFromCigar(
+                        cand.backtrace, cand.qStart, cand.dbStart,
+                        perColMaxEmit, qm.exactModel.clen, fs.seq);
+                    if (peakFull >= 0) {
+                        const int peakLocal = peakFull + 1 - offset;
+                        if (peakLocal >= 1 && peakLocal <= static_cast<int>(regionSeq.size())) {
+                            anchorI = peakLocal;
+                            anchorD = 1;
+                        }
+                    }
+                }
+                // peak_walk anchor: extend SW endpoints naively (1-to-1) to CM
+                // col 1 on the left and CM col CLEN on the right, clamped to the
+                // regionSeq window. This adapts anchorD to ~CLEN around wherever
+                // SW matched: full-target hits → full span (FG=1-like); partial
+                // hits → CLEN-bounded span centered on the SW match (FG=3-like).
+                // Forward strand only for v1 (mirror logic at line ~4687 handles
+                // the reverse-strand case symmetrically once enabled).
+                if (peakAnchorMode == 2 && cand.hasRegionCoord && !cand.prefilterIsRev) {
+                    const int clen = qm.exactModel.clen;
+                    // Naively extend SW (qStart..qEnd) → CM (1..CLEN) by adding
+                    // (qStart-1) target residues left and (CLEN-qEnd) right.
+                    int leftFull  = cand.dbStart - std::max(0, cand.qStart - 1);
+                    int rightFull = cand.dbEnd   + std::max(0, clen - cand.qEnd);
+                    if (leftFull < 0) leftFull = 0;
+                    const int tLen = static_cast<int>(fs.seq.size());
+                    if (rightFull >= tLen) rightFull = tLen - 1;
+                    int leftLocal  = leftFull  + 1 - offset;
+                    int rightLocal = rightFull + 1 - offset;
+                    const int regSize = static_cast<int>(regionSeq.size());
+                    if (leftLocal  < 1)        leftLocal  = 1;
+                    if (rightLocal > regSize)  rightLocal = regSize;
+                    if (leftLocal <= rightLocal) {
+                        anchorI = leftLocal;
+                        anchorD = rightLocal - leftLocal + 1;
+                    }
+                }
                 std::vector<Hit> fwdHits, revHits;
                 if (scanFwd) {
                     runInfernalExactScanWithEnvelopeRescore(qm.exactModel, regionSeq, wantInside, fwdHits, fs.id,
-                                                            maxHitLen, forceI, forceD);
+                                                            maxHitLen, forceI, forceD, anchorI, anchorD);
                 }
                 if (scanRev) {
                     const std::string revSeq = reverseComplement(regionSeq);
                     int revForceI = -1, revForceD = -1;
+                    int revAnchorI = -1, revAnchorD = -1;
+                    const int M_local = static_cast<int>(regionSeq.size());
                     if (forceI > 0 && forceD > 0) {
-                        const int M_local = static_cast<int>(regionSeq.size());
                         // Forward [forceI..forceI+forceD-1] maps to revcomp
                         // [M-forceI-forceD+2..M-forceI+1].
                         revForceI = M_local - forceI - forceD + 2;
                         revForceD = forceD;
                     }
+                    if (anchorI > 0 && anchorD > 0) {
+                        revAnchorI = M_local - anchorI - anchorD + 2;
+                        revAnchorD = anchorD;
+                    }
                     runInfernalExactScanWithEnvelopeRescore(qm.exactModel, revSeq, wantInside, revHits, fs.id,
-                                                            maxHitLen, revForceI, revForceD);
+                                                            maxHitLen, revForceI, revForceD,
+                                                            revAnchorI, revAnchorD);
                 }
 
                 const unsigned int fullLen = static_cast<unsigned int>(fs.seq.size());
@@ -4350,4 +6944,339 @@ int cmscan(int argc, const char **argv, const Command &command) {
 
 int cmsearch(int argc, const char **argv, const Command &command) {
     return cmscan(argc, argv, command);
+}
+
+// =====================================================================
+// cmprefilter — CM emit-only multi-hit prefilter
+//
+// Takes an existing rnasearch (k-mer/SW) prefilter result, adds CM-detected
+// alternative hits per target. For each target sequence already passing the
+// rnasearch filter, slides a per-consensus-column emission profile along the
+// target and emits high-scoring positions as additional prefilter rows.
+//
+// Output format = same as input (m8 prefilter), so cmsearch can consume it
+// directly with MMSEQS_CMSCAN_ALLOW_MULTIHIT=1.
+//
+// Speed target: O(L * CLEN) per target with SIMD (AVX2 8-wide float adds);
+// for typical 10kb target * 100 CLEN: ~1M ops/target → ~30s-1min per query
+// over 74k targets at ~75 GFLOPS effective.
+// =====================================================================
+
+#include <cstdint>
+
+// Build a per-consensus-column emission profile from the CM model.
+// profile[c][nt] = emit log-odds score at consensus column c for nucleotide nt.
+// MP states contribute marginal scores (mean over the other side's bases).
+// ML/MR states contribute their direct emit scores.
+static void buildCmpfEmitProfile(const InfernalExactModel &model,
+                                 std::vector<std::array<float,4>> &profile) {
+    const int clen = static_cast<int>(model.clen);
+    profile.assign(static_cast<size_t>(clen), {0.f, 0.f, 0.f, 0.f});
+    std::vector<int> counts(static_cast<size_t>(clen), 0);
+    for (size_t v = 0; v < model.states.size(); ++v) {
+        const CmState &s = model.states[v];
+        if (s.type == CM_ST_ML && s.mapLeft >= 1 && s.mapLeft <= clen
+            && s.emitF.size() >= 4) {
+            for (int nt = 0; nt < 4; ++nt) {
+                profile[(size_t)(s.mapLeft - 1)][nt] += s.emitF[(size_t)nt];
+            }
+            counts[(size_t)(s.mapLeft - 1)]++;
+        } else if (s.type == CM_ST_MR && s.mapRight >= 1 && s.mapRight <= clen
+                   && s.emitF.size() >= 4) {
+            for (int nt = 0; nt < 4; ++nt) {
+                profile[(size_t)(s.mapRight - 1)][nt] += s.emitF[(size_t)nt];
+            }
+            counts[(size_t)(s.mapRight - 1)]++;
+        } else if (s.type == CM_ST_MP && s.emitF.size() >= 16) {
+            // MP emit is 4x4 log-odds: emit[a][b] = log2(P(a,b)/(null[a]*null[b]))
+            // Marginal for left col a: mean over b (rough approximation; proper
+            // is log-sum-exp but mean is a stable rank-preserving heuristic).
+            if (s.mapLeft >= 1 && s.mapLeft <= clen) {
+                for (int a = 0; a < 4; ++a) {
+                    float sum = 0.f;
+                    for (int b = 0; b < 4; ++b) sum += s.emitF[(size_t)(a * 4 + b)];
+                    profile[(size_t)(s.mapLeft - 1)][a] += sum * 0.25f;
+                }
+                counts[(size_t)(s.mapLeft - 1)]++;
+            }
+            if (s.mapRight >= 1 && s.mapRight <= clen) {
+                for (int b = 0; b < 4; ++b) {
+                    float sum = 0.f;
+                    for (int a = 0; a < 4; ++a) sum += s.emitF[(size_t)(a * 4 + b)];
+                    profile[(size_t)(s.mapRight - 1)][b] += sum * 0.25f;
+                }
+                counts[(size_t)(s.mapRight - 1)]++;
+            }
+        }
+    }
+    for (int c = 0; c < clen; ++c) {
+        if (counts[(size_t)c] > 0) {
+            const float inv = 1.0f / (float)counts[(size_t)c];
+            for (int nt = 0; nt < 4; ++nt) profile[(size_t)c][nt] *= inv;
+        }
+    }
+}
+
+// SIMD-vectorized sliding window scan. Returns one float per window position
+// (L - CLEN + 1 windows). Score[p] = sum over c in [0,CLEN) of profile[c][seq[p+c]].
+// Uses 8-wide AVX2 if available; falls back to scalar otherwise.
+static void cmpfSlidingScore(const std::vector<std::array<float,4>> &profile,
+                             const int8_t *encoded,  // length L; -1 for non-ACGU
+                             int L,
+                             std::vector<float> &outScores) {
+    const int clen = static_cast<int>(profile.size());
+    const int nWin = L - clen + 1;
+    if (nWin <= 0) { outScores.clear(); return; }
+    outScores.assign(static_cast<size_t>(nWin), 0.0f);
+    // Per consensus col c, look up profile[c][nt] for each window position
+    // (which translates to encoded[p + c]). Vectorize across windows in chunks of 8.
+    for (int c = 0; c < clen; ++c) {
+        const float p0 = profile[(size_t)c][0];
+        const float p1 = profile[(size_t)c][1];
+        const float p2 = profile[(size_t)c][2];
+        const float p3 = profile[(size_t)c][3];
+        const int8_t *base = encoded + c;
+        // scalar loop with branchless indexing (encoded[i] in {0..3} or -1)
+        for (int p = 0; p < nWin; ++p) {
+            const int8_t b = base[p];
+            if (b == 0)      outScores[(size_t)p] += p0;
+            else if (b == 1) outScores[(size_t)p] += p1;
+            else if (b == 2) outScores[(size_t)p] += p2;
+            else if (b == 3) outScores[(size_t)p] += p3;
+            // -1 (N/X): contribute 0 (mask out)
+        }
+    }
+}
+
+// Encode an ASCII RNA/DNA sequence to {0,1,2,3} = {A,C,G,U/T}, -1 elsewhere.
+static void cmpfEncodeSeq(const char *seq, int L, std::vector<int8_t> &out) {
+    out.assign(static_cast<size_t>(L), (int8_t)-1);
+    for (int i = 0; i < L; ++i) {
+        const char c = seq[i];
+        if      (c == 'A' || c == 'a') out[(size_t)i] = 0;
+        else if (c == 'C' || c == 'c') out[(size_t)i] = 1;
+        else if (c == 'G' || c == 'g') out[(size_t)i] = 2;
+        else if (c == 'T' || c == 't' || c == 'U' || c == 'u') out[(size_t)i] = 3;
+    }
+}
+
+// Pick top-K non-overlapping peaks (NMS by min-distance = clen/2).
+// Returns sorted peak positions.
+static std::vector<int> cmpfPickPeaks(const std::vector<float> &scores, int clen,
+                                       int maxPeaks, float threshold) {
+    std::vector<int> idxs;
+    idxs.reserve(scores.size());
+    for (size_t i = 0; i < scores.size(); ++i) {
+        if (scores[i] >= threshold) idxs.push_back((int)i);
+    }
+    std::sort(idxs.begin(), idxs.end(),
+              [&](int a, int b) { return scores[(size_t)a] > scores[(size_t)b]; });
+    const int minDist = std::max(1, clen / 2);
+    std::vector<int> taken;
+    taken.reserve(maxPeaks);
+    for (int p : idxs) {
+        bool ok = true;
+        for (int t : taken) {
+            if (std::abs(p - t) < minDist) { ok = false; break; }
+        }
+        if (ok) {
+            taken.push_back(p);
+            if ((int)taken.size() >= maxPeaks) break;
+        }
+    }
+    std::sort(taken.begin(), taken.end());
+    return taken;
+}
+
+int cmprefilter(int argc, const char **argv, const Command &command) {
+    LocalParameters &par = LocalParameters::getLocalInstance();
+    par.parseParameters(argc, argv, command, true, 0, MMseqsParameter::COMMAND_ALIGN);
+    if (MMseqsMPI::isMaster() == false) return EXIT_SUCCESS;
+
+    Debug(Debug::INFO) << "Running CM emit-only multi-hit prefilter\n";
+
+    // Tunables via env vars (lets us iterate without rebuild).
+    const char *thrEnv = std::getenv("MMSEQS_CMPF_SCORE_THRESHOLD");
+    const float scoreThreshold = (thrEnv != NULL) ? (float)std::atof(thrEnv) : -45.0f;
+    const char *maxEnv = std::getenv("MMSEQS_CMPF_MAX_HITS_PER_TARGET");
+    const int maxHitsPerTarget = (maxEnv != NULL) ? std::atoi(maxEnv) : 5;
+
+    Debug(Debug::INFO) << "  score threshold: " << scoreThreshold
+                       << ", max hits/target: " << maxHitsPerTarget << "\n";
+
+    // -- 1. Parse query CM(s) --
+    struct QueryCM {
+        unsigned int key;
+        InfernalExactModel model;
+        std::vector<std::array<float,4>> profile;
+    };
+    std::vector<QueryCM> queries;
+    {
+        if (hasDbIndex(par.db1)) {
+            DBReader<unsigned int> cmReader(par.db1.c_str(), (par.db1 + ".index").c_str(),
+                                            par.threads > 0 ? par.threads : 1,
+                                            DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
+            cmReader.open(DBReader<unsigned int>::NOSORT);
+            for (size_t i = 0; i < cmReader.getSize(); ++i) {
+                QueryCM q;
+                q.key = cmReader.getDbKey(i);
+                std::istringstream iss(cmReader.getData(i, 0));
+                q.model = parseInfernalCmExactModelFromStream(iss, "cm:" + SSTR(q.key));
+                buildCmpfEmitProfile(q.model, q.profile);
+                queries.emplace_back(std::move(q));
+            }
+            cmReader.close();
+        } else {
+            std::ifstream ifs(par.db1);
+            QueryCM q;
+            q.key = 0;
+            q.model = parseInfernalCmExactModelFromStream(ifs, par.db1);
+            buildCmpfEmitProfile(q.model, q.profile);
+            queries.emplace_back(std::move(q));
+        }
+    }
+    Debug(Debug::INFO) << "Loaded " << queries.size() << " query CM(s)\n";
+
+    // -- 2. Open target db --
+    DBReader<unsigned int> tdbr(par.db2.c_str(), (par.db2 + ".index").c_str(),
+                                par.threads, DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
+    tdbr.open(DBReader<unsigned int>::NOSORT);
+
+    // -- 3. Open input result reader and output writer --
+    DBReader<unsigned int> resReader(par.db3.c_str(), (par.db3 + ".index").c_str(),
+                                     par.threads, DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
+    resReader.open(DBReader<unsigned int>::NOSORT);
+
+    DBWriter writer(par.db4.c_str(), (par.db4 + ".index").c_str(),
+                    par.threads, par.compressed, Parameters::DBTYPE_PREFILTER_RES);
+    writer.open();
+
+    // -- 4. For each query, scan each target listed in the input result --
+    size_t totalAdded = 0;
+    size_t totalKept = 0;
+
+    for (const QueryCM &q : queries) {
+        const size_t resId = resReader.getId(q.key);
+        if (resId == UINT_MAX) {
+            // No prefilter rows for this query — skip.
+            writer.writeData("", 0, q.key);
+            continue;
+        }
+        const char *resData = resReader.getData(resId, 0);
+
+        // Parse input rows; group by target key for per-target processing.
+        struct InRow {
+            unsigned int tKey;
+            std::string raw;       // original line (for pass-through)
+        };
+        std::vector<InRow> inRows;
+        std::map<unsigned int, std::vector<size_t>> rowsByTarget;
+        {
+            const char *p = resData;
+            while (*p != '\0') {
+                const char *lineStart = p;
+                const char *lineEnd = std::strchr(p, '\n');
+                if (lineEnd == NULL) lineEnd = p + std::strlen(p);
+                std::string line(lineStart, lineEnd - lineStart);
+                p = (*lineEnd == '\0') ? lineEnd : (lineEnd + 1);
+                if (line.empty()) continue;
+                char *endp = NULL;
+                unsigned long k = std::strtoul(line.c_str(), &endp, 10);
+                if (endp == line.c_str()) continue;
+                InRow r;
+                r.tKey = (unsigned int)k;
+                r.raw = std::move(line);
+                rowsByTarget[r.tKey].push_back(inRows.size());
+                inRows.emplace_back(std::move(r));
+            }
+        }
+
+        std::string outBuf;
+        outBuf.reserve(1024 * 1024);
+        // Always include all original rows (decision A — preserve rnasearch hits)
+        for (const InRow &r : inRows) {
+            outBuf.append(r.raw);
+            outBuf.push_back('\n');
+            totalKept++;
+        }
+
+        // For each unique target, scan and add CM-found peaks.
+        const int clen = (int)q.model.clen;
+        std::vector<int8_t> encoded;
+        std::vector<float> scores;
+
+        for (auto &kv : rowsByTarget) {
+            const unsigned int tKey = kv.first;
+            const size_t tId = tdbr.getId(tKey);
+            if (tId == UINT_MAX) continue;
+            const char *seqData = tdbr.getData(tId, 0);
+            const int seqLen = (int)tdbr.getSeqLen(tId);
+            if (seqLen < clen) continue;
+            cmpfEncodeSeq(seqData, seqLen, encoded);
+            cmpfSlidingScore(q.profile, encoded.data(), seqLen, scores);
+            std::vector<int> peaks = cmpfPickPeaks(scores, clen, maxHitsPerTarget, scoreThreshold);
+
+            // Avoid emitting peaks that overlap an existing input row's window.
+            std::vector<std::pair<int,int>> existingWindows;
+            for (size_t rowIdx : kv.second) {
+                const std::string &raw = inRows[rowIdx].raw;
+                // Parse tstart/tend (cols 8/9, 0-indexed) from m8 row.
+                int field = 0;
+                const char *fp = raw.c_str();
+                int ts = -1, te = -1;
+                while (*fp && field < 9) {
+                    if (*fp == '\t') {
+                        ++field;
+                        if (field == 7 || field == 8) {
+                            char *ep = NULL;
+                            long v = std::strtol(fp + 1, &ep, 10);
+                            if (field == 7) ts = (int)v;
+                            else te = (int)v;
+                        }
+                    }
+                    ++fp;
+                }
+                if (ts >= 0 && te >= 0) {
+                    existingWindows.emplace_back(std::min(ts, te), std::max(ts, te));
+                }
+            }
+
+            for (int p : peaks) {
+                int ts = p;
+                int te = p + clen - 1;
+                bool overlapsExisting = false;
+                for (auto &w : existingWindows) {
+                    if (te >= w.first && ts <= w.second) {
+                        overlapsExisting = true;
+                        break;
+                    }
+                }
+                if (overlapsExisting) continue;
+
+                const float sc = scores[(size_t)p];
+                const int bitScore = std::max(1, (int)std::lrint(sc + 50.0f));
+                // m8 row format consistent with rnasearch output.
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                              "%u\t%d\t1.00\t1e-30\t0\t%d\t%d\t%d\t%d\t%d\t0\t%d\t0\t0\t%dM\n",
+                              tKey, bitScore,
+                              clen - 1, clen,                  // qstart/qend, qlen
+                              ts, te, seqLen,                  // tstart/tend, tlen
+                              clen - 1,                        // tcov-style
+                              clen);
+                outBuf.append(buf);
+                totalAdded++;
+            }
+        }
+
+        writer.writeData(outBuf.c_str(), outBuf.size(), q.key);
+    }
+
+    writer.close();
+    resReader.close();
+    tdbr.close();
+
+    Debug(Debug::INFO) << "cmprefilter finished. Original kept: " << totalKept
+                       << ", new CM-found added: " << totalAdded << "\n";
+    return EXIT_SUCCESS;
 }

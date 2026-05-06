@@ -61,6 +61,7 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     const unsigned int maxAccept = static_cast<unsigned int>(par.maxAccept);
     const unsigned int maxReject = static_cast<unsigned int>(par.maxRejected);
     const float correlationScoreWeight = par.correlationScoreWeight;
+    const int altAlignment = par.altAlignment;  // # of alternative alignments per target
 
     // Realignment parameters
     const bool realign = par.realign;
@@ -342,6 +343,42 @@ int rnaalign(int argc, const char **argv, const Command &command) {
                         passedNum++;
                         totalPassedNum++;
                         rejected = 0;
+
+                        // Alternative alignments — mask matched TARGET region with X
+                        // and re-run the matcher up to altAlignment times to find
+                        // additional non-overlapping hits in the same target.
+                        // Mirrors lib/mmseqs/src/alignment/Alignment.cpp:590-599.
+                        if (altAlignment > 0 && !isIdentity
+                            && res.dbStartPos >= 0 && res.dbEndPos > res.dbStartPos) {
+                            const unsigned char xIndex = subMat.aa2num[static_cast<int>('X')];
+                            // Mask the just-matched region of dbSeq.numSequence
+                            const int dbLen = dbSeq.L;
+                            int p0 = std::max(0, res.dbStartPos);
+                            int p1 = std::min(dbLen, res.dbEndPos);
+                            for (int p = p0; p < p1; ++p) {
+                                dbSeq.numSequence[p] = xIndex;
+                            }
+                            for (int altIdx = 0; altIdx < altAlignment; ++altIdx) {
+                                RnaMatcher::result_t altRes = matcher.getSWResult(
+                                    &dbSeq, INT_MAX, isReverse, covMode, covThr,
+                                    evalThr, swMode, seqIdMode, isIdentity, false, reverse);
+                                if (!checkCriteria(altRes, isIdentity, evalThr,
+                                                   seqIdThr, alnLenThr, covMode, covThr)) {
+                                    break;
+                                }
+                                if (altRes.dbStartPos < 0 || altRes.dbEndPos <= altRes.dbStartPos) {
+                                    break;
+                                }
+                                swResults.emplace_back(altRes);
+                                passedNum++;
+                                totalPassedNum++;
+                                int ap0 = std::max(0, altRes.dbStartPos);
+                                int ap1 = std::min(dbLen, altRes.dbEndPos);
+                                for (int p = ap0; p < ap1; ++p) {
+                                    dbSeq.numSequence[p] = xIndex;
+                                }
+                            }
+                        }
                     } else {
                         rejected++;
                     }
