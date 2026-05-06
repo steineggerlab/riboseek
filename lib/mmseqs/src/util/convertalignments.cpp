@@ -246,7 +246,8 @@ int convertalignments(int argc, const char **argv, const Command &command) {
     EvalueComputation *evaluer = NULL;
     bool queryProfile = false;
     bool targetProfile = false;
-    const Sequence::SeqAuxInfo *auxInfo = needSequenceDB ? Sequence::getAuxInfo(tDbr->sequenceReader->getDbtype()) : NULL;
+    const Sequence::SeqAuxInfo *auxInfo = needSequenceDB ? Sequence::getAuxInfo(qDbr.sequenceReader->getDbtype()) : NULL;
+    bool isGpuDb = (DBReader<unsigned int>::getExtendedDbtype(tDbr->sequenceReader->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU);
     const unsigned char *num2outputnum = (auxInfo != NULL) ? auxInfo->num2outputnum : NULL;
     if (needSequenceDB) {
         queryProfile = Parameters::isEqualDbtype(qDbr.sequenceReader->getDbtype(), Parameters::DBTYPE_HMM_PROFILE);
@@ -485,6 +486,12 @@ int convertalignments(int argc, const char **argv, const Command &command) {
                                     size_t targetEntryLen = tDbr->sequenceReader->getEntryLen(tId);
                                     Sequence::extractProfileConsensus(targetSeqData, targetEntryLen, *subMat, targetProfData);
                                 }
+                                #ifdef RIBOSEEK
+                                // If the DB is a GPU db, get uncompressed sequence data
+                                if (DBReader<unsigned int>::getExtendedDbtype(tDbr->sequenceReader->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU) {
+                                    targetSeqData = tDbr->sequenceReader->getDataUncompressed(tId);
+                                }
+                                #endif
                             }
                             for(size_t i = 0; i < outcodes.size(); i++) {
                                 switch (outcodes[i]) {
@@ -556,7 +563,12 @@ int convertalignments(int argc, const char **argv, const Command &command) {
                                             result.append(targetProfData.c_str(), res.dbLen);
                                         } else if (num2outputnum != NULL) {
                                             for (int pos = 0; pos < res.dbLen; pos++) {
-                                                result.push_back(subMat->num2aa[num2outputnum[subMat->aa2num[(unsigned char)targetSeqData[pos]]]]);
+                                                // If it is GPU db, don't do aa2num
+                                                if (isGpuDb) {
+                                                    result.push_back(subMat->num2aa[num2outputnum[static_cast<int>(targetSeqData[pos])]]);
+                                                } else {
+                                                    result.push_back(subMat->num2aa[num2outputnum[subMat->aa2num[(unsigned char)targetSeqData[pos]]]]);
+                                                }
                                             }
                                         } else {
                                             result.append(targetSeqData, res.dbLen);
