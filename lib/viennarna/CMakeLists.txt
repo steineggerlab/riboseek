@@ -9,6 +9,177 @@ if(NOT EXISTS "${VRNA_SRC_DIR}/fold_compound.c")
     return()
 endif()
 
+# ---------------------------------------------------------------------------
+# Codegen: turn ViennaRNA's data files (.par/.json/.data/.ps/.svg) into the
+# .hex byte-arrays + the four umbrella .h headers that the C sources include.
+# Replaces the autotools step that's normally driven by configure+xxd.
+# Output is fully arch-independent (xxd hex dumps of text data).
+# ---------------------------------------------------------------------------
+find_program(XXD_EXECUTABLE xxd)
+if(NOT XXD_EXECUTABLE)
+    message(FATAL_ERROR
+        "xxd not found — required to generate ViennaRNA .hex headers. "
+        "Install it (Debian/Ubuntu: 'sudo apt install xxd'; "
+        "macOS: ships with vim).")
+endif()
+
+set(VRNA_MISC_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/ViennaRNA/misc")
+set(VRNA_STATIC_DIR  "${VRNA_SRC_DIR}/static")
+set(VRNA_PS_DIR      "${VRNA_STATIC_DIR}/postscript")
+set(VRNA_SVG_DIR     "${VRNA_STATIC_DIR}/svg")
+set(VRNA_HEX_DIR     "${VRNA_STATIC_DIR}/misc")
+
+# Source basenames (without extension) that are baked into each header.
+# Order matters: must match the #include order ViennaRNA expects.
+set(VRNA_PARAM_NAMES
+    dna_mathews1999
+    dna_mathews2004
+    rna_andronescu2007
+    rna_langdon2018
+    rna_misc_special_hairpins
+    rna_turner1999
+    rna_turner2004)
+
+set(VRNA_RNA_MOD_NAMES
+    rna_mod_7DA_parameters
+    rna_mod_inosine_parameters
+    rna_mod_m6A_parameters
+    rna_mod_pseudouridine_parameters
+    rna_mod_purine_parameters
+    rna_mod_dihydrouridine_parameters)
+
+set(VRNA_PROBING_NAMES
+    prior_probing_1M7_paired
+    prior_probing_1M7_unpaired
+    prior_probing_DMS_paired
+    prior_probing_DMS_unpaired)
+
+set(VRNA_PS_NAMES
+    structure_plot_macro_base
+    structure_plot_macro_extras
+    dot_plot_macro_base
+    dot_plot_macro_turn
+    dot_plot_macro_sd
+    dot_plot_macro_ud
+    dot_plot_macro_sc_motifs
+    dot_plot_macro_linear_data
+    aln_macro_base)
+
+set(VRNA_SVG_NAMES
+    structure_plot_header
+    structure_plot_footer)
+
+# Helper: emit a custom_command that produces ${out} from ${in} via xxd -i + null terminator.
+function(vrna_xxd_hex in out)
+    get_filename_component(_outdir "${out}" DIRECTORY)
+    add_custom_command(
+        OUTPUT  "${out}"
+        DEPENDS "${in}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${_outdir}"
+        COMMAND sh -c "'${XXD_EXECUTABLE}' -i < '${in}' > '${out}' && echo ',0x00' >> '${out}'"
+        COMMENT "xxd -i ${in} -> ${out}"
+        VERBATIM)
+endfunction()
+
+set(VRNA_GENERATED_FILES "")
+
+# .par -> static/misc/<n>.hex
+foreach(_n ${VRNA_PARAM_NAMES})
+    vrna_xxd_hex("${VRNA_MISC_DIR}/${_n}.par" "${VRNA_HEX_DIR}/${_n}.hex")
+    list(APPEND VRNA_GENERATED_FILES "${VRNA_HEX_DIR}/${_n}.hex")
+endforeach()
+
+# .json (rna_mod_*) -> static/misc/<n>.hex
+foreach(_n ${VRNA_RNA_MOD_NAMES})
+    vrna_xxd_hex("${VRNA_MISC_DIR}/${_n}.json" "${VRNA_HEX_DIR}/${_n}.hex")
+    list(APPEND VRNA_GENERATED_FILES "${VRNA_HEX_DIR}/${_n}.hex")
+endforeach()
+
+# .data (probing priors) -> static/misc/<n>.hex
+foreach(_n ${VRNA_PROBING_NAMES})
+    vrna_xxd_hex("${VRNA_MISC_DIR}/${_n}.data" "${VRNA_HEX_DIR}/${_n}.hex")
+    list(APPEND VRNA_GENERATED_FILES "${VRNA_HEX_DIR}/${_n}.hex")
+endforeach()
+
+# .ps -> static/<n>.hex (note: .h includes them with no subdir)
+foreach(_n ${VRNA_PS_NAMES})
+    vrna_xxd_hex("${VRNA_PS_DIR}/${_n}.ps" "${VRNA_STATIC_DIR}/${_n}.hex")
+    list(APPEND VRNA_GENERATED_FILES "${VRNA_STATIC_DIR}/${_n}.hex")
+endforeach()
+
+# .svg -> static/<n>.hex
+foreach(_n ${VRNA_SVG_NAMES})
+    vrna_xxd_hex("${VRNA_SVG_DIR}/${_n}.svg" "${VRNA_STATIC_DIR}/${_n}.hex")
+    list(APPEND VRNA_GENERATED_FILES "${VRNA_STATIC_DIR}/${_n}.hex")
+endforeach()
+
+# Build the four umbrella headers. Their structure is content-stable —
+# one `static const unsigned char NAME[] = { #include "X.hex" };` block per
+# entry — so we synthesize them from the basename lists above.
+function(vrna_emit_header out_path guard prefix include_subdir cdecl_type names_var)
+    set(_body "#ifndef ${guard}\n#define ${guard}\n\n")
+    foreach(_n ${${names_var}})
+        if(include_subdir)
+            set(_inc "${include_subdir}/${_n}.hex")
+        else()
+            set(_inc "${_n}.hex")
+        endif()
+        string(APPEND _body
+            "static const ${cdecl_type} ${prefix}${_n}[] = {\n"
+            "#include \"${_inc}\"\n"
+            "};\n\n")
+    endforeach()
+    string(APPEND _body "#endif\n")
+    file(WRITE "${out_path}.tmp" "${_body}")
+    # Only overwrite if changed, so we don't trigger unnecessary rebuilds
+    execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
+        "${out_path}.tmp" "${out_path}"
+        RESULT_VARIABLE _diff
+        OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _diff EQUAL 0)
+        file(RENAME "${out_path}.tmp" "${out_path}")
+    else()
+        file(REMOVE "${out_path}.tmp")
+    endif()
+endfunction()
+
+# energy_parameter_sets.h: combines params + rna_mod sets
+set(VRNA_ENERGY_HEADER_NAMES ${VRNA_PARAM_NAMES} ${VRNA_RNA_MOD_NAMES})
+vrna_emit_header(
+    "${VRNA_STATIC_DIR}/energy_parameter_sets.h"
+    "VIENNA_RNA_PACKAGE_ENERGY_PARAMETER_SETS_H"
+    "parameter_set_"
+    "misc"
+    "unsigned char"
+    VRNA_ENERGY_HEADER_NAMES)
+
+vrna_emit_header(
+    "${VRNA_STATIC_DIR}/probing_data_priors.h"
+    "VIENNA_RNA_PACKAGE_PROBING_DATA_PRIORS_H"
+    "probing_data_"
+    "misc"
+    "unsigned char"
+    VRNA_PROBING_NAMES)
+
+vrna_emit_header(
+    "${VRNA_STATIC_DIR}/templates_postscript.h"
+    "VIENNA_RNA_PACKAGE_PLOT_PS_TEMPLATES_H"
+    "PS_"
+    ""
+    "unsigned char"
+    VRNA_PS_NAMES)
+
+vrna_emit_header(
+    "${VRNA_STATIC_DIR}/templates_svg.h"
+    "VIENNA_RNA_PACKAGE_PLOT_SVG_TEMPLATES_H"
+    "SVG_"
+    ""
+    "char"
+    VRNA_SVG_NAMES)
+
+# Custom target that bundles all .hex generation; sources will depend on it.
+add_custom_target(viennarna_static_headers DEPENDS ${VRNA_GENERATED_FILES})
+
 # Core sources (from Makefile.am libRNA_conv_la_SOURCES)
 set(VRNA_CONV_SOURCES
     ${VRNA_SRC_DIR}/fold_compound.c
@@ -326,3 +497,6 @@ target_compile_definitions(viennarna PRIVATE
     HAVE_CONFIG_H
     VRNA_WITH_NAVIEW_LAYOUT
 )
+
+# Ensure the .hex byte arrays are generated before any source compiles
+add_dependencies(viennarna viennarna_static_headers)
