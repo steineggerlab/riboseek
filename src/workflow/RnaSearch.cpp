@@ -47,6 +47,10 @@ int rnasearch(int argc, const char **argv, const Command &command) {
                         MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_PREFILTER);
 
     std::string indexStr = PrefilteringIndexReader::searchForIndex(par.db2);
+    const bool targetGpuDb =
+        (DBReader<unsigned int>::getExtendedDbtype(FileUtil::parseDbType(par.db2.c_str()))
+         & Parameters::DBTYPE_EXTENDED_GPU) != 0;
+    const bool gpuWorkflow = (par.gpu == 1) || targetGpuDb;
 
     // RNA always uses both strands; mark as set so result2profile inherits --strand 2
     par.strand = 2;
@@ -72,13 +76,13 @@ int rnasearch(int argc, const char **argv, const Command &command) {
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
     cmd.addVariable("THREADS_COMP_PAR", par.createParameterString(par.threadsandcompression).c_str());
     cmd.addVariable("VERB_COMP_PAR", par.createParameterString(par.verbandcompression).c_str());
-    cmd.addVariable("GPU", par.gpu ? "TRUE" : NULL);
+    cmd.addVariable("GPU", targetGpuDb ? "TRUE" : NULL);
 
     // RNA always uses rnaalign
     cmd.addVariable("ALIGN_MODULE", "rnaalign");
 
     // GPU can only use the ungapped prefilter
-    if (par.gpu == 1 && par.PARAM_PREF_MODE.wasSet == false) {
+    if (gpuWorkflow && par.PARAM_PREF_MODE.wasSet == false) {
         if (par.numIterations > 1
             || par.alignmentMode != Parameters::ALIGNMENT_MODE_SCORE_ONLY
             || par.altAlignment > 0

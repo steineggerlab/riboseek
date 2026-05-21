@@ -50,6 +50,61 @@ static inline char normalizeBase(char c) {
     return c;
 }
 
+static int effectiveDecodeSeqType(int dbtype, bool useDinucMapping) {
+    if (!useDinucMapping) {
+        return dbtype;
+    }
+    unsigned int ext = DBReader<unsigned int>::getExtendedDbtype(dbtype);
+    ext |= Parameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
+    if (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_HMM_PROFILE)) {
+        return DBReader<unsigned int>::setExtendedDbtype(dbtype, ext);
+    }
+    return DBReader<unsigned int>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, ext);
+}
+
+static std::string decodeMappedSequenceToRna(const Sequence &seq,
+                                             const SubstitutionMatrix &subMat,
+                                             const unsigned char *num2outputnum) {
+    std::string out;
+    out.reserve(static_cast<size_t>(seq.L));
+    for (int i = 0; i < seq.L; ++i) {
+        unsigned char code = seq.numSequence[i];
+        if (num2outputnum != NULL) {
+            code = num2outputnum[code];
+        }
+        char c = normalizeBase(subMat.num2aa[code]);
+        if (c != 'A' && c != 'C' && c != 'G' && c != 'U') {
+            c = 'N';
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+static std::string decodeDbSequence(DBReader<unsigned int> &dbr,
+                                    size_t id,
+                                    unsigned int threadIdx,
+                                    Sequence &mapper,
+                                    bool useDinucMapping,
+                                    bool isGpuDb,
+                                    const SubstitutionMatrix &subMat) {
+    const unsigned int seqLen = dbr.getSeqLen(id);
+    if (isGpuDb) {
+        const unsigned char *data =
+            reinterpret_cast<const unsigned char *>(dbr.getDataUncompressed(id));
+        mapper.mapSequence(id, dbr.getDbKey(id), std::make_pair(data, seqLen));
+    } else {
+        const char *data = dbr.getData(id, threadIdx);
+        mapper.mapSequence(id, dbr.getDbKey(id), data, seqLen);
+    }
+
+    const Sequence::SeqAuxInfo *auxInfo = Sequence::getAuxInfo(mapper.getSeqType());
+    const unsigned char *num2outputnum = (useDinucMapping && auxInfo != NULL)
+        ? auxInfo->num2outputnum
+        : NULL;
+    return decodeMappedSequenceToRna(mapper, subMat, num2outputnum);
+}
+
 static inline void convertTsToUs(std::string &seq) {
     for (size_t i = 0; i < seq.size(); ++i) {
         if (seq[i] == 'T') seq[i] = 'U';
@@ -176,6 +231,10 @@ int cmbuild(int argc, const char **argv, const Command &command) {
     // --qid, --qsc, --filter-min-enable. Default is off.
     const bool doMsaFilter = (par.filterMsa != 0);
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, 0.0f);
+    const unsigned int targetExt = DBReader<unsigned int>::getExtendedDbtype(tDbr->getDbtype());
+    const bool targetGpuDb = (targetExt & Parameters::DBTYPE_EXTENDED_GPU) != 0;
+    const bool decodeTargetDinuc = ((targetExt & Parameters::DBTYPE_EXTENDED_DINUCLEOTIDE) != 0) || targetGpuDb;
+    const int targetSeqType = effectiveDecodeSeqType(tDbr->getDbtype(), decodeTargetDinuc);
     std::vector<std::string> qid_str_vec = Util::split(par.qid, ",");
     std::vector<int> qid_vec;
     qid_vec.reserve(qid_str_vec.size());
@@ -200,6 +259,7 @@ int cmbuild(int argc, const char **argv, const Command &command) {
         // maxSeqLen and maxSetSize grow inside MsaFilter as needed (increaseSetSize),
         // so seeding with conservative values is fine.
         MsaFilter msaFilter(8192, 1024, &subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid());
+        Sequence targetMapper(tDbr->getMaxSeqLen(), targetSeqType, &subMat, 0, false, false);
         std::vector<unsigned char> encBuf;
         std::vector<const char *> rowPtrs;
 
@@ -255,23 +315,10 @@ int cmbuild(int argc, const char **argv, const Command &command) {
                 if (seenKeys.find(res.dbKey) != seenKeys.end()) continue;
                 seenKeys.insert(res.dbKey);
 
-                const char *targetSeq = tDbr->getData(targetId, thread_idx);
-                std::string decodedTargetSeq;
-                // If tDbr is GPU db, get uncompressed sequence data
-                if (DBReader<unsigned int>::getExtendedDbtype(tDbr->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU) {
-                    const char *gpuTargetSeq = tDbr->getDataUncompressed(targetId);
-                    const size_t targetSeqLen = tDbr->getSeqLen(targetId);
-                    const unsigned char *dinucToNuc = getDinucToNucTable();
-                    decodedTargetSeq.resize(targetSeqLen);
-
-                    // Convert GPU dinucleotide-encoded bytes to nucleotide chars.
-                    for (size_t pos = 0; pos < targetSeqLen; ++pos) {
-                        const unsigned char dinucCode = static_cast<unsigned char>(gpuTargetSeq[pos]);
-                        const unsigned char nucCode = dinucToNuc[dinucCode];
-                        decodedTargetSeq[pos] = subMat.num2aa[nucCode];
-                    }
-                    targetSeq = decodedTargetSeq.c_str();
-                }
+                std::string decodedTargetSeq = decodeDbSequence(*tDbr, targetId, thread_idx,
+                                                                targetMapper, decodeTargetDinuc,
+                                                                targetGpuDb, subMat);
+                const char *targetSeq = decodedTargetSeq.c_str();
 
                 // Fold reverse-strand alignments onto the forward query frame
                 // (matches result2dnamsa.cpp). Strand handling lives here so
