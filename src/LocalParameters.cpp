@@ -42,6 +42,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmMode = 0;
     dbSize = 0;
     calibrateCm = false;
+    emsearchDinucleotide = false;
     cmliteMsaEvalThr = DBL_MAX;
     lolalignMsaEvalThr = DBL_MAX;
     lolcmsearchTmpDir.clear();

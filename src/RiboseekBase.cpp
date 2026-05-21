@@ -53,7 +53,7 @@ std::vector<Command> riboseekCommands = {
             CITATION_MMSEQS2, {{"queryDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                       {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                       {"resultDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::resultDb },
-                                      {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}}},
+                                      {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}},
     {"lolcmsearch", lolcmsearch, &localPar.rnaalign, COMMAND_ALIGNMENT,
             "Full CM CYK refinement with LoLalign-derived state bands",
             "riboseek lolcmsearch queryDB targetDB resultDB alignmentDB --cm-region 1.5 -e inf --lolalign-msa-eval 1e-3\n"
@@ -70,7 +70,7 @@ std::vector<Command> riboseekCommands = {
             CITATION_MMSEQS2, {{"queryDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                       {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                       {"resultDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::resultDb },
-                                      {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}}},
+                                      {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}},
     {"cmsearch", cmsearch, &localPar.align, COMMAND_ALIGNMENT,
             "CM search with in-tree CYK/Inside dynamic programming",
             "riboseek cmsearch queryCMDB targetDB resultDB alignmentDB\n",

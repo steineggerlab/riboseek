@@ -26,6 +26,7 @@ public:
     int cmMode;
     size_t dbSize;
     bool calibrateCm;
+    bool emsearchDinucleotide;
     double cmliteMsaEvalThr;
     double lolalignMsaEvalThr;
     std::string lolcmsearchTmpDir;

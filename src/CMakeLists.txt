@@ -20,6 +20,8 @@ mmseqs_setup_derived_target(riboseek-framework)
 target_include_directories(riboseek-framework BEFORE PUBLIC ${CMAKE_BINARY_DIR}/generated)
 add_dependencies(riboseek-framework generated_riboseek)
 target_include_directories(riboseek-framework PUBLIC ${CMAKE_SOURCE_DIR}/lib)
+target_compile_options(riboseek-framework PUBLIC
+    $<$<COMPILE_LANGUAGE:CXX>:-fexceptions>)
 
 # Infernal bridge
 if (TARGET infernal-bridge)
