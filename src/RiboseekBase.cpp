@@ -40,6 +40,37 @@ std::vector<Command> riboseekCommands = {
                                       {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                       {"resultDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb },
                                       {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
+    {"lolalign", lolalign, &localPar.rnaalign, COMMAND_ALIGNMENT,
+            "LoL-style iterative local RNA profile/structure realignment",
+            "riboseek lolalign queryDB targetDB resultDB alignmentDB --cm-region 1.5 -e inf --lolalign-msa-eval 1e-3\n"
+            "Environment overrides:\n"
+            "  MMSEQS_LOLALIGN_STRUCTURE_BACKEND=auto|rnafold|linearfold|canonical\n"
+            "  MMSEQS_LOLALIGN_ITERATIONS=N\n"
+            "  MMSEQS_LOLALIGN_REL_WEIGHT=F\n"
+            "  MMSEQS_LOLALIGN_GUIDE_WEIGHT=F\n",
+            "OpenAI Codex",
+            "<i:queryDB> <i:targetDB> <i:resultDB> <o:alignmentDB>",
+            CITATION_MMSEQS2, {{"queryDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                      {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                      {"resultDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::resultDb },
+                                      {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}}},
+    {"lolcmsearch", lolcmsearch, &localPar.rnaalign, COMMAND_ALIGNMENT,
+            "Full CM CYK refinement with LoLalign-derived state bands",
+            "riboseek lolcmsearch queryDB targetDB resultDB alignmentDB --cm-region 1.5 -e inf --lolalign-msa-eval 1e-3\n"
+            "targetDB and resultDB may also be comma-separated lists of equal length.\n"
+            "Environment overrides:\n"
+            "  MMSEQS_LOLCMSEARCH_BAND_PAD=N\n"
+            "  MMSEQS_LOLCMSEARCH_KEEP_TMP=1\n"
+            "  MMSEQS_LOLCMSEARCH_SKIP_BUILD=1\n"
+            "  MMSEQS_LOLCMSEARCH_SKIP_ROUGH=1\n"
+            "Argument:\n"
+            "  --lolcmsearch-tmpdir DIR\n",
+            "OpenAI Codex",
+            "<i:queryDB> <i:targetDB> <i:resultDB> <o:alignmentDB>",
+            CITATION_MMSEQS2, {{"queryDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                      {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                      {"resultDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::resultDb },
+                                      {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}}},
     {"cmsearch", cmsearch, &localPar.align, COMMAND_ALIGNMENT,
             "CM search with in-tree CYK/Inside dynamic programming",
             "riboseek cmsearch queryCMDB targetDB resultDB alignmentDB\n",

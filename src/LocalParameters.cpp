@@ -1,6 +1,8 @@
 #include "LocalParameters.h"
 #include "dinuc.out.h"
 
+#include <cfloat>
+
 LocalParameters::LocalParameters() : Parameters(),
     PARAM_CM_REGION(PARAM_CM_REGION_ID, "--cm-region", "CM region flanking",
         "Extract target subregion around prefilter hit for CM alignment.\n"
@@ -19,12 +21,30 @@ LocalParameters::LocalParameters() : Parameters(),
         "Run Infernal cmcalibrate after cmbuild to fit E-value exp-tail parameters.\n"
         "Slow (~1-2s per query). Off by default; CmScan uses a native E-value fallback.",
         typeid(bool), (void *) &calibrateCm,
-        "", MMseqsParameter::COMMAND_MISC)
+        "", MMseqsParameter::COMMAND_MISC),
+    PARAM_CMLITE_MSA_EVAL(200001, "--cmlite-msa-eval", "CmLite MSA E-value",
+        "Include only hits with <= this E-value when building the CmLite seed MSA/profile.\n"
+        "All hits from resultDB are still realigned afterward; this only filters the profile-building subset.",
+        typeid(double), (void *) &cmliteMsaEvalThr,
+        "^(([-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?)|([iI][nN][fF]))$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_LOLALIGN_MSA_EVAL(200002, "--lolalign-msa-eval", "LoLalign MSA E-value",
+        "Include only hits with <= this E-value when building the LoLalign seed MSA/profile.\n"
+        "All hits from resultDB are still realigned afterward; this only filters the profile-building subset.",
+        typeid(double), (void *) &lolalignMsaEvalThr,
+        "^(([-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?)|([iI][nN][fF]))$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_LOLCMSEARCH_TMPDIR(200003, "--lolcmsearch-tmpdir", "LoLCMSearch tmp dir",
+        "Directory to use for lolcmsearch intermediate databases.\n"
+        "If set, this directory is created if needed and is not auto-deleted.",
+        typeid(std::string), (void *) &lolcmsearchTmpDir,
+        "", MMseqsParameter::COMMAND_ALIGN)
 {
     cmRegionFlanking = 0.0f;
     cmMode = 0;
     dbSize = 0;
     calibrateCm = false;
+    cmliteMsaEvalThr = DBL_MAX;
+    lolalignMsaEvalThr = DBL_MAX;
+    lolcmsearchTmpDir.clear();
 
     // Register dinuc.out as compiled-in matrix and set as default
     scoringMatrixFile = MultiParam<NuclAA<std::string>>(NuclAA<std::string>("dinuc.out", "dinuc.out"));
@@ -40,6 +60,9 @@ LocalParameters::LocalParameters() : Parameters(),
     // rnaalign inherits the standard align parameters plus --db-size
     rnaalign = align;
     rnaalign.push_back(&PARAM_DB_SIZE);
+    rnaalign.push_back(&PARAM_CMLITE_MSA_EVAL);
+    rnaalign.push_back(&PARAM_LOLALIGN_MSA_EVAL);
+    rnaalign.push_back(&PARAM_LOLCMSEARCH_TMPDIR);
 
     splitstrand.push_back(&PARAM_STRAND);
     splitstrand.push_back(&PARAM_THREADS);
@@ -55,6 +78,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuild.push_back(&PARAM_FILTER_COV);
     cmbuild.push_back(&PARAM_FILTER_NDIFF);
     cmbuild.push_back(&PARAM_FILTER_MIN_ENABLE);
+    cmbuild.push_back(&PARAM_CMLITE_MSA_EVAL);
     cmbuild.push_back(&PARAM_THREADS);
     cmbuild.push_back(&PARAM_COMPRESSED);
     cmbuild.push_back(&PARAM_V);

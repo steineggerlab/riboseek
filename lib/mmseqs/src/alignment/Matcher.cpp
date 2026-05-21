@@ -167,9 +167,12 @@ float Matcher::estimateSeqIdByScorePerCol(uint16_t score, unsigned int qLen, uns
 
 std::string Matcher::compressAlignment(const std::string& bt) {
     std::string ret;
-    char state = 'M';
-    size_t counter = 0;
-    for (size_t i = 0; i < bt.size(); ++i) {
+    if (bt.empty()) {
+        return ret;
+    }
+    char state = bt[0];
+    size_t counter = 1;
+    for (size_t i = 1; i < bt.size(); ++i) {
         if (bt[i] != state) {
             // we could leave this out if counter == 1
             // to save a few byte (~5% of total cigar strings)

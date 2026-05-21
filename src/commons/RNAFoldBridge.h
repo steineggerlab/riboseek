@@ -115,4 +115,10 @@ static inline bool rnaFoldAlifoldDotBracket(const std::vector<std::string> & /*r
 
 #endif
 
+bool rnaLinearPartitionPredict(const std::string &rna,
+                               int minLoop,
+                               int beamSize,
+                               std::string &dotBracket,
+                               std::vector<float> &pairMatrix);
+
 #endif

@@ -10,6 +10,7 @@
 #include "Util.h"
 #include "NucleotideMatrix.h"
 #include "Sequence.h"
+#include "rnautils/CmScanGpu.h"
 #include "simd.h"
 
 #ifdef OPENMP
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
 #include <chrono>
 #include <climits>
@@ -29,14 +31,18 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #if defined(__AVX2__)
 #include <immintrin.h>
 #define CM_HAS_SSE2 1
@@ -189,6 +195,15 @@ struct InfernalExactModel {
     bool hasTruncDp = false;
 };
 
+struct CmBeamLocalizeResult {
+    bool valid = false;
+    int start = 1;     // 1-indexed inclusive in the scanned region
+    int end = 0;       // 1-indexed inclusive in the scanned region
+    float bestScore = -std::numeric_limits<float>::infinity();
+    int rowsPruned = 0;
+    int rowsVisited = 0;
+};
+
 template <typename T>
 struct RawBuffer {
     T *ptr;
@@ -244,15 +259,18 @@ struct ExactScanWorkspace {
     uint32_t memoInGen = 1;
     std::unordered_map<int64_t, double> memoVitMap;
     std::unordered_map<int64_t, double> memoInMap;
-    // Per-state ragged (v, i, d) chart for Infernal-compat exactVitRec.
-    // Each state v gets bandSize[v] * (N+1) cells, allocated contiguously
-    // and indexed via cumulative chartOffset[v]. Total cells = chartOffset[M].
-    // Bands derive from cmbuild's QDB output (CmState::dmin1/dmax1) and shrink
-    // memory ~30x vs the previous flat M*N*maxSpan layout.
+    // Per-state sparse chart for Infernal-compat exactVitRec.
+    // QDB still defines the legal d rows per state, but each (state,d) row now
+    // stores only the i interval that survives the optional LoL-derived state
+    // bounds. This preserves the exact recurrence while avoiding dead cells for
+    // i outside the state-local target band.
     std::vector<float> exactChart;
     std::vector<uint32_t> exactChartSeen;
     uint32_t exactChartGen = 1;
-    std::vector<size_t> exactChartOffset;   // M+1 entries, exactChartOffset[M] = total cells
+    std::vector<size_t> exactChartStateDOffset; // M+1 entries, prefix over d-rows
+    std::vector<size_t> exactChartRowOffset;    // totalRows+1 entries, prefix over live cells
+    std::vector<int> exactChartRowImin;         // totalRows entries
+    std::vector<int> exactChartRowSize;         // totalRows entries
     std::vector<int> exactChartBandDmin;    // M entries
     std::vector<int> exactChartBandSize;    // M entries (= dmax-dmin+1, or 0 if empty)
 };
@@ -303,6 +321,11 @@ static bool cmFastMathEnabled() {
     return cached == 1;
 }
 
+static int parseEnvIntLocal(const char *name, int defVal) {
+    const char *env = std::getenv(name);
+    return (env != NULL) ? std::atoi(env) : defVal;
+}
+
 static bool cmFastLogsumEnabled() {
     static int cached = -1;
     if (cached == -1) {
@@ -348,6 +371,114 @@ static bool cmNull3Enabled() {
         cached = (env != NULL && std::string(env) == "0") ? 0 : 1;
     }
     return cached == 1;
+}
+
+static bool cmGpuExactEnabled() {
+#ifdef HAVE_CUDA
+    return Parameters::getInstance().gpu != 0;
+#else
+    return false;
+#endif
+}
+
+static bool cmGpuBatchCommonPathEnabled(const InfernalExactModel &model) {
+#ifdef HAVE_CUDA
+    if (!cmGpuExactEnabled() || !cmExactFastDeckEnabled()) {
+        return false;
+    }
+    if (model.hasLocalCfg) {
+        return false;
+    }
+    const char *rescoreEnv = std::getenv("MMSEQS_CMSCAN_RESCORE_ENVELOPE");
+    if (rescoreEnv != NULL && std::string(rescoreEnv) == "1") {
+        return false;
+    }
+    const char *forceGlobalEnv = std::getenv("MMSEQS_CMSCAN_FORCE_GLOBAL");
+    if (forceGlobalEnv != NULL && forceGlobalEnv[0] != '\0' && forceGlobalEnv[0] != '0') {
+        return false;
+    }
+    const char *traceElEnv = std::getenv("MMSEQS_CMSCAN_TRACE_EL");
+    if (traceElEnv != NULL && traceElEnv[0] == '1') {
+        return false;
+    }
+    const char *traceLboEnv = std::getenv("MMSEQS_CMSCAN_TRACE_LBO");
+    if (traceLboEnv != NULL && traceLboEnv[0] == '1') {
+        return false;
+    }
+    const char *dumpTraceEnv = std::getenv("MMSEQS_CMSCAN_DUMP_TRACE_TID");
+    if (dumpTraceEnv != NULL && dumpTraceEnv[0] != '\0') {
+        return false;
+    }
+    return true;
+#else
+    (void)model;
+    return false;
+#endif
+}
+
+static double cmGpuBatchMemFrac() {
+    static double cached = -1.0;
+    if (cached < 0.0) {
+        cached = 0.90;
+        if (const char *env = std::getenv("MMSEQS_CMSCAN_GPU_BATCH_MEM_FRAC")) {
+            const double parsed = std::atof(env);
+            if (parsed > 0.0 && parsed < 1.0) cached = parsed;
+        }
+    }
+    return cached;
+}
+
+static size_t cmGpuBatchMemReserveBytes() {
+    static size_t cached = 0;
+    if (cached == 0) {
+        cached = 256ULL << 20;
+        if (const char *env = std::getenv("MMSEQS_CMSCAN_GPU_BATCH_MEM_RESERVE_MB")) {
+            const unsigned long long parsed = std::strtoull(env, NULL, 10);
+            cached = static_cast<size_t>(parsed) << 20;
+        }
+    }
+    return cached;
+}
+
+static size_t cmGpuUsableBytes() {
+#ifdef HAVE_CUDA
+    size_t freeBytes = 0;
+    size_t totalBytes = 0;
+    if (!cmFastDeckGpuGetMemoryInfo(&freeBytes, &totalBytes)) {
+        return 0;
+    }
+    const size_t fracBudget = static_cast<size_t>(static_cast<double>(freeBytes) * cmGpuBatchMemFrac());
+    const size_t reserve = cmGpuBatchMemReserveBytes();
+    return (fracBudget > reserve) ? (fracBudget - reserve) : fracBudget;
+#else
+    return 0;
+#endif
+}
+
+static size_t estimateFastDeckGpuSingleJobBytes(int M,
+                                                int N,
+                                                size_t activeStateCount,
+                                                size_t trDstCount,
+                                                size_t trScCount,
+                                                size_t emitFloatCount) {
+    if (M <= 0 || N <= 0) {
+        return 0;
+    }
+    const size_t iStride = static_cast<size_t>(N + 2);
+    const size_t stateStride = static_cast<size_t>(N + 1) * iStride;
+    const size_t cells = static_cast<size_t>(M) * stateStride;
+    const size_t vdCells = static_cast<size_t>(M) * static_cast<size_t>(N + 1);
+    size_t bytes = 0;
+    bytes += static_cast<size_t>(N + 1) * sizeof(int8_t);
+    bytes += static_cast<size_t>(M) * sizeof(CmFastDeckGpuState);
+    bytes += activeStateCount * sizeof(int);
+    bytes += static_cast<size_t>(M) * sizeof(size_t);
+    bytes += 2ULL * vdCells * sizeof(int);
+    bytes += trDstCount * sizeof(uint16_t);
+    bytes += trScCount * sizeof(float);
+    bytes += emitFloatCount * sizeof(float);
+    bytes += cells * sizeof(float);
+    return bytes;
 }
 
 // Optimal-accuracy alignment opt-in. When set, runInfernalExactScan switches
@@ -3015,6 +3146,384 @@ static bool hasDbIndex(const std::string &path) {
     return FileUtil::fileExists((path + ".index").c_str());
 }
 
+static std::string getSelfExecutablePath() {
+    std::vector<char> buf(4096, '\0');
+    const ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size() - 1);
+    if (n <= 0) {
+        return std::string();
+    }
+    buf[static_cast<size_t>(n)] = '\0';
+    return std::string(buf.data());
+}
+
+static bool runExternalCommand(const std::vector<std::string> &args,
+                               const std::vector<std::pair<std::string, std::string>> &envOverrides,
+                               std::string &error) {
+    if (args.empty()) {
+        error = "empty command";
+        return false;
+    }
+    std::vector<char *> argv;
+    argv.reserve(args.size() + 1);
+    for (size_t i = 0; i < args.size(); ++i) {
+        argv.push_back(const_cast<char *>(args[i].c_str()));
+    }
+    argv.push_back(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        error = "fork failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    if (pid == 0) {
+        for (size_t i = 0; i < envOverrides.size(); ++i) {
+            setenv(envOverrides[i].first.c_str(), envOverrides[i].second.c_str(), 1);
+        }
+        execv(argv[0], argv.data());
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        std::ostringstream oss;
+        oss << "command failed with status " << status << ":";
+        for (size_t i = 0; i < args.size(); ++i) {
+            oss << ' ' << args[i];
+        }
+        error = oss.str();
+        return false;
+    }
+    return true;
+}
+
+static std::string createTempDir(const std::string &prefix) {
+    std::string templ = "/tmp/" + prefix + "_XXXXXX";
+    std::vector<char> path(templ.begin(), templ.end());
+    path.push_back('\0');
+    char *dir = ::mkdtemp(path.data());
+    return (dir != NULL) ? std::string(dir) : std::string();
+}
+
+static bool ensureDirectoryRecursive(const std::string &path) {
+    if (path.empty()) {
+        return false;
+    }
+    if (FileUtil::directoryExists(path.c_str())) {
+        return true;
+    }
+
+    std::string cur;
+    size_t pos = 0;
+    if (path[0] == '/') {
+        cur = "/";
+        pos = 1;
+    }
+    while (pos <= path.size()) {
+        const size_t next = path.find('/', pos);
+        const std::string part = path.substr(pos, next - pos);
+        if (!part.empty()) {
+            if (!cur.empty() && cur[cur.size() - 1] != '/') {
+                cur.push_back('/');
+            }
+            cur += part;
+            if (!FileUtil::directoryExists(cur.c_str()) && !FileUtil::makeDir(cur.c_str())) {
+                return false;
+            }
+        }
+        if (next == std::string::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+    return FileUtil::directoryExists(path.c_str());
+}
+
+static std::string trimCopy(const std::string &s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) {
+        ++b;
+    }
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) {
+        --e;
+    }
+    return s.substr(b, e - b);
+}
+
+static std::vector<std::string> splitCommaList(const std::string &s) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        const size_t next = s.find(',', pos);
+        const std::string part = trimCopy(s.substr(pos, next - pos));
+        if (!part.empty()) {
+            out.push_back(part);
+        }
+        if (next == std::string::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+    if (out.empty() && !trimCopy(s).empty()) {
+        out.push_back(trimCopy(s));
+    }
+    return out;
+}
+
+static bool mergeLolcmsearchInputs(const std::string &queryDb,
+                                   const std::vector<std::string> &targetDbs,
+                                   const std::vector<std::string> &resultDbs,
+                                   const std::string &mergedTargetDb,
+                                   const std::string &mergedResultDb,
+                                   int threads,
+                                   std::string &error) {
+    if (targetDbs.empty() || targetDbs.size() != resultDbs.size()) {
+        error = "target/result DB list sizes do not match";
+        return false;
+    }
+
+    DBReader<unsigned int> qDbr(queryDb.c_str(), (queryDb + ".index").c_str(),
+                                std::max(1, threads),
+                                DBReader<unsigned int>::USE_INDEX);
+    qDbr.open(DBReader<unsigned int>::NOSORT);
+
+    std::vector<DBReader<unsigned int> *> tReaders(targetDbs.size(), NULL);
+    std::vector<DBReader<unsigned int> *> rReaders(resultDbs.size(), NULL);
+    std::vector<std::unordered_map<unsigned int, unsigned int> > keyMaps(targetDbs.size());
+    int mergedTargetDbtype = -1;
+
+    try {
+        for (size_t i = 0; i < targetDbs.size(); ++i) {
+            tReaders[i] = new DBReader<unsigned int>(targetDbs[i].c_str(),
+                                                     (targetDbs[i] + ".index").c_str(),
+                                                     std::max(1, threads),
+                                                     DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
+            tReaders[i]->open(DBReader<unsigned int>::NOSORT);
+            rReaders[i] = new DBReader<unsigned int>(resultDbs[i].c_str(),
+                                                     (resultDbs[i] + ".index").c_str(),
+                                                     std::max(1, threads),
+                                                     DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
+            rReaders[i]->open(DBReader<unsigned int>::NOSORT);
+            if (mergedTargetDbtype < 0) {
+                mergedTargetDbtype = tReaders[i]->getDbtype();
+            } else if (tReaders[i]->getDbtype() != mergedTargetDbtype) {
+                error = "target DB types do not match across inputs";
+                throw std::runtime_error(error);
+            }
+        }
+
+        FILE *targetIndexFile = fopen((mergedTargetDb + ".index").c_str(), "w");
+        if (targetIndexFile == NULL) {
+            error = "failed to create merged target index";
+            throw std::runtime_error(error);
+        }
+        unsigned int nextTargetKey = 0;
+        size_t nextShardId = 0;
+        size_t cumulativeDataSize = 0;
+        for (size_t ti = 0; ti < tReaders.size(); ++ti) {
+            DBReader<unsigned int> &tDbr = *tReaders[ti];
+            std::unordered_map<unsigned int, unsigned int> &map = keyMaps[ti];
+            map.reserve(tDbr.getSize() * 2 + 1);
+            const std::vector<std::string> dataFiles = FileUtil::findDatafiles(targetDbs[ti].c_str());
+            if (dataFiles.empty()) {
+                error = "no datafiles found for target DB " + targetDbs[ti];
+                throw std::runtime_error(error);
+            }
+            size_t thisDbDataSize = 0;
+            for (size_t fi = 0; fi < dataFiles.size(); ++fi) {
+                const std::string realDataFile = FileUtil::getRealPathFromSymLink(dataFiles[fi]);
+                struct stat st;
+                if (stat(realDataFile.c_str(), &st) != 0) {
+                    error = "failed to stat target data file " + realDataFile;
+                    throw std::runtime_error(error);
+                }
+                thisDbDataSize += static_cast<size_t>(st.st_size);
+                const std::string dstShard = mergedTargetDb + "." + SSTR(nextShardId++);
+                if (symlink(realDataFile.c_str(), dstShard.c_str()) != 0) {
+                    error = "failed to symlink target data file " + realDataFile + " -> " + dstShard;
+                    throw std::runtime_error(error);
+                }
+            }
+            for (size_t id = 0; id < tDbr.getSize(); ++id) {
+                const unsigned int oldKey = tDbr.getDbKey(id);
+                const size_t mergedOffset = cumulativeDataSize + tDbr.getOffset(id);
+                const size_t len = tDbr.getEntryLen(id);
+                fprintf(targetIndexFile, "%u\t%zu\t%zu\n", nextTargetKey, mergedOffset, len);
+                map[oldKey] = nextTargetKey;
+                ++nextTargetKey;
+            }
+            cumulativeDataSize += thisDbDataSize;
+        }
+        if (fclose(targetIndexFile) != 0) {
+            error = "failed to close merged target index";
+            throw std::runtime_error(error);
+        }
+        {
+            FILE *dbtypeFile = fopen((mergedTargetDb + ".dbtype").c_str(), "wb");
+            if (dbtypeFile == NULL) {
+                error = "failed to create merged target dbtype";
+                throw std::runtime_error(error);
+            }
+            if (fwrite(&mergedTargetDbtype, sizeof(int), 1, dbtypeFile) != 1) {
+                fclose(dbtypeFile);
+                error = "failed to write merged target dbtype";
+                throw std::runtime_error(error);
+            }
+            if (fclose(dbtypeFile) != 0) {
+                error = "failed to close merged target dbtype";
+                throw std::runtime_error(error);
+            }
+        }
+
+        FILE *lookupFilePtr = fopen((mergedTargetDb + ".lookup").c_str(), "w");
+        if (lookupFilePtr == NULL) {
+            error = "failed to create merged target lookup";
+            throw std::runtime_error(error);
+        }
+        DBWriter headerWriter((mergedTargetDb + "_h").c_str(),
+                              (mergedTargetDb + "_h.index").c_str(),
+                              1, 0, Parameters::DBTYPE_GENERIC_DB);
+        headerWriter.open();
+        unsigned int nextFileNumberOffset = 0;
+        for (size_t ti = 0; ti < tReaders.size(); ++ti) {
+            unsigned int localMaxFileNumber = 0;
+            const std::string srcLookup = targetDbs[ti] + ".lookup";
+            if (FileUtil::fileExists(srcLookup.c_str())) {
+                DBReader<unsigned int> lookupReader(targetDbs[ti].c_str(),
+                                                    (targetDbs[ti] + ".index").c_str(),
+                                                    1,
+                                                    DBReader<unsigned int>::USE_LOOKUP);
+                lookupReader.open(DBReader<unsigned int>::NOSORT);
+                DBReader<unsigned int>::LookupEntry *lookup = lookupReader.getLookup();
+                for (size_t li = 0; li < lookupReader.getLookupSize(); ++li) {
+                    const unsigned int oldKey = lookup[li].id;
+                    std::unordered_map<unsigned int, unsigned int>::const_iterator it = keyMaps[ti].find(oldKey);
+                    if (it == keyMaps[ti].end()) {
+                        continue;
+                    }
+                    const unsigned int mergedKey = it->second;
+                    const unsigned int mergedFileNumber = nextFileNumberOffset + lookup[li].fileNumber;
+                    if (lookup[li].fileNumber > localMaxFileNumber) {
+                        localMaxFileNumber = lookup[li].fileNumber;
+                    }
+                    fprintf(lookupFilePtr, "%u\t%s\t%u\n",
+                            mergedKey,
+                            lookup[li].entryName.c_str(),
+                            mergedFileNumber);
+                    headerWriter.writeData(lookup[li].entryName.c_str(),
+                                           lookup[li].entryName.size(),
+                                           mergedKey,
+                                           0);
+                }
+                lookupReader.close();
+                nextFileNumberOffset += (localMaxFileNumber + 1);
+            } else {
+                DBReader<unsigned int> &tDbr = *tReaders[ti];
+                for (size_t id = 0; id < tDbr.getSize(); ++id) {
+                    const unsigned int oldKey = tDbr.getDbKey(id);
+                    std::unordered_map<unsigned int, unsigned int>::const_iterator it = keyMaps[ti].find(oldKey);
+                    if (it == keyMaps[ti].end()) {
+                        continue;
+                    }
+                    const unsigned int mergedKey = it->second;
+                    fprintf(lookupFilePtr, "%u\t%u\t%u\n", mergedKey, mergedKey, nextFileNumberOffset);
+                    const std::string mergedName = SSTR(mergedKey);
+                    headerWriter.writeData(mergedName.c_str(), mergedName.size(), mergedKey, 0);
+                }
+                nextFileNumberOffset += 1;
+            }
+        }
+        if (fclose(lookupFilePtr) != 0) {
+            error = "failed to close merged target lookup";
+            throw std::runtime_error(error);
+        }
+        headerWriter.close(true);
+
+        DBWriter resultWriter(mergedResultDb.c_str(), (mergedResultDb + ".index").c_str(),
+                              1, 0, Parameters::DBTYPE_ALIGNMENT_RES);
+        resultWriter.open();
+        for (size_t qi = 0; qi < qDbr.getSize(); ++qi) {
+            const unsigned int queryKey = qDbr.getDbKey(qi);
+            std::string out;
+            for (size_t ri = 0; ri < rReaders.size(); ++ri) {
+                DBReader<unsigned int> &rDbr = *rReaders[ri];
+                const size_t rid = rDbr.getId(queryKey);
+                if (rid == UINT_MAX) {
+                    continue;
+                }
+                char *block = rDbr.getData(rid, 0);
+                const size_t blockLen = rDbr.getEntryLen(rid);
+                size_t pos = 0;
+                const size_t usable = (blockLen == 0 ? 0 : blockLen - 1);
+                while (pos < usable) {
+                    const size_t lineStart = pos;
+                    while (pos < usable && block[pos] != '\n') {
+                        ++pos;
+                    }
+                    const size_t lineEnd = pos;
+                    if (pos < usable && block[pos] == '\n') {
+                        ++pos;
+                    }
+                    if (lineEnd <= lineStart) {
+                        continue;
+                    }
+                    size_t tabPos = lineStart;
+                    while (tabPos < lineEnd && block[tabPos] != '\t') {
+                        ++tabPos;
+                    }
+                    if (tabPos <= lineStart || tabPos >= lineEnd) {
+                        continue;
+                    }
+                    const unsigned int oldKey = static_cast<unsigned int>(
+                        std::strtoul(block + lineStart, NULL, 10));
+                    std::unordered_map<unsigned int, unsigned int>::const_iterator it = keyMaps[ri].find(oldKey);
+                    if (it == keyMaps[ri].end()) {
+                        continue;
+                    }
+                    out.append(SSTR(it->second));
+                    out.append(block + tabPos, lineEnd - tabPos);
+                    out.push_back('\n');
+                }
+            }
+            resultWriter.writeData(out.c_str(), out.size(), queryKey, 0, true, true);
+        }
+        resultWriter.close(true);
+    } catch (...) {
+        for (size_t i = 0; i < tReaders.size(); ++i) {
+            if (tReaders[i] != NULL) {
+                tReaders[i]->close();
+                delete tReaders[i];
+            }
+            if (rReaders[i] != NULL) {
+                rReaders[i]->close();
+                delete rReaders[i];
+            }
+        }
+        qDbr.close();
+        if (error.empty()) {
+            error = "failed while merging multiple target/result DBs";
+        }
+        return false;
+    }
+
+    for (size_t i = 0; i < tReaders.size(); ++i) {
+        tReaders[i]->close();
+        delete tReaders[i];
+        rReaders[i]->close();
+        delete rReaders[i];
+    }
+    qDbr.close();
+    return true;
+}
+
+static void removePathRecursively(const std::string &path) {
+    if (path.empty()) {
+        return;
+    }
+    std::string cmd = "rm -rf '" + path + "'";
+    std::system(cmd.c_str());
+}
+
 // Decode a single sequence from an open DBReader by internal index.
 static FastaSeq decodeOneSequence(DBReader<unsigned int> &dbr,
                                   size_t id,
@@ -3578,6 +4087,224 @@ static float seqIdFromCigarConsensus(const std::string &cigar,
     return static_cast<float>(ident) / static_cast<float>(denom);
 }
 
+static inline char complementBaseLocal(char c) {
+    switch (normalizeBase(c)) {
+        case 'A': return 'U';
+        case 'C': return 'G';
+        case 'G': return 'C';
+        case 'U': return 'A';
+        default: return 'N';
+    }
+}
+
+static std::string buildWindowSequenceFromHit(const std::string &targetSeq,
+                                              const Matcher::result_t &hit,
+                                              float flankFrac,
+                                              int queryLen,
+                                              int &fullLo,
+                                              int &fullHi,
+                                              bool &reverseStrand) {
+    reverseStrand = (hit.dbStartPos > hit.dbEndPos);
+    const int dbLo = std::min(hit.dbStartPos, hit.dbEndPos);
+    const int dbHi = std::max(hit.dbStartPos, hit.dbEndPos);
+    const int qLo = std::min(hit.qStartPos, hit.qEndPos);
+    const int qHi = std::max(hit.qStartPos, hit.qEndPos);
+    const int hitSpan = std::max(dbHi - dbLo + 1, qHi - qLo + 1);
+    int flank = (flankFrac > 0.0f)
+        ? static_cast<int>(std::ceil(static_cast<float>(hitSpan) * flankFrac))
+        : std::max(24, queryLen / 4);
+    flank = std::max(flank, 8);
+    fullLo = std::max(0, dbLo - flank);
+    fullHi = std::min(static_cast<int>(targetSeq.size()) - 1, dbHi + flank);
+    if (fullHi < fullLo) {
+        fullLo = 0;
+        fullHi = -1;
+        return std::string();
+    }
+    std::string window;
+    window.reserve(static_cast<size_t>(fullHi - fullLo + 1));
+    if (!reverseStrand) {
+        for (int pos = fullLo; pos <= fullHi; ++pos) {
+            char c = normalizeBase(targetSeq[static_cast<size_t>(pos)]);
+            window.push_back((c == 'A' || c == 'C' || c == 'G' || c == 'U') ? c : 'N');
+        }
+    } else {
+        for (int pos = fullHi; pos >= fullLo; --pos) {
+            window.push_back(complementBaseLocal(targetSeq[static_cast<size_t>(pos)]));
+        }
+    }
+    return window;
+}
+
+static std::vector<int> buildLolConsensusTargetMap(const Matcher::result_t &rough,
+                                                   int fullLo,
+                                                   int fullHi,
+                                                   bool reverseStrand,
+                                                   int scanLen,
+                                                   int clen) {
+    std::vector<int> targetByConsensus(static_cast<size_t>(std::max(0, clen) + 1), -1);
+    if (rough.backtrace.empty() || scanLen <= 0 || clen <= 0) {
+        return targetByConsensus;
+    }
+    int qPos = rough.qStartPos;
+    const int qStep = (rough.qEndPos >= rough.qStartPos) ? 1 : -1;
+    int dbPos = rough.dbStartPos;
+    const int dbStep = (rough.dbEndPos >= rough.dbStartPos) ? 1 : -1;
+    for (size_t k = 0; k < rough.backtrace.size(); ++k) {
+        const char op = rough.backtrace[k];
+        if (op == 'M') {
+            const int consPos = qPos + 1;
+            if (consPos >= 1 && consPos <= clen && dbPos >= fullLo && dbPos <= fullHi) {
+                const int forwardLocal = dbPos - fullLo;
+                const int scanLocal = reverseStrand ? (scanLen - 1 - forwardLocal) : forwardLocal;
+                if (scanLocal >= 0 && scanLocal < scanLen) {
+                    targetByConsensus[static_cast<size_t>(consPos)] = scanLocal + 1;
+                }
+            }
+            qPos += qStep;
+            dbPos += dbStep;
+        } else if (op == 'I') {
+            qPos += qStep;
+        } else if (op == 'D') {
+            dbPos += dbStep;
+        }
+    }
+    return targetByConsensus;
+}
+
+static void computeLolRescoreWindow(const std::vector<int> &targetByConsensus,
+                                    int scanLen,
+                                    int pad,
+                                    int &subLo,
+                                    int &subHi) {
+    subLo = 1;
+    subHi = scanLen;
+    if (scanLen <= 0 || targetByConsensus.empty()) {
+        return;
+    }
+    int minMapped = scanLen + 1;
+    int maxMapped = 0;
+    for (size_t i = 1; i < targetByConsensus.size(); ++i) {
+        const int pos = targetByConsensus[i];
+        if (pos > 0) {
+            minMapped = std::min(minMapped, pos);
+            maxMapped = std::max(maxMapped, pos);
+        }
+    }
+    if (maxMapped <= 0 || minMapped > scanLen) {
+        return;
+    }
+    subLo = std::max(1, minMapped - pad);
+    subHi = std::min(scanLen, maxMapped + pad);
+}
+
+static void sliceLolStateBands(const std::vector<int> &srcMinI,
+                               const std::vector<int> &srcMaxI,
+                               const std::vector<int> &srcMinJ,
+                               const std::vector<int> &srcMaxJ,
+                               int subLo,
+                               int subHi,
+                               int scanLen,
+                               std::vector<int> &dstMinI,
+                               std::vector<int> &dstMaxI,
+                               std::vector<int> &dstMinJ,
+                               std::vector<int> &dstMaxJ) {
+    if (srcMinI.empty() || srcMaxI.empty() || srcMinJ.empty() || srcMaxJ.empty()
+        || subLo <= 1 && subHi >= scanLen) {
+        dstMinI = srcMinI;
+        dstMaxI = srcMaxI;
+        dstMinJ = srcMinJ;
+        dstMaxJ = srcMaxJ;
+        return;
+    }
+    const int shift = subLo - 1;
+    const size_t M = srcMinI.size();
+    dstMinI.assign(M, 1);
+    dstMaxI.assign(M, subHi - subLo + 1);
+    dstMinJ.assign(M, 1);
+    dstMaxJ.assign(M, subHi - subLo + 1);
+    bool anyBand = false;
+    for (size_t v = 0; v < M; ++v) {
+        const int loI = std::max(subLo, srcMinI[v]);
+        const int hiI = std::min(subHi, srcMaxI[v]);
+        if (hiI >= loI) {
+            dstMinI[v] = loI - shift;
+            dstMaxI[v] = hiI - shift;
+            anyBand = true;
+        }
+        const int loJ = std::max(subLo, srcMinJ[v]);
+        const int hiJ = std::min(subHi, srcMaxJ[v]);
+        if (hiJ >= loJ) {
+            dstMinJ[v] = loJ - shift;
+            dstMaxJ[v] = hiJ - shift;
+            anyBand = true;
+        }
+    }
+    if (!anyBand) {
+        dstMinI.clear();
+        dstMaxI.clear();
+        dstMinJ.clear();
+        dstMaxJ.clear();
+    }
+}
+
+static void buildLolStateBands(const InfernalExactModel &model,
+                               const Matcher::result_t &rough,
+                               int fullLo,
+                               int fullHi,
+                               bool reverseStrand,
+                               int scanLen,
+                               int bandPad,
+                               std::vector<int> &stateMinI,
+                               std::vector<int> &stateMaxI,
+                               std::vector<int> &stateMinJ,
+                               std::vector<int> &stateMaxJ) {
+    const int clen = std::max(0, model.clen);
+    if (rough.backtrace.empty() || scanLen <= 0 || clen <= 0) {
+        stateMinI.clear();
+        stateMaxI.clear();
+        stateMinJ.clear();
+        stateMaxJ.clear();
+        return;
+    }
+    std::vector<int> targetByConsensus =
+        buildLolConsensusTargetMap(rough, fullLo, fullHi, reverseStrand, scanLen, clen);
+
+    const int M = static_cast<int>(model.states.size());
+    stateMinI.assign(static_cast<size_t>(M), 1);
+    stateMaxI.assign(static_cast<size_t>(M), scanLen);
+    stateMinJ.assign(static_cast<size_t>(M), 1);
+    stateMaxJ.assign(static_cast<size_t>(M), scanLen);
+    bool anyBand = false;
+    for (int v = 0; v < M; ++v) {
+        const CmState &st = model.states[static_cast<size_t>(v)];
+        if ((st.type == CM_ST_MP || st.type == CM_ST_ML || st.type == CM_ST_IL)
+            && st.mapLeft > 0 && st.mapLeft <= clen) {
+            const int mapped = targetByConsensus[static_cast<size_t>(st.mapLeft)];
+            if (mapped > 0) {
+                stateMinI[static_cast<size_t>(v)] = std::max(1, mapped - bandPad);
+                stateMaxI[static_cast<size_t>(v)] = std::min(scanLen, mapped + bandPad);
+                anyBand = true;
+            }
+        }
+        if ((st.type == CM_ST_MP || st.type == CM_ST_MR || st.type == CM_ST_IR)
+            && st.mapRight > 0 && st.mapRight <= clen) {
+            const int mapped = targetByConsensus[static_cast<size_t>(st.mapRight)];
+            if (mapped > 0) {
+                stateMinJ[static_cast<size_t>(v)] = std::max(1, mapped - bandPad);
+                stateMaxJ[static_cast<size_t>(v)] = std::min(scanLen, mapped + bandPad);
+                anyBand = true;
+            }
+        }
+    }
+    if (!anyBand) {
+        stateMinI.clear();
+        stateMaxI.clear();
+        stateMinJ.clear();
+        stateMaxJ.clear();
+    }
+}
+
 static inline double cmStateEmitScoreFast(const ExactStateExec &st, const std::vector<int8_t> &seqCode, int i, int j) {
     if (st.type == CM_ST_MP) {
         if (i > j || i < 1 || j >= static_cast<int>(seqCode.size()) || st.emitSize < 16 || st.emitPtr == NULL) {
@@ -3628,15 +4355,30 @@ struct ExactRecCtx {
     float *chartScore;
     uint32_t *chartSeen;
     uint32_t chartGen;
-    const size_t *chartOffset;  // M+1 entries; chartOffset[M] = total cells
+    const size_t *chartStateDOffset; // M+1 entries; prefix over (state,d) rows
+    const size_t *chartRowOffset;    // totalRows+1 entries; prefix over live cells
+    const int *chartRowImin;         // totalRows entries
+    const int *chartRowSize;         // totalRows entries
     const int *chartBandDmin;   // M entries
     const int *chartBandSize;   // M entries (= dmax-dmin+1, 0 if empty)
+    const int *stateMinI;
+    const int *stateMaxI;
+    const int *stateMinJ;
+    const int *stateMaxJ;
 };
 
 static inline size_t exactChartIndex(const ExactRecCtx &ctx, int v, int i, int d) {
-    return ctx.chartOffset[v]
-         + static_cast<size_t>(i) * static_cast<size_t>(ctx.chartBandSize[v])
-         + static_cast<size_t>(d - ctx.chartBandDmin[v]);
+    const int dIdx = d - ctx.chartBandDmin[v];
+    if (dIdx < 0 || dIdx >= ctx.chartBandSize[v]) {
+        return std::numeric_limits<size_t>::max();
+    }
+    const size_t rowIdx = ctx.chartStateDOffset[v] + static_cast<size_t>(dIdx);
+    const int iMin = ctx.chartRowImin[rowIdx];
+    const int rowSize = ctx.chartRowSize[rowIdx];
+    if (rowSize <= 0 || i < iMin || i >= iMin + rowSize) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return ctx.chartRowOffset[rowIdx] + static_cast<size_t>(i - iMin);
 }
 
 static double exactVitRec(ExactRecCtx &ctx, int v, int i, int j) {
@@ -3651,11 +4393,24 @@ static double exactVitRec(ExactRecCtx &ctx, int v, int i, int j) {
         return NEG_INF;
     }
     const size_t dk = exactChartIndex(ctx, v, i, d);
+    if (dk == std::numeric_limits<size_t>::max()) {
+        return NEG_INF;
+    }
     if (ctx.chartSeen[dk] == ctx.chartGen) {
         return static_cast<double>(ctx.chartScore[dk]);
     }
 
     const ExactStateExec &st = ctx.execData[static_cast<size_t>(v)];
+    if (ctx.stateMinI != NULL && st.consumesLeft) {
+        if (i < ctx.stateMinI[v] || i > ctx.stateMaxI[v]) {
+            return NEG_INF;
+        }
+    }
+    if (ctx.stateMinJ != NULL && st.consumesRight) {
+        if (j < ctx.stateMinJ[v] || j > ctx.stateMaxJ[v]) {
+            return NEG_INF;
+        }
+    }
     if (j < i - 1) {
         return NEG_INF;
     }
@@ -3880,7 +4635,11 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                                  int forcedD = -1,
                                  int anchorI = -1,
                                  int anchorD = -1,
-                                 int forceDisableQdb = -1) {
+                                 int forceDisableQdb = -1,
+                                 const int *stateMinI = NULL,
+                                 const int *stateMaxI = NULL,
+                                 const int *stateMinJ = NULL,
+                                 const int *stateMaxJ = NULL) {
     const int N = static_cast<int>(seq.size());
     const int M = static_cast<int>(model.states.size());
     if (N <= 0 || M <= 0) {
@@ -4142,9 +4901,21 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             activeStates.push_back(v);
         }
     }
+    size_t gpuEmitFloatCount = 0;
+    for (size_t vi = 0; vi < model.states.size(); ++vi) {
+        gpuEmitFloatCount += model.states[vi].emitF.size();
+    }
+    const size_t gpuFastDeckBytesNeeded = estimateFastDeckGpuSingleJobBytes(
+        M, N, activeStates.size(), trDst.size(), ws.trScF.size(), gpuEmitFloatCount);
+    const size_t gpuFastDeckBytesBudget = cmGpuUsableBytes();
+    const bool gpuFastDeckMemEligible = cmGpuExactEnabled() &&
+                                        gpuFastDeckBytesBudget > 0 &&
+                                        gpuFastDeckBytesNeeded > 0 &&
+                                        gpuFastDeckBytesNeeded <= gpuFastDeckBytesBudget;
     // Fast path: iterative deck-based CYK over full sequence.
     // Inside score (if requested) is computed only for the selected best interval.
-    if (cmExactFastDeckEnabled() && N <= 1024) {
+    const bool allowCpuFastDeckFallback = (N <= 1024);
+    if (cmExactFastDeckEnabled() && (allowCpuFastDeckFallback || gpuFastDeckMemEligible)) {
         const float NEG_INF_F = -std::numeric_limits<float>::infinity();
         const size_t iStride = static_cast<size_t>(N + 2);
         const size_t stateStride = static_cast<size_t>(N + 1) * iStride;
@@ -4215,312 +4986,378 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             }
         }
 
-        // E states emit empty only.
-        for (int v = 0; v < M; ++v) {
-            if (exec[static_cast<size_t>(v)].type != CM_ST_E) {
-                continue;
+        bool gpuFilled = false;
+        if (cmGpuExactEnabled()) {
+            std::vector<CmFastDeckGpuState> gpuStates(static_cast<size_t>(M));
+            std::vector<float> gpuEmitData;
+            gpuEmitData.reserve(static_cast<size_t>(M) * 8);
+            for (int v = 0; v < M; ++v) {
+                const size_t vi = static_cast<size_t>(v);
+                const CmState &src = model.states[vi];
+                const ExactStateExec &st = exec[vi];
+                CmFastDeckGpuState &dst = gpuStates[vi];
+                dst.type = static_cast<int>(st.type);
+                dst.dmin = st.dmin;
+                dst.dmax = st.dmax;
+                dst.bLeft = st.bLeft;
+                dst.bRight = st.bRight;
+                dst.dConsume = st.dConsume;
+                dst.niShift = st.niShift;
+                dst.emitSize = st.emitSize;
+                dst.emitOffset = src.emitF.empty() ? -1 : static_cast<int>(gpuEmitData.size());
+                dst.trCount = st.trCount;
+                dst.trOff = st.trOff;
+                dst.consumeMask = (st.consumesLeft ? 1u : 0u) | (st.consumesRight ? 2u : 0u);
+                dst.endSc = static_cast<float>(src.endSc);
+                dst.null2Agg[0] = static_cast<float>(st.null2Agg[0]);
+                dst.null2Agg[1] = static_cast<float>(st.null2Agg[1]);
+                dst.null2Agg[2] = static_cast<float>(st.null2Agg[2]);
+                dst.null2Agg[3] = static_cast<float>(st.null2Agg[3]);
+                if (!src.emitF.empty()) {
+                    gpuEmitData.insert(gpuEmitData.end(), src.emitF.begin(), src.emitF.end());
+                }
             }
-            const size_t vb = stateBase[static_cast<size_t>(v)];
-            for (int i = 1; i <= N + 1; ++i) {
-                vit[vb + static_cast<size_t>(i)] = 0.0f;
+            std::vector<size_t> stateBaseHost(stateBase, stateBase + static_cast<size_t>(M));
+            std::vector<int> bSplitBegHost(bSplitBegByVD, bSplitBegByVD + vdCells);
+            std::vector<int> bSplitEndHost(bSplitEndByVD, bSplitEndByVD + vdCells);
+            std::string gpuError;
+            gpuFilled = runInfernalExactScanFastDeckGpu(
+                N,
+                M,
+                static_cast<int>(iStride),
+                stateStride,
+                cells,
+                ws.seqCode.data(),
+                gpuStates,
+                activeStates,
+                stateBaseHost,
+                bSplitBegHost,
+                bSplitEndHost,
+                trDst,
+                ws.trScF,
+                gpuEmitData,
+                model.hasLocalCfg,
+                static_cast<float>(model.elSelf),
+                vit,
+                &gpuError);
+            if (!gpuFilled && !gpuError.empty()) {
+                static bool warned = false;
+                if (!warned) {
+                    Debug(Debug::WARNING) << "cmscan GPU fast-deck disabled for this run: " << gpuError << "\n";
+                    warned = true;
+                }
             }
         }
 
-        for (int d = 0; d <= N; ++d) {
-            const int iMax = (d == 0) ? (N + 1) : (N - d + 1);
-            for (size_t vsi = 0; vsi < activeStates.size(); ++vsi) {
-                const int v = activeStates[vsi];
-                const size_t vi = static_cast<size_t>(v);
-                const ExactStateExec &st = execData[vi];
-                const size_t vBase = stateBase[vi];
-                const int dmin = isBState[vi] ? st.dmin : nbDmin[vi];
-                const int dmax = isBState[vi] ? st.dmax : nbDmax[vi];
-                if (dmax >= dmin && (d < dmin || d > dmax)) {
-                    // Out-of-band: already NEG_INF from the contiguous pre-fill.
+        if (gpuFilled || allowCpuFastDeckFallback) {
+        if (!gpuFilled) {
+            // E states emit empty only.
+            for (int v = 0; v < M; ++v) {
+                if (exec[static_cast<size_t>(v)].type != CM_ST_E) {
                     continue;
                 }
-                if (isBState[vi]) {
-                    const int y = st.bLeft;
-                    const int z = st.bRight;
-                    if (y < 0 || y >= M || z < 0 || z >= M) {
+                const size_t vb = stateBase[static_cast<size_t>(v)];
+                for (int i = 1; i <= N + 1; ++i) {
+                    vit[vb + static_cast<size_t>(i)] = 0.0f;
+                }
+            }
+
+            for (int d = 0; d <= N; ++d) {
+                const int iMax = (d == 0) ? (N + 1) : (N - d + 1);
+                for (size_t vsi = 0; vsi < activeStates.size(); ++vsi) {
+                    const int v = activeStates[vsi];
+                    const size_t vi = static_cast<size_t>(v);
+                    const ExactStateExec &st = execData[vi];
+                    const size_t vBase = stateBase[vi];
+                    const int dmin = isBState[vi] ? st.dmin : nbDmin[vi];
+                    const int dmax = isBState[vi] ? st.dmax : nbDmax[vi];
+                    if (dmax >= dmin && (d < dmin || d > dmax)) {
+                        // Out-of-band: already NEG_INF from the contiguous pre-fill.
                         continue;
                     }
-                    const size_t vd = static_cast<size_t>(v) * static_cast<size_t>(N + 1) + static_cast<size_t>(d);
-                    const int kBeg = bSplitBegByVD[vd];
-                    const int kEnd = bSplitEndByVD[vd];
-                    const float *const yBase = &vit[stateBase[static_cast<size_t>(y)]];
-                    const float *const zBase = &vit[stateBase[static_cast<size_t>(z)]];
-                    float *const bOut = &vit[vBase + static_cast<size_t>(d) * iStride + 1];
-                    if (kBeg > kEnd) {
-                        std::fill(bOut, bOut + iMax, NEG_INF_F);
-                    } else {
-                        for (int i = 1; i <= iMax; ++i) {
-                            float bBest = NEG_INF_F;
-                            for (int k = kBeg; k <= kEnd; ++k) {
-                                const float l = yBase[static_cast<size_t>(k) * iStride + static_cast<size_t>(i)];
-                                const float r = zBase[static_cast<size_t>(d - k) * iStride + static_cast<size_t>(i + k)];
-                                const float cand = l + r;
-                                bBest = std::fmaxf(bBest, cand);
-                            }
-                            bOut[i - 1] = bBest;
+                    if (isBState[vi]) {
+                        const int y = st.bLeft;
+                        const int z = st.bRight;
+                        if (y < 0 || y >= M || z < 0 || z >= M) {
+                            continue;
                         }
-                    }
-                    continue;
-                }
-
-                const int dConsume = nbDConsume[vi];
-                if (d < dConsume) {
-                    continue;
-                }
-                const int nd = d - dConsume;
-                const int niShift = nbNiShift[vi];
-                const float *ep = nbEmitPtr[vi];
-                const int emitSize = nbEmitSize[vi];
-                const int trCount = nbTrCount[vi];
-                const size_t trOff = nbTrOff[vi];
-                const uint8_t consumeMask = nbConsumeMask[vi];
-                const size_t t4 = vi * 4;
-                const int8_t *sc = ws.seqCode.data();
-                const float *trScFPtr = ws.trScF.data();
-                const StateId *trDstPtr = trDst.data();
-                const size_t *stateBasePtr = stateBase;
-                const size_t dstBase0 = (trCount >= 1) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 0])] : 0;
-                const size_t dstBase1 = (trCount >= 2) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 1])] : 0;
-                const size_t dstBase2 = (trCount >= 3) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 2])] : 0;
-                const size_t dstBase3 = (trCount >= 4) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 3])] : 0;
-                const float trSc0 = (trCount >= 1) ? nbTrScF4[t4 + 0] : 0.f;
-                const float trSc1 = (trCount >= 2) ? nbTrScF4[t4 + 1] : 0.f;
-                const float trSc2 = (trCount >= 3) ? nbTrScF4[t4 + 2] : 0.f;
-                const float trSc3 = (trCount >= 4) ? nbTrScF4[t4 + 3] : 0.f;
-                // Build 5-entry emit lookup (indexed by sc+1, sc in {-1,0,1,2,3})
-                // NEG_INF_F propagates naturally through IEEE float arithmetic
-                float efT[5];
-                if (consumeMask == 0u) {
-                    efT[0] = efT[1] = efT[2] = efT[3] = efT[4] = 0.0f;
-                } else if (consumeMask == 1u || consumeMask == 2u) {
-                    efT[0] = -1.0f;
-                    if (ep && emitSize >= 4) {
-                        efT[1] = ep[0]; efT[2] = ep[1]; efT[3] = ep[2]; efT[4] = ep[3];
-                    } else {
-                        efT[1] = efT[2] = efT[3] = efT[4] = NEG_INF_F;
-                    }
-                } else {
-                    efT[0] = efT[1] = efT[2] = efT[3] = efT[4] = 0.0f; // pair: handled inline
-                }
-                // Contiguous output and source pointers (new layout: d*iStride + i)
-                float *const outPtr = &vit[vBase + static_cast<size_t>(d) * iStride + 1];
-                const float *const src0 = (trCount >= 1) ? &vit[dstBase0 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
-                const float *const src1 = (trCount >= 2) ? &vit[dstBase1 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
-                const float *const src2 = (trCount >= 3) ? &vit[dstBase2 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
-                const float *const src3 = (trCount >= 4) ? &vit[dstBase3 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
-                // sc[i] offset: scL[ii] = sc[ii+1] = sc[i]; scR[ii] = sc[ii+d] = sc[i+d-1]
-                const int8_t *const scL = sc + 1;
-                const int8_t *const scR = sc + d;
-#if defined(CM_HAS_SSE2)
-                if ((trCount == 1 || trCount == 2 || trCount == 4) && consumeMask != 3u) {
-                    const __m128 trSc0V = _mm_set1_ps(trSc0);
-                    const __m128 trSc1V = (trCount >= 2) ? _mm_set1_ps(trSc1) : _mm_set1_ps(NEG_INF_F);
-                    const __m128 trSc2V = (trCount >= 3) ? _mm_set1_ps(trSc2) : _mm_set1_ps(NEG_INF_F);
-                    const __m128 trSc3V = (trCount >= 4) ? _mm_set1_ps(trSc3) : _mm_set1_ps(NEG_INF_F);
-                    int ii = 0;
-                    for (; ii + 4 <= iMax; ii += 4) {
-                        __m128 ef_v;
-                        if (consumeMask == 0u) {
-                            ef_v = _mm_setzero_ps();
-                        } else if (consumeMask == 1u) {
-                            ef_v = _mm_set_ps(efT[scL[ii+3]+1], efT[scL[ii+2]+1],
-                                              efT[scL[ii+1]+1], efT[scL[ii+0]+1]);
-                        } else { // consumeMask == 2u
-                            ef_v = _mm_set_ps(efT[scR[ii+3]+1], efT[scR[ii+2]+1],
-                                              efT[scR[ii+1]+1], efT[scR[ii+0]+1]);
-                        }
-                        __m128 result;
-                        if (trCount == 1) {
-                            result = _mm_add_ps(_mm_add_ps(ef_v, trSc0V), _mm_loadu_ps(src0 + ii));
-                        } else if (trCount == 2) {
-                            const __m128 c0 = _mm_add_ps(_mm_add_ps(ef_v, trSc0V), _mm_loadu_ps(src0 + ii));
-                            const __m128 c1 = _mm_add_ps(_mm_add_ps(ef_v, trSc1V), _mm_loadu_ps(src1 + ii));
-                            result = _mm_max_ps(c0, c1);
-                        } else { // trCount == 4
-                            const __m128 c0 = _mm_add_ps(_mm_add_ps(ef_v, trSc0V), _mm_loadu_ps(src0 + ii));
-                            const __m128 c1 = _mm_add_ps(_mm_add_ps(ef_v, trSc1V), _mm_loadu_ps(src1 + ii));
-                            const __m128 c2 = _mm_add_ps(_mm_add_ps(ef_v, trSc2V), _mm_loadu_ps(src2 + ii));
-                            const __m128 c3 = _mm_add_ps(_mm_add_ps(ef_v, trSc3V), _mm_loadu_ps(src3 + ii));
-                            result = _mm_max_ps(_mm_max_ps(c0, c1), _mm_max_ps(c2, c3));
-                        }
-                        _mm_storeu_ps(outPtr + ii, result);
-                    }
-                    // Scalar remainder
-                    for (; ii < iMax; ++ii) {
-                        const float ef = (consumeMask == 0u) ? 0.0f
-                                       : (consumeMask == 1u) ? efT[scL[ii]+1]
-                                                             : efT[scR[ii]+1];
-                        float best = NEG_INF_F;
-                        if (trCount >= 1) { const float c = ef + trSc0 + src0[ii]; best = std::fmaxf(best, c); }
-                        if (trCount >= 2) { const float c = ef + trSc1 + src1[ii]; best = std::fmaxf(best, c); }
-                        if (trCount >= 3) { const float c = ef + trSc2 + src2[ii]; best = std::fmaxf(best, c); }
-                        if (trCount >= 4) { const float c = ef + trSc3 + src3[ii]; best = std::fmaxf(best, c); }
-                        outPtr[ii] = best;
-                    }
-                } else
-#endif
-                {
-                    // General scalar path (consumeMask==3 pair emit, or trCount==3/trCount>4)
-                    // Precompute base pointers for all transitions (loop-invariant over i)
-                    const float *trSrcPtrs[16];
-                    float trScVals[16];
-                    const int trCountClamped = (trCount <= 16) ? trCount : 16;
-                    for (int t = 0; t < trCountClamped; ++t) {
-                        const size_t ti = trOff + static_cast<size_t>(t);
-                        trSrcPtrs[t] = &vit[stateBasePtr[static_cast<size_t>(trDstPtr[ti])] +
-                                            static_cast<size_t>(nd) * iStride +
-                                            static_cast<size_t>(niShift)];
-                        trScVals[t] = trScFPtr[ti];
-                    }
-
-                    if (trCount == 1) {
-                        for (int ii = 0; ii < iMax; ++ii) {
-                            const int i = ii + 1;
-                            float ef;
-                            if (consumeMask == 3u) {
-                                if (!(ep && emitSize >= 16)) { ef = NEG_INF_F; }
-                                else { const int li = sc[i]; const int ri = sc[i + d - 1]; ef = (li >= 0 && ri >= 0) ? ep[li * 4 + ri] : -1.0f; }
-                            } else if (consumeMask == 0u) { ef = 0.0f; }
-                            else if (consumeMask == 1u) { ef = efT[scL[ii]+1]; }
-                            else { ef = efT[scR[ii]+1]; }
-                            outPtr[ii] = ef + trSc0 + src0[ii];
-                        }
-                    } else if (trCount == 2) {
-                        for (int ii = 0; ii < iMax; ++ii) {
-                            const int i = ii + 1;
-                            float ef;
-                            if (consumeMask == 3u) {
-                                if (!(ep && emitSize >= 16)) { ef = NEG_INF_F; }
-                                else { const int li = sc[i]; const int ri = sc[i + d - 1]; ef = (li >= 0 && ri >= 0) ? ep[li * 4 + ri] : -1.0f; }
-                            } else if (consumeMask == 0u) { ef = 0.0f; }
-                            else if (consumeMask == 1u) { ef = efT[scL[ii]+1]; }
-                            else { ef = efT[scR[ii]+1]; }
-                            float best = ef + trSc0 + src0[ii];
-                            best = std::fmaxf(best, ef + trSc1 + src1[ii]);
-                            outPtr[ii] = best;
-                        }
-                    } else if (trCount == 4) {
-                        for (int ii = 0; ii < iMax; ++ii) {
-                            const int i = ii + 1;
-                            float ef;
-                            if (consumeMask == 3u) {
-                                if (!(ep && emitSize >= 16)) { ef = NEG_INF_F; }
-                                else { const int li = sc[i]; const int ri = sc[i + d - 1]; ef = (li >= 0 && ri >= 0) ? ep[li * 4 + ri] : -1.0f; }
-                            } else if (consumeMask == 0u) { ef = 0.0f; }
-                            else if (consumeMask == 1u) { ef = efT[scL[ii]+1]; }
-                            else { ef = efT[scR[ii]+1]; }
-                            float best = ef + trSc0 + src0[ii];
-                            best = std::fmaxf(best, ef + trSc1 + src1[ii]);
-                            best = std::fmaxf(best, ef + trSc2 + src2[ii]);
-                            best = std::fmaxf(best, ef + trSc3 + src3[ii]);
-                            outPtr[ii] = best;
-                        }
-                    } else {
-                        // Loop-swapped with precomputed emission scores
-                        // Step 1: precompute emission into outPtr (reused as temp buffer)
-                        if (consumeMask == 3u && ep && emitSize >= 16) {
-                            for (int ii = 0; ii < iMax; ++ii) {
-                                const int i = ii + 1;
-                                const int li = sc[i];
-                                const int ri = sc[i + d - 1];
-                                outPtr[ii] = (li >= 0 && ri >= 0) ? ep[li * 4 + ri] : -1.0f;
-                            }
-                        } else if (consumeMask == 3u) {
-                            std::fill(outPtr, outPtr + iMax, NEG_INF_F);
-                        } else if (consumeMask == 0u) {
-                            std::fill(outPtr, outPtr + iMax, 0.0f);
-                        } else if (consumeMask == 1u) {
-                            for (int ii = 0; ii < iMax; ++ii)
-                                outPtr[ii] = efT[scL[ii]+1];
+                        const size_t vd = static_cast<size_t>(v) * static_cast<size_t>(N + 1) + static_cast<size_t>(d);
+                        const int kBeg = bSplitBegByVD[vd];
+                        const int kEnd = bSplitEndByVD[vd];
+                        const float *const yBase = &vit[stateBase[static_cast<size_t>(y)]];
+                        const float *const zBase = &vit[stateBase[static_cast<size_t>(z)]];
+                        float *const bOut = &vit[vBase + static_cast<size_t>(d) * iStride + 1];
+                        if (kBeg > kEnd) {
+                            std::fill(bOut, bOut + iMax, NEG_INF_F);
                         } else {
-                            for (int ii = 0; ii < iMax; ++ii)
-                                outPtr[ii] = efT[scR[ii]+1];
-                        }
-                        // Step 2: for each transition, stream through all i and accumulate
-                        // First transition: bestBuf[ii] = outPtr[ii] + trSc + trSrc[i]
-                        // Use bSplitTmp as temp best buffer
-                        float *bestBuf = ws.bSplitTmp.data();
-                        const int VS = VECSIZE_FLOAT;
-                        {
-                            const float *tsrc = trSrcPtrs[0];
-                            const float tsc = trScVals[0];
-                            const simd_float vtsc = simdf32_set(tsc);
-                            int ii = 0;
-                            for (; ii + VS - 1 < iMax; ii += VS) {
-                                simd_float vo = simdf32_loadu(outPtr + ii);
-                                simd_float vs = simdf32_loadu(tsrc + ii + 1);
-                                simdf32_storeu(bestBuf + ii, simdf32_add(simdf32_add(vo, vtsc), vs));
-                            }
-                            for (; ii < iMax; ++ii) {
-                                bestBuf[ii] = outPtr[ii] + tsc + tsrc[ii + 1];
+                            for (int i = 1; i <= iMax; ++i) {
+                                float bBest = NEG_INF_F;
+                                for (int k = kBeg; k <= kEnd; ++k) {
+                                    const float l = yBase[static_cast<size_t>(k) * iStride + static_cast<size_t>(i)];
+                                    const float r = zBase[static_cast<size_t>(d - k) * iStride + static_cast<size_t>(i + k)];
+                                    const float cand = l + r;
+                                    bBest = std::fmaxf(bBest, cand);
+                                }
+                                bOut[i - 1] = bBest;
                             }
                         }
-                        // Remaining transitions: bestBuf = max(bestBuf, outPtr + tsc + tsrc[i+1])
-                        for (int t = 1; t < trCountClamped; ++t) {
-                            const float *tsrc = trSrcPtrs[t];
-                            const float tsc = trScVals[t];
-                            const simd_float vtsc = simdf32_set(tsc);
-                            int ii = 0;
-                            for (; ii + VS - 1 < iMax; ii += VS) {
-                                simd_float vo = simdf32_loadu(outPtr + ii);
-                                simd_float vs = simdf32_loadu(tsrc + ii + 1);
-                                simd_float vb = simdf32_loadu(bestBuf + ii);
-                                simd_float cand = simdf32_add(simdf32_add(vo, vtsc), vs);
-                                simdf32_storeu(bestBuf + ii, simdf32_max(vb, cand));
-                            }
-                            for (; ii < iMax; ++ii) {
-                                bestBuf[ii] = std::fmaxf(bestBuf[ii], outPtr[ii] + tsc + tsrc[ii + 1]);
-                            }
-                        }
-                        // Copy result back
-                        std::copy(bestBuf, bestBuf + iMax, outPtr);
+                        continue;
                     }
-                }
 
-                // EL pre-fill fusion. Mirrors Infernal cm_dpsearch.c:3389-3398:
-                // for any end-eligible state v, alpha[v][d][i] must reflect
-                // max(regular recurrence, emit_v(i,d) + el_scA[d-sd] + endsc[v]).
-                // Doing this INSIDE the (d,v) fill (not as a post-pass) is what
-                // lets parents w of v reading alpha[v] at later d-iterations see
-                // the EL-augmented value — so EL contribution propagates up the
-                // CM tree, which the prior post-pass placement could never do.
-                if (model.hasLocalCfg && model.elSelf <= 0.0) {
-                    const CmState &csEl = model.states[vi];
-                    if (csEl.endSc != NEG_INF) {
-                        int sdEl = -1;
-                        if (csEl.type == CM_ST_MP) sdEl = 2;
-                        else if (csEl.type == CM_ST_ML || csEl.type == CM_ST_MR) sdEl = 1;
-                        else if (csEl.type == CM_ST_S) sdEl = 0;
-                        if (sdEl >= 0 && d >= sdEl) {
-                            const float elContrib = static_cast<float>(model.elSelf) * static_cast<float>(d - sdEl)
-                                                  + static_cast<float>(csEl.endSc);
-                            const int8_t *scEl = ws.seqCode.data();
+                    const int dConsume = nbDConsume[vi];
+                    if (d < dConsume) {
+                        continue;
+                    }
+                    const int nd = d - dConsume;
+                    const int niShift = nbNiShift[vi];
+                    const float *ep = nbEmitPtr[vi];
+                    const int emitSize = nbEmitSize[vi];
+                    const int trCount = nbTrCount[vi];
+                    const size_t trOff = nbTrOff[vi];
+                    const uint8_t consumeMask = nbConsumeMask[vi];
+                    const size_t t4 = vi * 4;
+                    const int8_t *sc = ws.seqCode.data();
+                    const float *trScFPtr = ws.trScF.data();
+                    const StateId *trDstPtr = trDst.data();
+                    const size_t *stateBasePtr = stateBase;
+                    const size_t dstBase0 = (trCount >= 1) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 0])] : 0;
+                    const size_t dstBase1 = (trCount >= 2) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 1])] : 0;
+                    const size_t dstBase2 = (trCount >= 3) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 2])] : 0;
+                    const size_t dstBase3 = (trCount >= 4) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 3])] : 0;
+                    const float trSc0 = (trCount >= 1) ? nbTrScF4[t4 + 0] : 0.f;
+                    const float trSc1 = (trCount >= 2) ? nbTrScF4[t4 + 1] : 0.f;
+                    const float trSc2 = (trCount >= 3) ? nbTrScF4[t4 + 2] : 0.f;
+                    const float trSc3 = (trCount >= 4) ? nbTrScF4[t4 + 3] : 0.f;
+                    // Build 5-entry emit lookup (indexed by sc+1, sc in {-1,0,1,2,3})
+                    // NEG_INF_F propagates naturally through IEEE float arithmetic
+                    float efT[5];
+                    if (consumeMask == 0u) {
+                        efT[0] = efT[1] = efT[2] = efT[3] = efT[4] = 0.0f;
+                    } else if (consumeMask == 1u || consumeMask == 2u) {
+                        efT[0] = -1.0f;
+                        if (ep && emitSize >= 4) {
+                            efT[1] = ep[0]; efT[2] = ep[1]; efT[3] = ep[2]; efT[4] = ep[3];
+                        } else {
+                            efT[1] = efT[2] = efT[3] = efT[4] = NEG_INF_F;
+                        }
+                    } else {
+                        efT[0] = efT[1] = efT[2] = efT[3] = efT[4] = 0.0f; // pair: handled inline
+                    }
+                    // Contiguous output and source pointers (new layout: d*iStride + i)
+                    float *const outPtr = &vit[vBase + static_cast<size_t>(d) * iStride + 1];
+                    const float *const src0 = (trCount >= 1) ? &vit[dstBase0 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
+                    const float *const src1 = (trCount >= 2) ? &vit[dstBase1 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
+                    const float *const src2 = (trCount >= 3) ? &vit[dstBase2 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
+                    const float *const src3 = (trCount >= 4) ? &vit[dstBase3 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
+                    // sc[i] offset: scL[ii] = sc[ii+1] = sc[i]; scR[ii] = sc[ii+d] = sc[i+d-1]
+                    const int8_t *const scL = sc + 1;
+                    const int8_t *const scR = sc + d;
+#if defined(CM_HAS_SSE2)
+                    if ((trCount == 1 || trCount == 2 || trCount == 4) && consumeMask != 3u) {
+                        const __m128 trSc0V = _mm_set1_ps(trSc0);
+                        const __m128 trSc1V = (trCount >= 2) ? _mm_set1_ps(trSc1) : _mm_set1_ps(NEG_INF_F);
+                        const __m128 trSc2V = (trCount >= 3) ? _mm_set1_ps(trSc2) : _mm_set1_ps(NEG_INF_F);
+                        const __m128 trSc3V = (trCount >= 4) ? _mm_set1_ps(trSc3) : _mm_set1_ps(NEG_INF_F);
+                        int ii = 0;
+                        for (; ii + 4 <= iMax; ii += 4) {
+                            __m128 ef_v;
+                            if (consumeMask == 0u) {
+                                ef_v = _mm_setzero_ps();
+                            } else if (consumeMask == 1u) {
+                                ef_v = _mm_set_ps(efT[scL[ii+3]+1], efT[scL[ii+2]+1],
+                                                  efT[scL[ii+1]+1], efT[scL[ii+0]+1]);
+                            } else { // consumeMask == 2u
+                                ef_v = _mm_set_ps(efT[scR[ii+3]+1], efT[scR[ii+2]+1],
+                                                  efT[scR[ii+1]+1], efT[scR[ii+0]+1]);
+                            }
+                            __m128 result;
+                            if (trCount == 1) {
+                                result = _mm_add_ps(_mm_add_ps(ef_v, trSc0V), _mm_loadu_ps(src0 + ii));
+                            } else if (trCount == 2) {
+                                const __m128 c0 = _mm_add_ps(_mm_add_ps(ef_v, trSc0V), _mm_loadu_ps(src0 + ii));
+                                const __m128 c1 = _mm_add_ps(_mm_add_ps(ef_v, trSc1V), _mm_loadu_ps(src1 + ii));
+                                result = _mm_max_ps(c0, c1);
+                            } else { // trCount == 4
+                                const __m128 c0 = _mm_add_ps(_mm_add_ps(ef_v, trSc0V), _mm_loadu_ps(src0 + ii));
+                                const __m128 c1 = _mm_add_ps(_mm_add_ps(ef_v, trSc1V), _mm_loadu_ps(src1 + ii));
+                                const __m128 c2 = _mm_add_ps(_mm_add_ps(ef_v, trSc2V), _mm_loadu_ps(src2 + ii));
+                                const __m128 c3 = _mm_add_ps(_mm_add_ps(ef_v, trSc3V), _mm_loadu_ps(src3 + ii));
+                                result = _mm_max_ps(_mm_max_ps(c0, c1), _mm_max_ps(c2, c3));
+                            }
+                            _mm_storeu_ps(outPtr + ii, result);
+                        }
+                        // Scalar remainder
+                        for (; ii < iMax; ++ii) {
+                            const float ef = (consumeMask == 0u) ? 0.0f
+                                           : (consumeMask == 1u) ? efT[scL[ii]+1]
+                                                                 : efT[scR[ii]+1];
+                            float best = NEG_INF_F;
+                            if (trCount >= 1) { const float c = ef + trSc0 + src0[ii]; best = std::fmaxf(best, c); }
+                            if (trCount >= 2) { const float c = ef + trSc1 + src1[ii]; best = std::fmaxf(best, c); }
+                            if (trCount >= 3) { const float c = ef + trSc2 + src2[ii]; best = std::fmaxf(best, c); }
+                            if (trCount >= 4) { const float c = ef + trSc3 + src3[ii]; best = std::fmaxf(best, c); }
+                            outPtr[ii] = best;
+                        }
+                    } else
+#endif
+                    {
+                        // General scalar path (consumeMask==3 pair emit, or trCount==3/trCount>4)
+                        // Precompute base pointers for all transitions (loop-invariant over i)
+                        const float *trSrcPtrs[16];
+                        float trScVals[16];
+                        const int trCountClamped = (trCount <= 16) ? trCount : 16;
+                        for (int t = 0; t < trCountClamped; ++t) {
+                            const size_t ti = trOff + static_cast<size_t>(t);
+                            trSrcPtrs[t] = &vit[stateBasePtr[static_cast<size_t>(trDstPtr[ti])] +
+                                                static_cast<size_t>(nd) * iStride +
+                                                static_cast<size_t>(niShift)];
+                            trScVals[t] = trScFPtr[ti];
+                        }
+
+                        if (trCount == 1) {
                             for (int ii = 0; ii < iMax; ++ii) {
                                 const int i = ii + 1;
                                 float ef;
-                                if (consumeMask == 0u) {
-                                    ef = 0.0f;
-                                } else if (consumeMask == 1u) {
-                                    const int li = scEl[i];
-                                    if (li < 0) continue;
-                                    ef = (ep && emitSize >= 4) ? ep[li] : -1.0f;
-                                } else if (consumeMask == 2u) {
-                                    const int ri = scEl[i + d - 1];
-                                    if (ri < 0) continue;
-                                    ef = (ep && emitSize >= 4) ? ep[ri] : -1.0f;
-                                } else {
-                                    const int li = scEl[i];
-                                    const int ri = scEl[i + d - 1];
-                                    if (li < 0 || ri < 0) continue;
-                                    ef = (ep && emitSize >= 16) ? ep[li * 4 + ri] : -1.0f;
+                                if (consumeMask == 3u) {
+                                    if (!(ep && emitSize >= 16)) { ef = NEG_INF_F; }
+                                    else { const int li = sc[i]; const int ri = sc[i + d - 1]; ef = (li >= 0 && ri >= 0) ? ep[li * 4 + ri] : -1.0f; }
+                                } else if (consumeMask == 0u) { ef = 0.0f; }
+                                else if (consumeMask == 1u) { ef = efT[scL[ii]+1]; }
+                                else { ef = efT[scR[ii]+1]; }
+                                outPtr[ii] = ef + trSc0 + src0[ii];
+                            }
+                        } else if (trCount == 2) {
+                            for (int ii = 0; ii < iMax; ++ii) {
+                                const int i = ii + 1;
+                                float ef;
+                                if (consumeMask == 3u) {
+                                    if (!(ep && emitSize >= 16)) { ef = NEG_INF_F; }
+                                    else { const int li = sc[i]; const int ri = sc[i + d - 1]; ef = (li >= 0 && ri >= 0) ? ep[li * 4 + ri] : -1.0f; }
+                                } else if (consumeMask == 0u) { ef = 0.0f; }
+                                else if (consumeMask == 1u) { ef = efT[scL[ii]+1]; }
+                                else { ef = efT[scR[ii]+1]; }
+                                float best = ef + trSc0 + src0[ii];
+                                best = std::fmaxf(best, ef + trSc1 + src1[ii]);
+                                outPtr[ii] = best;
+                            }
+                        } else if (trCount == 4) {
+                            for (int ii = 0; ii < iMax; ++ii) {
+                                const int i = ii + 1;
+                                float ef;
+                                if (consumeMask == 3u) {
+                                    if (!(ep && emitSize >= 16)) { ef = NEG_INF_F; }
+                                    else { const int li = sc[i]; const int ri = sc[i + d - 1]; ef = (li >= 0 && ri >= 0) ? ep[li * 4 + ri] : -1.0f; }
+                                } else if (consumeMask == 0u) { ef = 0.0f; }
+                                else if (consumeMask == 1u) { ef = efT[scL[ii]+1]; }
+                                else { ef = efT[scR[ii]+1]; }
+                                float best = ef + trSc0 + src0[ii];
+                                best = std::fmaxf(best, ef + trSc1 + src1[ii]);
+                                best = std::fmaxf(best, ef + trSc2 + src2[ii]);
+                                best = std::fmaxf(best, ef + trSc3 + src3[ii]);
+                                outPtr[ii] = best;
+                            }
+                        } else {
+                            // Loop-swapped with precomputed emission scores
+                            // Step 1: precompute emission into outPtr (reused as temp buffer)
+                            if (consumeMask == 3u && ep && emitSize >= 16) {
+                                for (int ii = 0; ii < iMax; ++ii) {
+                                    const int i = ii + 1;
+                                    const int li = sc[i];
+                                    const int ri = sc[i + d - 1];
+                                    outPtr[ii] = (li >= 0 && ri >= 0) ? ep[li * 4 + ri] : -1.0f;
                                 }
-                                const float cand = ef + elContrib;
-                                if (outPtr[ii] < cand) outPtr[ii] = cand;
+                            } else if (consumeMask == 3u) {
+                                std::fill(outPtr, outPtr + iMax, NEG_INF_F);
+                            } else if (consumeMask == 0u) {
+                                std::fill(outPtr, outPtr + iMax, 0.0f);
+                            } else if (consumeMask == 1u) {
+                                for (int ii = 0; ii < iMax; ++ii)
+                                    outPtr[ii] = efT[scL[ii]+1];
+                            } else {
+                                for (int ii = 0; ii < iMax; ++ii)
+                                    outPtr[ii] = efT[scR[ii]+1];
+                            }
+                            // Step 2: for each transition, stream through all i and accumulate
+                            // First transition: bestBuf[ii] = outPtr[ii] + trSc + trSrc[i]
+                            // Use bSplitTmp as temp best buffer
+                            float *bestBuf = ws.bSplitTmp.data();
+                            const int VS = VECSIZE_FLOAT;
+                            {
+                                const float *tsrc = trSrcPtrs[0];
+                                const float tsc = trScVals[0];
+                                const simd_float vtsc = simdf32_set(tsc);
+                                int ii = 0;
+                                for (; ii + VS - 1 < iMax; ii += VS) {
+                                    simd_float vo = simdf32_loadu(outPtr + ii);
+                                    simd_float vs = simdf32_loadu(tsrc + ii + 1);
+                                    simdf32_storeu(bestBuf + ii, simdf32_add(simdf32_add(vo, vtsc), vs));
+                                }
+                                for (; ii < iMax; ++ii) {
+                                    bestBuf[ii] = outPtr[ii] + tsc + tsrc[ii + 1];
+                                }
+                            }
+                            // Remaining transitions: bestBuf = max(bestBuf, outPtr + tsc + tsrc[i+1])
+                            for (int t = 1; t < trCountClamped; ++t) {
+                                const float *tsrc = trSrcPtrs[t];
+                                const float tsc = trScVals[t];
+                                const simd_float vtsc = simdf32_set(tsc);
+                                int ii = 0;
+                                for (; ii + VS - 1 < iMax; ii += VS) {
+                                    simd_float vo = simdf32_loadu(outPtr + ii);
+                                    simd_float vs = simdf32_loadu(tsrc + ii + 1);
+                                    simd_float vb = simdf32_loadu(bestBuf + ii);
+                                    simd_float cand = simdf32_add(simdf32_add(vo, vtsc), vs);
+                                    simdf32_storeu(bestBuf + ii, simdf32_max(vb, cand));
+                                }
+                                for (; ii < iMax; ++ii) {
+                                    bestBuf[ii] = std::fmaxf(bestBuf[ii], outPtr[ii] + tsc + tsrc[ii + 1]);
+                                }
+                            }
+                            // Copy result back
+                            std::copy(bestBuf, bestBuf + iMax, outPtr);
+                        }
+                    }
+
+                    // EL pre-fill fusion. Mirrors Infernal cm_dpsearch.c:3389-3398:
+                    // for any end-eligible state v, alpha[v][d][i] must reflect
+                    // max(regular recurrence, emit_v(i,d) + el_scA[d-sd] + endsc[v]).
+                    // Doing this INSIDE the (d,v) fill (not as a post-pass) is what
+                    // lets parents w of v reading alpha[v] at later d-iterations see
+                    // the EL-augmented value — so EL contribution propagates up the
+                    // CM tree, which the prior post-pass placement could never do.
+                    if (model.hasLocalCfg && model.elSelf <= 0.0) {
+                        const CmState &csEl = model.states[vi];
+                        if (csEl.endSc != NEG_INF) {
+                            int sdEl = -1;
+                            if (csEl.type == CM_ST_MP) sdEl = 2;
+                            else if (csEl.type == CM_ST_ML || csEl.type == CM_ST_MR) sdEl = 1;
+                            else if (csEl.type == CM_ST_S) sdEl = 0;
+                            if (sdEl >= 0 && d >= sdEl) {
+                                const float elContrib = static_cast<float>(model.elSelf) * static_cast<float>(d - sdEl)
+                                                      + static_cast<float>(csEl.endSc);
+                                const int8_t *scEl = ws.seqCode.data();
+                                for (int ii = 0; ii < iMax; ++ii) {
+                                    const int i = ii + 1;
+                                    float ef;
+                                    if (consumeMask == 0u) {
+                                        ef = 0.0f;
+                                    } else if (consumeMask == 1u) {
+                                        const int li = scEl[i];
+                                        if (li < 0) continue;
+                                        ef = (ep && emitSize >= 4) ? ep[li] : -1.0f;
+                                    } else if (consumeMask == 2u) {
+                                        const int ri = scEl[i + d - 1];
+                                        if (ri < 0) continue;
+                                        ef = (ep && emitSize >= 4) ? ep[ri] : -1.0f;
+                                    } else {
+                                        const int li = scEl[i];
+                                        const int ri = scEl[i + d - 1];
+                                        if (li < 0 || ri < 0) continue;
+                                        ef = (ep && emitSize >= 16) ? ep[li * 4 + ri] : -1.0f;
+                                    }
+                                    const float cand = ef + elContrib;
+                                    if (outPtr[ii] < cand) outPtr[ii] = cand;
+                                }
                             }
                         }
                     }
@@ -5701,6 +6538,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         }
         outHits.push_back(h);
         return;
+        }
     }
 
     // Compute maxSpan first so we can size the per-state ragged chart precisely.
@@ -5715,17 +6553,12 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         maxSpan = std::min(maxSpan, maxHitLen);
     }
 
-    // Per-state ragged chart: each state v gets bandSize[v]*(N+1) cells, with
-    // bands derived from QDB (CmState::dmin1/dmax1 as copied into exec[v].dmin/dmax).
-    // For big rRNA CMs (M ~ 9000) bands are typically tight (avg ~20) so the
-    // ragged chart is ~30x smaller than a flat M*(N+1)*(maxSpan+1) chart.
-    std::vector<size_t> &chartOffset = ws.exactChartOffset;
+    // Per-state sparse chart: QDB defines legal d rows, and optional LoL bands
+    // later shrink each (state,d) row to only its live i interval.
     std::vector<int> &bandDmin = ws.exactChartBandDmin;
     std::vector<int> &bandSize = ws.exactChartBandSize;
-    chartOffset.assign(static_cast<size_t>(M) + 1, 0);
     bandDmin.assign(static_cast<size_t>(M), 0);
     bandSize.assign(static_cast<size_t>(M), 0);
-    const size_t rowPlus1 = static_cast<size_t>(N + 1);
     for (int v = 0; v < M; ++v) {
         const ExactStateExec &e = exec[static_cast<size_t>(v)];
         int dlo;
@@ -5745,10 +6578,8 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             bandDmin[v] = dlo;
             bandSize[v] = dhi - dlo + 1;
         }
-        chartOffset[v + 1] = chartOffset[v] +
-            static_cast<size_t>(bandSize[v]) * rowPlus1;
     }
-    size_t chartCells = chartOffset[M];
+    size_t chartCells = 0;
 
     // Safety budget. 1G cells = 4GB float + 4GB uint32 = 8GB per-thread worst case.
     // Big rRNA CMs (M=6869-9017, like CP000968) vs comparable-length targets
@@ -5760,6 +6591,49 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                               << "(" << chartCells << " > " << CM_EXACT_CHART_MAX_CELLS
                               << " cells) for M=" << M << " N=" << N << "; skipping target\n";
         return;
+    }
+
+    std::vector<size_t> &chartStateDOffset = ws.exactChartStateDOffset;
+    std::vector<size_t> &chartRowOffset = ws.exactChartRowOffset;
+    std::vector<int> &chartRowImin = ws.exactChartRowImin;
+    std::vector<int> &chartRowSize = ws.exactChartRowSize;
+    chartStateDOffset.assign(static_cast<size_t>(M + 1), 0);
+    for (int v = 0; v < M; ++v) {
+        chartStateDOffset[static_cast<size_t>(v + 1)] =
+            chartStateDOffset[static_cast<size_t>(v)] + static_cast<size_t>(bandSize[v]);
+    }
+    const size_t totalRows = chartStateDOffset[static_cast<size_t>(M)];
+    chartRowOffset.assign(totalRows + 1, 0);
+    chartRowImin.assign(totalRows, 1);
+    chartRowSize.assign(totalRows, 0);
+
+    chartCells = 0;
+    for (int v = 0; v < M; ++v) {
+        const ExactStateExec &st = exec[static_cast<size_t>(v)];
+        for (int dIdx = 0; dIdx < bandSize[v]; ++dIdx) {
+            const int d = bandDmin[v] + dIdx;
+            const size_t rowIdx = chartStateDOffset[static_cast<size_t>(v)] + static_cast<size_t>(dIdx);
+            int iLo = 1;
+            int iHi = N - d + 1;
+            if (iHi < iLo) {
+                chartRowOffset[rowIdx + 1] = chartCells;
+                continue;
+            }
+            if (stateMinI != NULL && st.consumesLeft) {
+                iLo = std::max(iLo, stateMinI[v]);
+                iHi = std::min(iHi, stateMaxI[v]);
+            }
+            if (stateMinJ != NULL && st.consumesRight) {
+                iLo = std::max(iLo, stateMinJ[v] - d + 1);
+                iHi = std::min(iHi, stateMaxJ[v] - d + 1);
+            }
+            if (iHi >= iLo) {
+                chartRowImin[rowIdx] = iLo;
+                chartRowSize[rowIdx] = iHi - iLo + 1;
+                chartCells += static_cast<size_t>(chartRowSize[rowIdx]);
+            }
+            chartRowOffset[rowIdx + 1] = chartCells;
+        }
     }
 
     std::vector<float> &exactChart = ws.exactChart;
@@ -5788,9 +6662,16 @@ static void runInfernalExactScan(const InfernalExactModel &model,
     recCtx.chartScore = exactChart.data();
     recCtx.chartSeen = exactChartSeen.data();
     recCtx.chartGen = exactChartGen;
-    recCtx.chartOffset = chartOffset.data();
+    recCtx.chartStateDOffset = chartStateDOffset.data();
+    recCtx.chartRowOffset = chartRowOffset.data();
+    recCtx.chartRowImin = chartRowImin.data();
+    recCtx.chartRowSize = chartRowSize.data();
     recCtx.chartBandDmin = bandDmin.data();
     recCtx.chartBandSize = bandSize.data();
+    recCtx.stateMinI = stateMinI;
+    recCtx.stateMaxI = stateMaxI;
+    recCtx.stateMinJ = stateMinJ;
+    recCtx.stateMaxJ = stateMaxJ;
     // Infernal semantics evaluate all legal spans under state dmin/dmax/w constraints.
     int minSpan = 1;
     // Fix B: force prefilter envelope on memoized path too (same as fast path).
@@ -6182,6 +7063,51 @@ static int peakAnchorFromCigar(const std::string &bt,
     return any ? bestT : -1;
 }
 
+static bool finishFastDeckSelectedHitBatched(const InfernalExactModel &model,
+                                             const std::string &seqId,
+                                             const CmFastDeckGpuBatchResult &gr,
+                                             const uint16_t *traceStateBuf,
+                                             std::vector<Hit> &outHits) {
+    if (!gr.found || gr.traceOverflow || gr.traceLen <= 0 || traceStateBuf == NULL) {
+        return false;
+    }
+    std::vector<int> traceStates;
+    traceStates.reserve(static_cast<size_t>(gr.traceLen));
+    for (int i = 0; i < gr.traceLen; ++i) {
+        traceStates.push_back(static_cast<int>(traceStateBuf[static_cast<size_t>(i)]));
+    }
+
+    Hit h;
+    h.seqId = seqId;
+    h.start1 = gr.minUsed;
+    h.end1 = gr.maxUsed;
+    h.mode = static_cast<char>(gr.bestMode);
+    h.trunc = (gr.bestMode != 'J');
+    h.traceStates = encodeTraceStates(traceStates);
+    {
+        int qS = -1, qE = -1, aL = 0, leadIns = 0, trailIns = 0;
+        h.cigar = modelTraceCigarQueryCoord(model, traceStates, &qS, &qE, &aL,
+                                            &leadIns, &trailIns);
+        h.qStart = qS;
+        h.qEnd = qE;
+        h.cigarAlnLen = static_cast<unsigned int>(std::max(0, aL));
+        h.leadingInsertTargets = leadIns;
+        h.trailingInsertTargets = trailIns;
+    }
+    const double modelAggRaw[4] = {
+        gr.modelAggRaw[0], gr.modelAggRaw[1], gr.modelAggRaw[2], gr.modelAggRaw[3]
+    };
+    const int obsCount[4] = {
+        gr.obsCount[0], gr.obsCount[1], gr.obsCount[2], gr.obsCount[3]
+    };
+    const double null2Corr = scoreCorrectionNull2BitsFromTrace(model, modelAggRaw, obsCount);
+    h.cyk = gr.bestSc - null2Corr;
+    h.inside = NEG_INF;
+    h.bias = gr.bestNull3Corr + null2Corr;
+    outHits.push_back(std::move(h));
+    return true;
+}
+
 // Stage 8: re-align each hit's envelope sub-sequence using the truncation DP
 // (J/L/R/T modes via runTrCYKInsideAlign + runTrCYKAlignT). Mirrors Infernal
 // cmsearch's per-envelope re-alignment with cm_TrCYKInsideAlign + cm_tr_alignT.
@@ -6334,6 +7260,374 @@ static void runTruncDpReAlignHits(const InfernalExactModel &model,
     }
 }
 
+static bool cmBeamLocalizeEnabled() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char *env = std::getenv("MMSEQS_CMSCAN_BEAM_LOCALIZE");
+        cached = (env != NULL && std::string(env) == "1") ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static int cmBeamLocalizeBeamSize() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char *env = std::getenv("MMSEQS_CMSCAN_BEAM_SIZE");
+        cached = (env != NULL) ? std::atoi(env) : 128;
+        if (cached < 16) {
+            cached = 16;
+        }
+    }
+    return cached;
+}
+
+static int cmBeamLocalizePad() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char *env = std::getenv("MMSEQS_CMSCAN_BEAM_PAD");
+        cached = (env != NULL) ? std::atoi(env) : 48;
+        if (cached < 0) {
+            cached = 0;
+        }
+    }
+    return cached;
+}
+
+static float cmBeamLocalizeGapPenalty() {
+    static float cached = std::numeric_limits<float>::quiet_NaN();
+    if (std::isnan(cached)) {
+        const char *env = std::getenv("MMSEQS_CMSCAN_BEAM_GAP");
+        cached = (env != NULL) ? static_cast<float>(std::atof(env)) : 1.25f;
+        if (!(cached > 0.0f)) {
+            cached = 1.25f;
+        }
+    }
+    return cached;
+}
+
+static float cmBeamLocalizeSlack() {
+    static float cached = std::numeric_limits<float>::quiet_NaN();
+    if (std::isnan(cached)) {
+        const char *env = std::getenv("MMSEQS_CMSCAN_BEAM_SLACK");
+        cached = (env != NULL) ? static_cast<float>(std::atof(env)) : 2.5f;
+        if (cached < 0.0f) {
+            cached = 0.0f;
+        }
+    }
+    return cached;
+}
+
+static void cmBeamBuildEmitProfile(const InfernalExactModel &model,
+                                   std::vector<std::array<float,4>> &profile) {
+    const int clen = static_cast<int>(model.clen);
+    profile.assign(static_cast<size_t>(clen), {0.f, 0.f, 0.f, 0.f});
+    std::vector<int> counts(static_cast<size_t>(clen), 0);
+    for (size_t vi = 0; vi < model.states.size(); ++vi) {
+        const CmState &s = model.states[vi];
+        if (s.type == CM_ST_ML && s.mapLeft >= 1 && s.mapLeft <= clen && s.emitF.size() >= 4) {
+            for (int nt = 0; nt < 4; ++nt) {
+                profile[static_cast<size_t>(s.mapLeft - 1)][static_cast<size_t>(nt)] += s.emitF[static_cast<size_t>(nt)];
+            }
+            counts[static_cast<size_t>(s.mapLeft - 1)]++;
+        } else if (s.type == CM_ST_MR && s.mapRight >= 1 && s.mapRight <= clen && s.emitF.size() >= 4) {
+            for (int nt = 0; nt < 4; ++nt) {
+                profile[static_cast<size_t>(s.mapRight - 1)][static_cast<size_t>(nt)] += s.emitF[static_cast<size_t>(nt)];
+            }
+            counts[static_cast<size_t>(s.mapRight - 1)]++;
+        } else if (s.type == CM_ST_MP && s.emitF.size() >= 16) {
+            if (s.mapLeft >= 1 && s.mapLeft <= clen) {
+                for (int a = 0; a < 4; ++a) {
+                    float sum = 0.0f;
+                    for (int b = 0; b < 4; ++b) {
+                        sum += s.emitF[static_cast<size_t>(a * 4 + b)];
+                    }
+                    profile[static_cast<size_t>(s.mapLeft - 1)][static_cast<size_t>(a)] += sum * 0.25f;
+                }
+                counts[static_cast<size_t>(s.mapLeft - 1)]++;
+            }
+            if (s.mapRight >= 1 && s.mapRight <= clen) {
+                for (int b = 0; b < 4; ++b) {
+                    float sum = 0.0f;
+                    for (int a = 0; a < 4; ++a) {
+                        sum += s.emitF[static_cast<size_t>(a * 4 + b)];
+                    }
+                    profile[static_cast<size_t>(s.mapRight - 1)][static_cast<size_t>(b)] += sum * 0.25f;
+                }
+                counts[static_cast<size_t>(s.mapRight - 1)]++;
+            }
+        }
+    }
+    for (int c = 0; c < clen; ++c) {
+        if (counts[static_cast<size_t>(c)] > 0) {
+            const float inv = 1.0f / static_cast<float>(counts[static_cast<size_t>(c)]);
+            for (int nt = 0; nt < 4; ++nt) {
+                profile[static_cast<size_t>(c)][static_cast<size_t>(nt)] *= inv;
+            }
+        }
+    }
+}
+
+static void cmBeamEncodeSeq(const char *seq, int L, std::vector<int8_t> &out) {
+    out.assign(static_cast<size_t>(L), static_cast<int8_t>(-1));
+    for (int i = 0; i < L; ++i) {
+        const char c = seq[i];
+        if      (c == 'A' || c == 'a') out[static_cast<size_t>(i)] = 0;
+        else if (c == 'C' || c == 'c') out[static_cast<size_t>(i)] = 1;
+        else if (c == 'G' || c == 'g') out[static_cast<size_t>(i)] = 2;
+        else if (c == 'T' || c == 't' || c == 'U' || c == 'u') out[static_cast<size_t>(i)] = 3;
+    }
+}
+
+static CmBeamLocalizeResult cmBeamLocalizeInterval(const InfernalExactModel &model,
+                                                   const std::string &seq) {
+    CmBeamLocalizeResult out;
+    const int N = static_cast<int>(seq.size());
+    if (N <= 0 || model.clen <= 0) {
+        return out;
+    }
+
+    thread_local const InfernalExactModel *cachedModel = NULL;
+    thread_local std::vector<std::array<float,4>> cachedProfile;
+    if (cachedModel != &model) {
+        cmBeamBuildEmitProfile(model, cachedProfile);
+        cachedModel = &model;
+    }
+    if (cachedProfile.empty()) {
+        return out;
+    }
+
+    std::vector<int8_t> encoded;
+    cmBeamEncodeSeq(seq.c_str(), N, encoded);
+    const int qLen = static_cast<int>(cachedProfile.size());
+    const int beamSize = cmBeamLocalizeBeamSize();
+    const int beamCap = std::max(beamSize * 4, beamSize);
+    const int pad = cmBeamLocalizePad();
+    const float gap = cmBeamLocalizeGapPenalty();
+    const float slack = cmBeamLocalizeSlack();
+    const float negInf = -std::numeric_limits<float>::infinity();
+
+    std::vector<float> prevScore(static_cast<size_t>(N + 1), negInf);
+    std::vector<int> prevStart(static_cast<size_t>(N + 1), 0);
+    std::vector<uint8_t> prevValid(static_cast<size_t>(N + 1), 0);
+    std::vector<int> prevActive;
+    std::vector<int> candidates;
+    std::vector<int> rowPositions;
+    std::vector<float> rowScores;
+    std::vector<int> rowStarts;
+    std::vector<int> keepPositions;
+    prevActive.reserve(static_cast<size_t>(beamCap));
+    candidates.reserve(static_cast<size_t>(std::max(N, beamCap * 3)));
+    rowPositions.reserve(static_cast<size_t>(std::max(N, beamCap * 3)));
+    rowScores.reserve(static_cast<size_t>(std::max(N, beamCap * 3)));
+    rowStarts.reserve(static_cast<size_t>(std::max(N, beamCap * 3)));
+    keepPositions.reserve(static_cast<size_t>(beamCap));
+
+    float globalBest = negInf;
+    int globalStart = 1;
+    int globalEnd = 0;
+
+    for (int qi = 0; qi < qLen; ++qi) {
+        candidates.clear();
+        if (qi == 0) {
+            candidates.resize(static_cast<size_t>(N));
+            for (int j = 1; j <= N; ++j) {
+                candidates[static_cast<size_t>(j - 1)] = j;
+            }
+        } else {
+            for (size_t idx = 0; idx < prevActive.size(); ++idx) {
+                const int j = prevActive[idx];
+                if (j > 1) candidates.push_back(j - 1);
+                candidates.push_back(j);
+                if (j < N) candidates.push_back(j + 1);
+            }
+            if (candidates.empty()) {
+                break;
+            }
+            std::sort(candidates.begin(), candidates.end());
+            candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+        }
+
+        rowPositions.clear();
+        rowScores.clear();
+        rowStarts.clear();
+        float rowBest = negInf;
+        int prevCandidateJ = -1000000000;
+        float prevRowScore = negInf;
+        int prevRowStart = 0;
+
+        for (size_t ci = 0; ci < candidates.size(); ++ci) {
+            const int j = candidates[ci];
+            float emit = 0.0f;
+            const int8_t b = encoded[static_cast<size_t>(j - 1)];
+            if (b >= 0 && b < 4) {
+                emit = cachedProfile[static_cast<size_t>(qi)][static_cast<size_t>(b)];
+            }
+
+            float best = emit;
+            int bestStart = j;
+            if (j > 1 && prevValid[static_cast<size_t>(j - 1)] != 0) {
+                const float diag = prevScore[static_cast<size_t>(j - 1)] + emit;
+                if (diag > best) {
+                    best = diag;
+                    bestStart = prevStart[static_cast<size_t>(j - 1)];
+                }
+            }
+            if (prevValid[static_cast<size_t>(j)] != 0) {
+                const float up = prevScore[static_cast<size_t>(j)] - gap;
+                if (up > best) {
+                    best = up;
+                    bestStart = prevStart[static_cast<size_t>(j)];
+                }
+            }
+            if (prevCandidateJ == j - 1 && std::isfinite(prevRowScore)) {
+                const float left = prevRowScore - gap;
+                if (left > best) {
+                    best = left;
+                    bestStart = prevRowStart;
+                }
+            }
+            if (!(best > 0.0f) || !std::isfinite(best)) {
+                prevCandidateJ = j;
+                prevRowScore = negInf;
+                prevRowStart = 0;
+                continue;
+            }
+            rowPositions.push_back(j);
+            rowScores.push_back(best);
+            rowStarts.push_back(bestStart);
+            if (best > rowBest) {
+                rowBest = best;
+            }
+            if (best > globalBest) {
+                globalBest = best;
+                globalStart = bestStart;
+                globalEnd = j;
+            }
+            prevCandidateJ = j;
+            prevRowScore = best;
+            prevRowStart = bestStart;
+        }
+
+        out.rowsVisited++;
+        for (size_t idx = 0; idx < prevActive.size(); ++idx) {
+            prevValid[static_cast<size_t>(prevActive[idx])] = 0;
+        }
+        prevActive.clear();
+        if (rowPositions.empty()) {
+            break;
+        }
+
+        std::vector<size_t> order(rowPositions.size());
+        std::iota(order.begin(), order.end(), 0);
+        if (static_cast<int>(order.size()) > beamSize) {
+            out.rowsPruned++;
+        }
+        std::sort(order.begin(), order.end(),
+                  [&](size_t left, size_t right) {
+                      if (rowScores[left] != rowScores[right]) {
+                          return rowScores[left] > rowScores[right];
+                      }
+                      return rowPositions[left] < rowPositions[right];
+                  });
+        const float kthScore = rowScores[order[std::min<size_t>(order.size(), static_cast<size_t>(beamSize)) - 1]];
+        const float threshold = std::max(kthScore, rowBest - slack);
+        keepPositions.clear();
+        for (size_t oi = 0; oi < order.size(); ++oi) {
+            const size_t idx = order[oi];
+            if (rowScores[idx] < threshold && static_cast<int>(keepPositions.size()) >= beamSize) {
+                break;
+            }
+            keepPositions.push_back(static_cast<int>(idx));
+            if (static_cast<int>(keepPositions.size()) >= beamCap) {
+                break;
+            }
+        }
+        std::sort(keepPositions.begin(), keepPositions.end(),
+                  [&](int left, int right) {
+                      return rowPositions[static_cast<size_t>(left)] < rowPositions[static_cast<size_t>(right)];
+                  });
+        for (size_t ki = 0; ki < keepPositions.size(); ++ki) {
+            const size_t idx = static_cast<size_t>(keepPositions[ki]);
+            const int pos = rowPositions[idx];
+            prevValid[static_cast<size_t>(pos)] = 1;
+            prevScore[static_cast<size_t>(pos)] = rowScores[idx];
+            prevStart[static_cast<size_t>(pos)] = rowStarts[idx];
+            prevActive.push_back(pos);
+        }
+    }
+
+    if (!std::isfinite(globalBest) || globalEnd < globalStart) {
+        return out;
+    }
+
+    int lo = std::max(1, globalStart - pad);
+    int hi = std::min(N, globalEnd + pad);
+    const int minWidth = std::max(24, qLen / 2);
+    if (hi - lo + 1 < minWidth) {
+        const int center = (globalStart + globalEnd) / 2;
+        lo = std::max(1, center - minWidth / 2);
+        hi = std::min(N, lo + minWidth - 1);
+        lo = std::max(1, hi - minWidth + 1);
+    }
+
+    out.valid = (hi > lo) && (hi - lo + 1 < N);
+    out.start = lo;
+    out.end = hi;
+    out.bestScore = globalBest;
+    return out;
+}
+
+static void cmMaybeBeamNarrowRegion(const InfernalExactModel &model,
+                                    std::string &regionSeq,
+                                    int &offset,
+                                    int &forceI,
+                                    int &anchorI,
+                                    int &anchorD) {
+    if (!cmBeamLocalizeEnabled()) {
+        return;
+    }
+    if (regionSeq.size() < 64) {
+        return;
+    }
+    if (forceI > 0 || anchorI > 0 || anchorD > 0) {
+        return;
+    }
+
+    const CmBeamLocalizeResult beam = cmBeamLocalizeInterval(model, regionSeq);
+    if (!beam.valid) {
+        return;
+    }
+
+    const int lo0 = beam.start - 1;
+    const int len = beam.end - beam.start + 1;
+    if (len <= 0 || len >= static_cast<int>(regionSeq.size())) {
+        return;
+    }
+    regionSeq = regionSeq.substr(static_cast<size_t>(lo0), static_cast<size_t>(len));
+    offset += lo0;
+    forceI = -1;
+    anchorI = -1;
+    anchorD = -1;
+}
+
+static bool cmBeamResultLooksOff(const std::vector<Hit> &hits,
+                                 int beamStart,
+                                 int beamEnd,
+                                 int fullLen) {
+    if (hits.empty()) {
+        return true;
+    }
+    const int margin = std::max(4, std::min(16, fullLen / 20));
+    for (size_t i = 0; i < hits.size(); ++i) {
+        const int lo = std::min(hits[i].start1, hits[i].end1);
+        const int hi = std::max(hits[i].start1, hits[i].end1);
+        if (lo <= beamStart + margin || hi >= beamEnd - margin) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Per-envelope CYK re-scan wrapper. When MMSEQS_CMSCAN_RESCORE_ENVELOPE=1,
 // runs CYK twice: first to identify peak (i,j), then re-runs on a sub-sequence
 // of [max(1, i-pad) .. min(N, j+pad)] which mirrors Infernal's dispatch#2 behavior
@@ -6348,7 +7642,11 @@ static void runInfernalExactScanWithEnvelopeRescore(const InfernalExactModel &mo
                                                     int forcedI = -1,
                                                     int forcedD = -1,
                                                     int anchorI = -1,
-                                                    int anchorD = -1) {
+                                                    int anchorD = -1,
+                                                    const int *stateMinI = NULL,
+                                                    const int *stateMaxI = NULL,
+                                                    const int *stateMinJ = NULL,
+                                                    const int *stateMaxJ = NULL) {
     static int rescoreEnabled = -1;
     static int rescorePad = -1;
     static int rescanQdbOff = -1;
@@ -6384,7 +7682,8 @@ static void runInfernalExactScanWithEnvelopeRescore(const InfernalExactModel &mo
         std::chrono::steady_clock::time_point _t0, _t1, _t2;
         if (_wrapTiming) _t0 = std::chrono::steady_clock::now();
         runInfernalExactScan(model, seq, wantInside, outHits, seqId, maxHitLen, forcedI, forcedD,
-                             anchorI, anchorD);
+                             anchorI, anchorD, -1,
+                             stateMinI, stateMaxI, stateMinJ, stateMaxJ);
         if (_wrapTiming) _t1 = std::chrono::steady_clock::now();
         if (!skipTruncRealign) {
             runTruncDpReAlignHits(model, seq, outHits);
@@ -6406,7 +7705,8 @@ static void runInfernalExactScanWithEnvelopeRescore(const InfernalExactModel &mo
     std::vector<Hit> probeHits;
     const int pass1DisableQdb = rescanQdbOff ? 0 : -1;
     runInfernalExactScan(model, seq, /*wantInside=*/false, probeHits, seqId, maxHitLen, forcedI, forcedD,
-                         anchorI, anchorD, pass1DisableQdb);
+                         anchorI, anchorD, pass1DisableQdb,
+                         stateMinI, stateMaxI, stateMinJ, stateMaxJ);
     if (probeHits.empty()) {
         outHits = std::move(probeHits);
         return;
@@ -6425,11 +7725,37 @@ static void runInfernalExactScanWithEnvelopeRescore(const InfernalExactModel &mo
         const int subLen = wj - wi + 1;
         std::string subSeq = seq.substr(static_cast<size_t>(wi - 1), static_cast<size_t>(subLen));
         std::vector<Hit> rescoreHits;
+        std::vector<int> slicedMinI, slicedMaxI, slicedMinJ, slicedMaxJ;
+        const int *pass2MinI = stateMinI;
+        const int *pass2MaxI = stateMaxI;
+        const int *pass2MinJ = stateMinJ;
+        const int *pass2MaxJ = stateMaxJ;
+        if (stateMinI != NULL || stateMaxI != NULL || stateMinJ != NULL || stateMaxJ != NULL) {
+            std::vector<int> tmpMinI, tmpMaxI, tmpMinJ, tmpMaxJ;
+            const int M = static_cast<int>(model.states.size());
+            if (stateMinI != NULL && stateMaxI != NULL && stateMinJ != NULL && stateMaxJ != NULL && M > 0) {
+                tmpMinI.assign(stateMinI, stateMinI + M);
+                tmpMaxI.assign(stateMaxI, stateMaxI + M);
+                tmpMinJ.assign(stateMinJ, stateMinJ + M);
+                tmpMaxJ.assign(stateMaxJ, stateMaxJ + M);
+                sliceLolStateBands(tmpMinI, tmpMaxI, tmpMinJ, tmpMaxJ,
+                                   wi, wj, N,
+                                   slicedMinI, slicedMaxI, slicedMinJ, slicedMaxJ);
+                if (!slicedMinI.empty() && !slicedMaxI.empty()
+                    && !slicedMinJ.empty() && !slicedMaxJ.empty()) {
+                    pass2MinI = slicedMinI.data();
+                    pass2MaxI = slicedMaxI.data();
+                    pass2MinJ = slicedMinJ.data();
+                    pass2MaxJ = slicedMaxJ.data();
+                }
+            }
+        }
         const int pass2DisableQdb = rescanQdbOff ? 1 : -1;
         runInfernalExactScan(model, subSeq, wantInside, rescoreHits, seqId, maxHitLen,
                              /*forcedI=*/-1, /*forcedD=*/-1,
                              /*anchorI=*/-1, /*anchorD=*/-1,
-                             pass2DisableQdb);
+                             pass2DisableQdb,
+                             pass2MinI, pass2MaxI, pass2MinJ, pass2MaxJ);
         if (rescoreHits.empty()) {
             outHits.push_back(std::move(probe));
             continue;
@@ -6684,6 +8010,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
             int dbEnd;
             int qStart;
             int qEnd;
+            int qLen;
             bool hasRegionCoord;
             bool prefilterIsRev;
             std::string backtrace; // SW per-char M/I/D from m8 col 10, if present
@@ -6734,6 +8061,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
                         cand.dbEnd   = Util::fast_atoi<int>(colStart[8]);
                         cand.qStart  = Util::fast_atoi<int>(colStart[4]);
                         cand.qEnd    = Util::fast_atoi<int>(colStart[5]);
+                        cand.qLen    = (colStart[6] != NULL) ? Util::fast_atoi<int>(colStart[6]) : 0;
                         // mmseqs/iter3 may encode minus strand by reversing
                         // either side. Strand is XOR of the two reversals.
                         const bool dbRev = (cand.dbStart > cand.dbEnd);
@@ -6755,6 +8083,519 @@ int cmscan(int argc, const char **argv, const Command &command) {
             }
         }
 
+        const bool useGpuBatchCommonPath = cmGpuBatchCommonPathEnabled(qm.exactModel);
+        if (useGpuBatchCommonPath) {
+            const int M = static_cast<int>(qm.exactModel.states.size());
+            const bool truncModesEnabled = cmTruncModesEnabled();
+            const bool null3Enabled = cmNull3Enabled();
+            const double log2Omega3 = (qm.exactModel.null3Omega > 0.0) ? std::log2(qm.exactModel.null3Omega) : NEG_INF;
+            const std::array<double, 4> log2Null = {{
+                (qm.exactModel.nullProb[0] > 0.0) ? std::log2(qm.exactModel.nullProb[0]) : NEG_INF,
+                (qm.exactModel.nullProb[1] > 0.0) ? std::log2(qm.exactModel.nullProb[1]) : NEG_INF,
+                (qm.exactModel.nullProb[2] > 0.0) ? std::log2(qm.exactModel.nullProb[2]) : NEG_INF,
+                (qm.exactModel.nullProb[3] > 0.0) ? std::log2(qm.exactModel.nullProb[3]) : NEG_INF
+            }};
+
+            std::vector<ExactStateExec> exec(static_cast<size_t>(M));
+            std::vector<StateId> trDst;
+            std::vector<double> trSc;
+            trDst.reserve(static_cast<size_t>(M) * 4);
+            trSc.reserve(static_cast<size_t>(M) * 4);
+            std::vector<int> activeStates;
+            activeStates.reserve(static_cast<size_t>(M));
+            const char *envDisableQdb = std::getenv("MMSEQS_CMSCAN_DISABLE_QDB");
+            const bool disableQdb = (envDisableQdb != NULL && envDisableQdb[0] == '1');
+            const char *envDropDmin = std::getenv("MMSEQS_CMSCAN_DROP_DMIN");
+            const bool dropDmin = (envDropDmin != NULL && envDropDmin[0] == '1');
+            const char *envDropDmax = std::getenv("MMSEQS_CMSCAN_DROP_DMAX");
+            const bool dropDmax = (envDropDmax != NULL && envDropDmax[0] == '1');
+            for (int v = 0; v < M; ++v) {
+                const CmState &st = qm.exactModel.states[static_cast<size_t>(v)];
+                ExactStateExec e;
+                e.type = st.type;
+                e.niShift = 0;
+                e.dConsume = 0;
+                e.consumesLeft = false;
+                e.consumesRight = false;
+                e.bLeft = st.cfirst;
+                e.bRight = st.cnum;
+                e.trDst4[0] = 0; e.trDst4[1] = 0; e.trDst4[2] = 0; e.trDst4[3] = 0;
+                e.trScF4[0] = -std::numeric_limits<float>::infinity();
+                e.trScF4[1] = -std::numeric_limits<float>::infinity();
+                e.trScF4[2] = -std::numeric_limits<float>::infinity();
+                e.trScF4[3] = -std::numeric_limits<float>::infinity();
+                e.trSc4[0] = NEG_INF; e.trSc4[1] = NEG_INF; e.trSc4[2] = NEG_INF; e.trSc4[3] = NEG_INF;
+                e.trOff = trDst.size();
+                e.trCount = 0;
+                e.emitPtr = st.emitF.empty() ? NULL : &st.emitF[0];
+                e.emitSize = static_cast<int>(st.emit.size());
+                e.splitKMin = 0;
+                e.splitKMax = -1;
+                e.splitRMin = 0;
+                e.splitRMax = -1;
+                e.dmin = (disableQdb || dropDmin || dropDmax) ? 0 : st.dmin1;
+                e.dmax = (disableQdb || dropDmax) ? -1 : st.dmax1;
+                e.null2Agg[0] = e.null2Agg[1] = e.null2Agg[2] = e.null2Agg[3] = 0.0;
+                if (st.type == CM_ST_MP) {
+                    e.niShift = 1;
+                    e.dConsume = 2;
+                    e.consumesLeft = true;
+                    e.consumesRight = true;
+                } else if (st.type == CM_ST_ML || st.type == CM_ST_IL) {
+                    e.niShift = 1;
+                    e.dConsume = 1;
+                    e.consumesLeft = true;
+                } else if (st.type == CM_ST_MR || st.type == CM_ST_IR) {
+                    e.dConsume = 1;
+                    e.consumesRight = true;
+                }
+                if (st.type == CM_ST_MP && e.emitPtr != NULL && e.emitSize >= 16) {
+                    for (int a = 0; a < 4; ++a) {
+                        double row = 0.0;
+                        double col = 0.0;
+                        for (int b = 0; b < 4; ++b) {
+                            row += emitBitToProbPair(e.emitPtr[a * 4 + b], qm.exactModel, a, b);
+                            col += emitBitToProbPair(e.emitPtr[b * 4 + a], qm.exactModel, b, a);
+                        }
+                        e.null2Agg[a] = row + col;
+                    }
+                } else if ((st.type == CM_ST_ML || st.type == CM_ST_MR || st.type == CM_ST_IL || st.type == CM_ST_IR) &&
+                           e.emitPtr != NULL && e.emitSize >= 4) {
+                    for (int a = 0; a < 4; ++a) {
+                        e.null2Agg[a] = emitBitToProbSingle(e.emitPtr[a], qm.exactModel, a);
+                    }
+                }
+                if (st.type == CM_ST_B) {
+                    if (!disableQdb && !dropDmax && e.bLeft >= 0 && e.bLeft < M) {
+                        const CmState &l = qm.exactModel.states[static_cast<size_t>(e.bLeft)];
+                        if (l.dmin1 >= 0 && l.dmax1 >= l.dmin1) {
+                            e.splitKMin = dropDmin ? 0 : l.dmin1;
+                            e.splitKMax = l.dmax1;
+                        }
+                    }
+                    if (!disableQdb && !dropDmax && e.bRight >= 0 && e.bRight < M) {
+                        const CmState &r = qm.exactModel.states[static_cast<size_t>(e.bRight)];
+                        if (r.dmin1 >= 0 && r.dmax1 >= r.dmin1) {
+                            e.splitRMin = dropDmin ? 0 : r.dmin1;
+                            e.splitRMax = r.dmax1;
+                        }
+                    }
+                } else if (st.type != CM_ST_E) {
+                    const int tn = std::min(st.cnum, static_cast<int>(st.trans.size()));
+                    for (int x = 0; x < tn; ++x) {
+                        const int y = st.cfirst + x;
+                        if (y < 0 || y >= M) continue;
+                        if (e.trCount < 4) {
+                            const size_t t = static_cast<size_t>(e.trCount);
+                            e.trDst4[t] = static_cast<StateId>(y);
+                            e.trSc4[t] = st.trans[static_cast<size_t>(x)];
+                            e.trScF4[t] = static_cast<float>(st.trans[static_cast<size_t>(x)]);
+                        }
+                        trDst.push_back(static_cast<StateId>(y));
+                        trSc.push_back(st.trans[static_cast<size_t>(x)]);
+                        ++e.trCount;
+                    }
+                }
+                exec[static_cast<size_t>(v)] = e;
+            }
+            for (int v = M - 1; v >= 0; --v) {
+                if (exec[static_cast<size_t>(v)].type != CM_ST_E) {
+                    activeStates.push_back(v);
+                }
+            }
+            std::vector<float> trScF(trSc.size());
+            for (size_t ti = 0; ti < trSc.size(); ++ti) {
+                trScF[ti] = static_cast<float>(trSc[ti]);
+            }
+            std::vector<CmFastDeckGpuState> gpuStates(static_cast<size_t>(M));
+            std::vector<float> gpuEmitData;
+            gpuEmitData.reserve(static_cast<size_t>(M) * 8);
+            for (int v = 0; v < M; ++v) {
+                const size_t vi = static_cast<size_t>(v);
+                const CmState &src = qm.exactModel.states[vi];
+                const ExactStateExec &st = exec[vi];
+                CmFastDeckGpuState &dst = gpuStates[vi];
+                dst.type = static_cast<int>(st.type);
+                dst.dmin = st.dmin;
+                dst.dmax = st.dmax;
+                dst.bLeft = st.bLeft;
+                dst.bRight = st.bRight;
+                dst.dConsume = st.dConsume;
+                dst.niShift = st.niShift;
+                dst.emitSize = st.emitSize;
+                dst.emitOffset = src.emitF.empty() ? -1 : static_cast<int>(gpuEmitData.size());
+                dst.trCount = st.trCount;
+                dst.trOff = st.trOff;
+                dst.consumeMask = (st.consumesLeft ? 1u : 0u) | (st.consumesRight ? 2u : 0u);
+                dst.endSc = static_cast<float>(src.endSc);
+                dst.null2Agg[0] = static_cast<float>(st.null2Agg[0]);
+                dst.null2Agg[1] = static_cast<float>(st.null2Agg[1]);
+                dst.null2Agg[2] = static_cast<float>(st.null2Agg[2]);
+                dst.null2Agg[3] = static_cast<float>(st.null2Agg[3]);
+                if (!src.emitF.empty()) {
+                    gpuEmitData.insert(gpuEmitData.end(), src.emitF.begin(), src.emitF.end());
+                }
+            }
+
+            struct BatchEntry {
+                std::string seqId;
+                std::string fullSeq;
+                std::string scanSeq;
+                unsigned int tKey = 0;
+                unsigned int fullLen = 0;
+                int offset = 0;
+                int regionLen = 0;
+                int strand = 1;
+                int minSpan = 1;
+                int maxSpan = 0;
+                int maxHitLen = 0;
+                int forceI = -1;
+                int forceD = -1;
+            };
+            struct BatchBucket {
+                int maxN = 0;
+                std::vector<BatchEntry> entries;
+            };
+            std::unordered_map<int, BatchBucket> batchBuckets;
+            std::vector<int> batchBucketKeys;
+            Sequence seqObjLocal(seqDbr.getMaxSeqLen(), Parameters::DBTYPE_NUCLEOTIDES, &nucMat, 0, false, false);
+            static int wcapModeBatch = -1;
+            if (wcapModeBatch == -1) {
+                const char *env = std::getenv("MMSEQS_CMSCAN_WCAP");
+                wcapModeBatch = (env != NULL && std::string(env) == "0") ? 0 : 1;
+            }
+            static double dminFracBatch = -1.0;
+            if (dminFracBatch < 0.0) {
+                const char *env = std::getenv("MMSEQS_CMSCAN_DMIN_CLEN_FRAC");
+                dminFracBatch = (env != NULL) ? std::atof(env) : 0.0;
+                if (dminFracBatch < 0.0 || dminFracBatch > 1.0) dminFracBatch = 0.0;
+            }
+            int gpuBatchBucketWidth = 4;
+            if (const char *env = std::getenv("MMSEQS_CMSCAN_GPU_BATCH_BUCKET")) {
+                const int parsed = std::atoi(env);
+                if (parsed > 0) gpuBatchBucketWidth = parsed;
+            }
+            size_t batchCellBudget = 1610612736ULL;
+            if (const char *env = std::getenv("MMSEQS_CMSCAN_GPU_BATCH_CELLS")) {
+                const unsigned long long parsed = std::strtoull(env, NULL, 10);
+                if (parsed > 0) batchCellBudget = static_cast<size_t>(parsed);
+            }
+            const size_t batchBytesBudget = cmGpuUsableBytes();
+            auto estimateGpuBatchBytes = [&](size_t batchSize, int maxN, int traceCapacity) -> size_t {
+                if (batchSize == 0 || maxN <= 0 || traceCapacity <= 0) {
+                    return 0;
+                }
+                const size_t seqStride = static_cast<size_t>(maxN + 1);
+                const size_t iStride = static_cast<size_t>(maxN + 2);
+                const size_t stateStride = static_cast<size_t>(maxN + 1) * iStride;
+                const size_t cellsPerJob = static_cast<size_t>(M) * stateStride;
+                const size_t vdCells = static_cast<size_t>(M) * static_cast<size_t>(maxN + 1);
+                size_t bytes = 0;
+                bytes += batchSize * sizeof(CmFastDeckGpuBatchJob);
+                bytes += batchSize * seqStride * sizeof(int8_t);
+                bytes += 4ULL * batchSize * seqStride * sizeof(int);
+                bytes += static_cast<size_t>(maxN + 1) * sizeof(double);
+                bytes += gpuStates.size() * sizeof(CmFastDeckGpuState);
+                bytes += activeStates.size() * sizeof(int);
+                bytes += static_cast<size_t>(M) * sizeof(size_t);
+                bytes += 2ULL * vdCells * sizeof(int);
+                bytes += trDst.size() * sizeof(uint16_t);
+                bytes += trScF.size() * sizeof(float);
+                bytes += gpuEmitData.size() * sizeof(float);
+                bytes += batchSize * cellsPerJob * sizeof(float);
+                bytes += batchSize * sizeof(CmFastDeckGpuBatchResult);
+                bytes += batchSize * static_cast<size_t>(traceCapacity) * sizeof(uint16_t);
+                bytes += batchSize * static_cast<size_t>(traceCapacity) * CM_FASTDECK_GPU_TBCELL_BYTES;
+                return bytes;
+            };
+
+            auto flushGpuBatch = [&](std::vector<BatchEntry> &batchEntries, int maxN) {
+                if (batchEntries.empty()) return;
+                if (maxN <= 0) {
+                    batchEntries.clear();
+                    return;
+                }
+                const size_t iStride = static_cast<size_t>(maxN + 2);
+                const size_t stateStride = static_cast<size_t>(maxN + 1) * iStride;
+                const size_t cellsPerJob = static_cast<size_t>(M) * stateStride;
+                std::vector<size_t> stateBase(static_cast<size_t>(M));
+                for (int v = 0; v < M; ++v) {
+                    stateBase[static_cast<size_t>(v)] = static_cast<size_t>(v) * stateStride;
+                }
+                const size_t vdCells = static_cast<size_t>(M) * static_cast<size_t>(maxN + 1);
+                std::vector<int> bSplitBegByVD(vdCells, 0);
+                std::vector<int> bSplitEndByVD(vdCells, -1);
+                for (int v = 0; v < M; ++v) {
+                    const ExactStateExec &st = exec[static_cast<size_t>(v)];
+                    if (st.type != CM_ST_B) continue;
+                    for (int d = 0; d <= maxN; ++d) {
+                        int kBeg = 0;
+                        int kEnd = d;
+                        if (st.splitKMax >= st.splitKMin) {
+                            kBeg = std::max(kBeg, st.splitKMin);
+                            kEnd = std::min(kEnd, st.splitKMax);
+                        }
+                        if (st.splitRMax >= st.splitRMin) {
+                            kBeg = std::max(kBeg, d - st.splitRMax);
+                            kEnd = std::min(kEnd, d - st.splitRMin);
+                        }
+                        const size_t vd = static_cast<size_t>(v) * static_cast<size_t>(maxN + 1) + static_cast<size_t>(d);
+                        bSplitBegByVD[vd] = kBeg;
+                        bSplitEndByVD[vd] = kEnd;
+                    }
+                }
+                const int seqStride = maxN + 1;
+                std::vector<CmFastDeckGpuBatchJob> gpuJobs(batchEntries.size());
+                std::vector<int8_t> packedSeqCode(static_cast<size_t>(batchEntries.size()) * static_cast<size_t>(seqStride), -1);
+                std::vector<int> packedPrefA(static_cast<size_t>(batchEntries.size()) * static_cast<size_t>(seqStride), 0);
+                std::vector<int> packedPrefC(static_cast<size_t>(batchEntries.size()) * static_cast<size_t>(seqStride), 0);
+                std::vector<int> packedPrefG(static_cast<size_t>(batchEntries.size()) * static_cast<size_t>(seqStride), 0);
+                std::vector<int> packedPrefU(static_cast<size_t>(batchEntries.size()) * static_cast<size_t>(seqStride), 0);
+                for (size_t bi = 0; bi < batchEntries.size(); ++bi) {
+                    const BatchEntry &e = batchEntries[bi];
+                    CmFastDeckGpuBatchJob &job = gpuJobs[bi];
+                    job.N = static_cast<int>(e.scanSeq.size());
+                    job.minSpan = e.minSpan;
+                    job.maxSpan = e.maxSpan;
+                    job.forcedI = e.forceI;
+                    job.forcedD = e.forceD;
+                    const size_t off = bi * static_cast<size_t>(seqStride);
+                    for (int p = 1; p <= job.N; ++p) {
+                        const int biCode = baseToIdx(e.scanSeq[static_cast<size_t>(p - 1)]);
+                        packedSeqCode[off + static_cast<size_t>(p)] = static_cast<int8_t>(biCode);
+                        packedPrefA[off + static_cast<size_t>(p)] = packedPrefA[off + static_cast<size_t>(p - 1)];
+                        packedPrefC[off + static_cast<size_t>(p)] = packedPrefC[off + static_cast<size_t>(p - 1)];
+                        packedPrefG[off + static_cast<size_t>(p)] = packedPrefG[off + static_cast<size_t>(p - 1)];
+                        packedPrefU[off + static_cast<size_t>(p)] = packedPrefU[off + static_cast<size_t>(p - 1)];
+                        if (biCode == 0) packedPrefA[off + static_cast<size_t>(p)]++;
+                        else if (biCode == 1) packedPrefC[off + static_cast<size_t>(p)]++;
+                        else if (biCode == 2) packedPrefG[off + static_cast<size_t>(p)]++;
+                        else if (biCode == 3) packedPrefU[off + static_cast<size_t>(p)]++;
+                    }
+                }
+                std::vector<double> log2Int(static_cast<size_t>(maxN + 1), NEG_INF);
+                for (int x = 1; x <= maxN; ++x) {
+                    log2Int[static_cast<size_t>(x)] = std::log2(static_cast<double>(x));
+                }
+                const int traceCapacity = std::max(256, 2 * (M + maxN + 8));
+                std::vector<CmFastDeckGpuBatchResult> gpuResults;
+                std::vector<uint16_t> hostTraceStates;
+                std::string gpuError;
+                const bool ok = runInfernalExactScanFastDeckGpuBatch(
+                    M,
+                    qm.exactModel.rootState,
+                    maxN,
+                    static_cast<int>(batchEntries.size()),
+                    static_cast<int>(iStride),
+                    stateStride,
+                    cellsPerJob,
+                    gpuJobs,
+                    packedSeqCode,
+                    packedPrefA,
+                    packedPrefC,
+                    packedPrefG,
+                    packedPrefU,
+                    log2Int,
+                    gpuStates,
+                    activeStates,
+                    stateBase,
+                    bSplitBegByVD,
+                    bSplitEndByVD,
+                    trDst,
+                    trScF,
+                    gpuEmitData,
+                    truncModesEnabled,
+                    null3Enabled,
+                    log2Omega3,
+                    log2Null,
+                    traceCapacity,
+                    &gpuResults,
+                    &hostTraceStates,
+                    &gpuError);
+                if (!ok) {
+                    Debug(Debug::WARNING) << "cmscan GPU batch disabled for this batch: " << gpuError << "\n";
+                    for (const BatchEntry &e : batchEntries) {
+                        std::vector<Hit> scanHits;
+                        runInfernalExactScanWithEnvelopeRescore(qm.exactModel, e.scanSeq, wantInside, scanHits, e.seqId,
+                                                                e.maxHitLen, e.forceI, e.forceD, -1, -1);
+                        for (Hit &h : scanHits) {
+                            finalizeHit(h, e.strand, e.fullSeq, e.tKey, e.fullLen, e.offset, e.regionLen);
+                            hits.emplace_back(std::move(h));
+                        }
+                    }
+                    batchEntries.clear();
+                    return;
+                }
+                for (size_t bi = 0; bi < batchEntries.size(); ++bi) {
+                    const CmFastDeckGpuBatchResult &gr = gpuResults[bi];
+                    std::vector<Hit> scanHits;
+                    const bool traced = finishFastDeckSelectedHitBatched(
+                        qm.exactModel,
+                        batchEntries[bi].seqId,
+                        gr,
+                        hostTraceStates.data() + bi * static_cast<size_t>(traceCapacity),
+                        scanHits);
+                    if (!traced) {
+                        runInfernalExactScanWithEnvelopeRescore(qm.exactModel, batchEntries[bi].scanSeq, wantInside, scanHits,
+                                                                batchEntries[bi].seqId, batchEntries[bi].maxHitLen,
+                                                                batchEntries[bi].forceI, batchEntries[bi].forceD, -1, -1);
+                    }
+                    for (Hit &h : scanHits) {
+                        finalizeHit(h, batchEntries[bi].strand, batchEntries[bi].fullSeq,
+                                    batchEntries[bi].tKey, batchEntries[bi].fullLen,
+                                    batchEntries[bi].offset, batchEntries[bi].regionLen);
+                        hits.emplace_back(std::move(h));
+                    }
+                }
+                batchEntries.clear();
+            };
+
+            for (long ci = 0; ci < static_cast<long>(cands.size()); ++ci) {
+                const Cand &cand = cands[ci];
+                const size_t tId = seqDbr.getId(cand.tKey);
+                if (tId == UINT_MAX) continue;
+                FastaSeq fs = decodeOneSequence(seqDbr, tId, subMat, seqObjLocal, 0);
+                std::string regionSeq;
+                int offset = 0;
+                int maxHitLen = 0;
+                if (cmRegionFlanking > 0.0f && cand.hasRegionCoord) {
+                    const int qAlnLen = std::max(1, cand.qEnd - cand.qStart + 1);
+                    int leftFlank = 0;
+                    int rightFlank = 0;
+                    const int qLen = std::max(qAlnLen, (cand.qLen > 0) ? cand.qLen : qm.exactModel.clen);
+                    if (qLen > 0) {
+                        const int qStartClamped = std::max(0, std::min(cand.qStart, qLen - 1));
+                        const int qEndClamped = std::max(qStartClamped, std::min(cand.qEnd, qLen - 1));
+                        const int leftMissing = qStartClamped;
+                        const int rightMissing = std::max(0, qLen - qEndClamped - 1);
+                        const int totalMissing = leftMissing + rightMissing;
+                        const double missingFrac = static_cast<double>(totalMissing) / static_cast<double>(qLen);
+                        const int baseFlank = static_cast<int>(std::ceil(static_cast<double>(cmRegionFlanking) * static_cast<double>(qAlnLen) * missingFrac));
+                        leftFlank = baseFlank + leftMissing;
+                        rightFlank = baseFlank + rightMissing;
+                    } else {
+                        const int baseFlank = static_cast<int>(cmRegionFlanking * qAlnLen);
+                        leftFlank = baseFlank;
+                        rightFlank = baseFlank;
+                    }
+                    const int sLen = static_cast<int>(fs.seq.size());
+                    const int regStart = std::max(0, cand.dbStart - leftFlank);
+                    const int regEnd = std::min(sLen, cand.dbEnd + rightFlank + 1);
+                    regionSeq = fs.seq.substr(static_cast<size_t>(regStart), static_cast<size_t>(regEnd - regStart));
+                    offset = regStart;
+                } else {
+                    regionSeq = fs.seq;
+                }
+                if (cand.hasRegionCoord) {
+                    const int dbSpan = std::max(1, cand.dbEnd - cand.dbStart + 1);
+                    maxHitLen = std::max(dbSpan * CM_MAXSPAN_ENV_SLACK, clenFloor);
+                } else if (clenFloor > 0) {
+                    maxHitLen = clenFloor;
+                }
+                const bool scanFwd = !cand.hasRegionCoord || !cand.prefilterIsRev;
+                const bool scanRev = !cand.hasRegionCoord || cand.prefilterIsRev;
+                int forceI = -1, forceD = -1;
+                static int forcePrefilter = -1;
+                if (forcePrefilter == -1) {
+                    const char *env = std::getenv("MMSEQS_CMSCAN_FORCE_PREFILTER_ENV");
+                    forcePrefilter = (env != NULL && std::string(env) == "1") ? 1 : 0;
+                }
+                if (forcePrefilter == 1 && cand.hasRegionCoord) {
+                    forceI = (cand.dbStart - offset) + 1;
+                    forceD = std::max(1, cand.dbEnd - cand.dbStart + 1);
+                }
+                auto enqueueJob = [&](const std::string &scanSeq, int strand, int jobForceI, int jobForceD) {
+                    const int Njob = static_cast<int>(scanSeq.size());
+                    if (Njob <= 0) return;
+                    int maxSpan = Njob;
+                    if (wcapModeBatch == 1 && qm.exactModel.w > 0) maxSpan = std::min(maxSpan, qm.exactModel.w);
+                    if (maxHitLen > 0) maxSpan = std::min(maxSpan, maxHitLen);
+                    int minSpan = 1;
+                    if (dminFracBatch > 0.0 && qm.exactModel.clen > 0) {
+                        minSpan = std::max(minSpan, static_cast<int>(dminFracBatch * qm.exactModel.clen));
+                        if (minSpan > maxSpan) minSpan = maxSpan;
+                    }
+                    if (jobForceI > 0 && jobForceD > 0 && jobForceD <= Njob && jobForceI <= Njob - jobForceD + 1) {
+                        minSpan = jobForceD;
+                        maxSpan = jobForceD;
+                    }
+                    if (maxSpan <= 0) {
+                        std::vector<Hit> scanHits;
+                        runInfernalExactScanWithEnvelopeRescore(qm.exactModel, scanSeq, wantInside, scanHits, fs.id, maxHitLen,
+                                                                jobForceI, jobForceD, -1, -1);
+                        for (Hit &h : scanHits) {
+                            finalizeHit(h, strand, fs.seq, cand.tKey, static_cast<unsigned int>(fs.seq.size()),
+                                        offset, static_cast<int>(regionSeq.size()));
+                            hits.emplace_back(std::move(h));
+                        }
+                        return;
+                    }
+                    const int bucketKey = std::max(gpuBatchBucketWidth, ((Njob + gpuBatchBucketWidth - 1) / gpuBatchBucketWidth) * gpuBatchBucketWidth);
+                    BatchBucket &bucket = batchBuckets[bucketKey];
+                    if (bucket.entries.empty()) {
+                        batchBucketKeys.push_back(bucketKey);
+                    }
+                    const int nextMaxN = std::max(bucket.maxN, Njob);
+                    const int nextTraceCapacity = std::max(256, 2 * (M + nextMaxN + 8));
+                    const size_t nextIStride = static_cast<size_t>(nextMaxN + 2);
+                    const size_t nextStateStride = static_cast<size_t>(nextMaxN + 1) * nextIStride;
+                    const size_t nextCellsPerJob = static_cast<size_t>(M) * nextStateStride;
+                    const size_t projectedCells = nextCellsPerJob * static_cast<size_t>(bucket.entries.size() + 1);
+                    const size_t projectedBytes = estimateGpuBatchBytes(bucket.entries.size() + 1, nextMaxN, nextTraceCapacity);
+                    if (!bucket.entries.empty() &&
+                        ((projectedCells > batchCellBudget) ||
+                         (batchBytesBudget > 0 && projectedBytes > batchBytesBudget))) {
+                        flushGpuBatch(bucket.entries, bucket.maxN);
+                        bucket.maxN = 0;
+                    }
+                    if (bucket.entries.empty()) {
+                        const size_t singleBytes = estimateGpuBatchBytes(1, Njob, std::max(256, 2 * (M + Njob + 8)));
+                        if (batchBytesBudget > 0 && singleBytes > batchBytesBudget) {
+                            std::vector<Hit> scanHits;
+                            runInfernalExactScanWithEnvelopeRescore(qm.exactModel, scanSeq, wantInside, scanHits, fs.id,
+                                                                    maxHitLen, jobForceI, jobForceD, -1, -1);
+                            for (Hit &h : scanHits) {
+                                finalizeHit(h, strand, fs.seq, cand.tKey, static_cast<unsigned int>(fs.seq.size()),
+                                            offset, static_cast<int>(regionSeq.size()));
+                                hits.emplace_back(std::move(h));
+                            }
+                            return;
+                        }
+                    }
+                    BatchEntry e;
+                    e.seqId = fs.id;
+                    e.fullSeq = fs.seq;
+                    e.scanSeq = scanSeq;
+                    e.tKey = cand.tKey;
+                    e.fullLen = static_cast<unsigned int>(fs.seq.size());
+                    e.offset = offset;
+                    e.regionLen = static_cast<int>(regionSeq.size());
+                    e.strand = strand;
+                    e.minSpan = minSpan;
+                    e.maxSpan = maxSpan;
+                    e.maxHitLen = maxHitLen;
+                    e.forceI = jobForceI;
+                    e.forceD = jobForceD;
+                    bucket.maxN = std::max(bucket.maxN, Njob);
+                    bucket.entries.emplace_back(std::move(e));
+                };
+                if (scanFwd) enqueueJob(regionSeq, +1, forceI, forceD);
+                if (scanRev) {
+                    const std::string revSeq = reverseComplement(regionSeq);
+                    int revForceI = -1, revForceD = -1;
+                    const int M_local = static_cast<int>(regionSeq.size());
+                    if (forceI > 0 && forceD > 0) {
+                        revForceI = M_local - forceI - forceD + 2;
+                        revForceD = forceD;
+                    }
+                    enqueueJob(revSeq, -1, revForceI, revForceD);
+                }
+            }
+            for (size_t ki = 0; ki < batchBucketKeys.size(); ++ki) {
+                BatchBucket &bucket = batchBuckets[batchBucketKeys[ki]];
+                flushGpuBatch(bucket.entries, bucket.maxN);
+            }
+        } else {
         // Phase 2: parallelize CYK across candidates. Each thread keeps a
         // local Hit accumulator and a local Sequence buffer; the global
         // `hits` is merged once under critical at the end.
@@ -6785,10 +8626,42 @@ int cmscan(int argc, const char **argv, const Command &command) {
                 int maxHitLen = 0;
                 if (cmRegionFlanking > 0.0f && cand.hasRegionCoord) {
                     const int qAlnLen = std::max(1, cand.qEnd - cand.qStart + 1);
-                    const int flank = static_cast<int>(cmRegionFlanking * qAlnLen);
+                    // Base slack still scales with the observed aligned span,
+                    // but shrink it when the prefilter already covers most of
+                    // the query/model so the extracted region does not grow
+                    // excessively for near-full-length hits.
+                    int leftFlank = 0;
+                    int rightFlank = 0;
+                    const int qLen = std::max(qAlnLen,
+                                              (cand.qLen > 0) ? cand.qLen
+                                                              : qm.exactModel.clen);
+                    if (qLen > 0) {
+                        const int qStartClamped = std::max(0, std::min(cand.qStart, qLen - 1));
+                        const int qEndClamped = std::max(qStartClamped,
+                                                         std::min(cand.qEnd, qLen - 1));
+                        const int leftMissing = qStartClamped;
+                        const int rightMissing = std::max(0, qLen - qEndClamped - 1);
+                        const int totalMissing = leftMissing + rightMissing;
+                        const double missingFrac = static_cast<double>(totalMissing)
+                                                   / static_cast<double>(qLen);
+                        const int baseFlank = static_cast<int>(std::ceil(
+                            static_cast<double>(cmRegionFlanking)
+                            * static_cast<double>(qAlnLen)
+                            * missingFrac));
+                        // Bias the envelope toward the side where the prefilter hit
+                        // leaves more of the query/model uncovered. Hits near the
+                        // query start get more downstream target flank; hits near the
+                        // query end get more upstream flank.
+                        leftFlank = baseFlank + leftMissing;
+                        rightFlank = baseFlank + rightMissing;
+                    } else {
+                        const int baseFlank = static_cast<int>(cmRegionFlanking * qAlnLen);
+                        leftFlank = baseFlank;
+                        rightFlank = baseFlank;
+                    }
                     const int sLen = static_cast<int>(fs.seq.size());
-                    const int regStart = std::max(0, cand.dbStart - flank);
-                    const int regEnd = std::min(sLen, cand.dbEnd + flank + 1);
+                    const int regStart = std::max(0, cand.dbStart - leftFlank);
+                    const int regEnd = std::min(sLen, cand.dbEnd + rightFlank + 1);
                     regionSeq = fs.seq.substr(static_cast<size_t>(regStart),
                                               static_cast<size_t>(regEnd - regStart));
                     offset = regStart;
@@ -6882,6 +8755,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
                         anchorD = rightLocal - leftLocal + 1;
                     }
                 }
+                cmMaybeBeamNarrowRegion(qm.exactModel, regionSeq, offset, forceI, anchorI, anchorD);
                 std::vector<Hit> fwdHits, revHits;
                 if (scanFwd) {
                     runInfernalExactScanWithEnvelopeRescore(qm.exactModel, regionSeq, wantInside, fwdHits, fs.id,
@@ -6926,6 +8800,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
                             std::make_move_iterator(localHits.end()));
             }
         } // end inner omp parallel
+        }
 
         std::sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) {
             if (a.dbKey != b.dbKey) return a.dbKey < b.dbKey;
@@ -7062,6 +8937,396 @@ int cmscan(int argc, const char **argv, const Command &command) {
 
 int cmsearch(int argc, const char **argv, const Command &command) {
     return cmscan(argc, argv, command);
+}
+
+int lolcmsearch(int argc, const char **argv, const Command &command) {
+    MMseqsMPI::init(argc, argv);
+    LocalParameters &par = LocalParameters::getLocalInstance();
+    std::string rawTargetDbArg;
+    std::string rawResultDbArg;
+    std::vector<std::string> parseArgStorage;
+    std::vector<const char *> parseArgv;
+    if (argc > 2) {
+        rawTargetDbArg = argv[1];
+        rawResultDbArg = argv[2];
+        if (rawTargetDbArg.find(',') != std::string::npos || rawResultDbArg.find(',') != std::string::npos) {
+            parseArgStorage.reserve(static_cast<size_t>(argc));
+            parseArgv.reserve(static_cast<size_t>(argc));
+            for (int i = 0; i < argc; ++i) {
+                parseArgStorage.push_back(argv[i]);
+            }
+            const std::vector<std::string> targetParts = splitCommaList(rawTargetDbArg);
+            const std::vector<std::string> resultParts = splitCommaList(rawResultDbArg);
+            if (!targetParts.empty()) {
+                parseArgStorage[1] = targetParts[0];
+            }
+            if (!resultParts.empty()) {
+                parseArgStorage[2] = resultParts[0];
+            }
+            for (size_t i = 0; i < parseArgStorage.size(); ++i) {
+                parseArgv.push_back(parseArgStorage[i].c_str());
+            }
+        }
+    }
+    par.parseParameters(argc,
+                        parseArgv.empty() ? argv : parseArgv.data(),
+                        command,
+                        true,
+                        0,
+                        MMseqsParameter::COMMAND_ALIGN);
+    if (MMseqsMPI::isMaster() == false) {
+        return EXIT_SUCCESS;
+    }
+
+    const std::string execPath = getSelfExecutablePath();
+    if (execPath.empty()) {
+        Debug(Debug::ERROR) << "lolcmsearch: failed to resolve executable path\n";
+        return EXIT_FAILURE;
+    }
+
+    const double msaEvalThr = par.lolalignMsaEvalThr;
+    const float flankFrac = (par.cmRegionFlanking > 0.0f) ? par.cmRegionFlanking : 1.5f;
+    const int bandPad = std::max(2, parseEnvIntLocal("MMSEQS_LOLCMSEARCH_BAND_PAD", 6));
+    const int roughBeam = std::max(1, parseEnvIntLocal("MMSEQS_LOLALIGN_LINEARFOLD_BEAM", 10));
+    const bool keepTmp = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_KEEP_TMP", 0) != 0);
+    const bool skipBuild = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_SKIP_BUILD", 0) != 0);
+    const bool skipRough = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_SKIP_ROUGH", 0) != 0);
+    const int rescorePad = std::max(0, parseEnvIntLocal("MMSEQS_CMSCAN_RESCORE_PAD", 5));
+
+    const bool userTmpDir = !par.lolcmsearchTmpDir.empty();
+    const std::string tempDir = userTmpDir ? par.lolcmsearchTmpDir
+                                           : createTempDir("riboseek_lolcmsearch");
+    if ((!userTmpDir && tempDir.empty())
+        || (userTmpDir && !ensureDirectoryRecursive(tempDir))) {
+        Debug(Debug::ERROR) << "lolcmsearch: failed to prepare tmp dir"
+                            << (userTmpDir ? (": " + tempDir) : std::string()) << "\n";
+        return EXIT_FAILURE;
+    }
+    const std::string cmDb = tempDir + "/cmdb";
+    const std::string roughDb = tempDir + "/rough";
+    const std::vector<std::string> targetDbList = splitCommaList(rawTargetDbArg.empty() ? par.db2 : rawTargetDbArg);
+    const std::vector<std::string> resultDbList = splitCommaList(rawResultDbArg.empty() ? par.db3 : rawResultDbArg);
+    const bool multiInput = (targetDbList.size() > 1 || resultDbList.size() > 1);
+    std::string inputTargetDb = par.db2;
+    std::string inputResultDb = par.db3;
+
+    auto cleanup = [&]() {
+        if (!keepTmp && !userTmpDir && !multiInput) {
+            removePathRecursively(tempDir);
+        } else {
+            if (multiInput && !keepTmp && !userTmpDir) {
+                Debug(Debug::INFO) << "lolcmsearch: keeping tmp dir " << tempDir
+                                   << " because multi-DB output uses merged target DB there\n";
+            } else {
+                Debug(Debug::INFO) << "lolcmsearch: keeping tmp dir " << tempDir << "\n";
+            }
+        }
+    };
+
+    std::ostringstream evalStr;
+    evalStr << std::scientific << msaEvalThr;
+    Debug(Debug::INFO) << "Running LoL-banded full CM CYK refinement\n";
+    Debug(Debug::INFO) << "  flank frac: " << flankFrac
+                       << ", lolalign msa e-value threshold: " << evalStr.str()
+                       << ", state band pad: " << bandPad
+                       << ", rough linearfold beam: " << roughBeam
+                       << ", tmp dir: " << tempDir
+                       << "\n";
+
+    if (multiInput) {
+        if (targetDbList.size() != resultDbList.size()) {
+            cleanup();
+            Debug(Debug::ERROR) << "lolcmsearch: targetDB/resultDB list sizes differ ("
+                                << targetDbList.size() << " vs " << resultDbList.size() << ")\n";
+            return EXIT_FAILURE;
+        }
+        inputTargetDb = tempDir + "/input_target_merged";
+        inputResultDb = tempDir + "/input_result_merged";
+        std::string mergeErr;
+        if (!mergeLolcmsearchInputs(par.db1,
+                                    targetDbList,
+                                    resultDbList,
+                                    inputTargetDb,
+                                    inputResultDb,
+                                    std::max(1, par.threads),
+                                    mergeErr)) {
+            cleanup();
+            Debug(Debug::ERROR) << "lolcmsearch: failed to merge multi-DB input: " << mergeErr << "\n";
+            return EXIT_FAILURE;
+        }
+        Debug(Debug::INFO) << "  merged " << targetDbList.size()
+                           << " target/result DB pairs into " << inputTargetDb
+                           << " and " << inputResultDb << "\n";
+    }
+
+    if (!skipBuild) {
+        std::vector<std::string> args;
+        args.push_back(execPath);
+        args.push_back("cmbuild");
+        args.push_back(par.db1);
+        args.push_back(inputTargetDb);
+        args.push_back(inputResultDb);
+        args.push_back(cmDb);
+        args.push_back("--cmlite-msa-eval");
+        args.push_back(SSTR(msaEvalThr));
+        args.push_back("--threads");
+        args.push_back(SSTR(std::max(1, par.threads)));
+        args.push_back("-v");
+        args.push_back("0");
+        std::string err;
+        if (!runExternalCommand(args, std::vector<std::pair<std::string, std::string>>(), err)) {
+            cleanup();
+            Debug(Debug::ERROR) << "lolcmsearch: cmbuild failed: " << err << "\n";
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (!skipRough) {
+        std::vector<std::string> args;
+        args.push_back(execPath);
+        args.push_back("lolalign");
+        args.push_back(par.db1);
+        args.push_back(inputTargetDb);
+        args.push_back(inputResultDb);
+        args.push_back(roughDb);
+        args.push_back("-a");
+        args.push_back("1");
+        args.push_back("--cm-region");
+        args.push_back(SSTR(flankFrac));
+        args.push_back("-e");
+        args.push_back("inf");
+        args.push_back("--lolalign-msa-eval");
+        args.push_back(SSTR(msaEvalThr));
+        args.push_back("--threads");
+        args.push_back(SSTR(std::max(1, par.threads)));
+        args.push_back("-v");
+        args.push_back("0");
+        std::vector<std::pair<std::string, std::string>> env;
+        env.push_back(std::make_pair("MMSEQS_LOLALIGN_ACCEPT_ALL", "1"));
+        env.push_back(std::make_pair("MMSEQS_LOLALIGN_DEDUP_ROWS", "0"));
+        env.push_back(std::make_pair("MMSEQS_LOLALIGN_LINEARFOLD_BEAM", SSTR(roughBeam)));
+        std::string err;
+        if (!runExternalCommand(args, env, err)) {
+            cleanup();
+            Debug(Debug::ERROR) << "lolcmsearch: lolalign failed: " << err << "\n";
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (!hasDbIndex(cmDb) || !hasDbIndex(roughDb)) {
+        cleanup();
+        Debug(Debug::ERROR) << "lolcmsearch: missing intermediate DBs in " << tempDir << "\n";
+        return EXIT_FAILURE;
+    }
+
+    DBReader<unsigned int> cmReader(cmDb.c_str(), (cmDb + ".index").c_str(),
+                                    std::max(1, par.threads),
+                                    DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
+    cmReader.open(DBReader<unsigned int>::NOSORT);
+
+    DBReader<unsigned int> roughReader(roughDb.c_str(), (roughDb + ".index").c_str(),
+                                       std::max(1, par.threads),
+                                       DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
+    roughReader.open(DBReader<unsigned int>::NOSORT);
+
+    DBReader<unsigned int> seqDbr(inputTargetDb.c_str(), (inputTargetDb + ".index").c_str(),
+                                  std::max(1, par.threads),
+                                  DBReader<unsigned int>::USE_DATA
+                                      | DBReader<unsigned int>::USE_INDEX
+                                      | DBReader<unsigned int>::USE_LOOKUP);
+    seqDbr.open(DBReader<unsigned int>::NOSORT);
+
+    NucleotideMatrix nucMat(Parameters::getInstance().scoringMatrixFile.values.nucleotide().c_str(), 1.0, 0.0);
+    BaseMatrix &subMat = static_cast<BaseMatrix&>(nucMat);
+    const size_t nThreads = (par.threads > 0) ? static_cast<size_t>(par.threads) : 1u;
+    DBWriter resultWriter(par.db4.c_str(), par.db4Index.c_str(),
+                          static_cast<unsigned int>(nThreads), par.compressed,
+                          Parameters::DBTYPE_ALIGNMENT_RES);
+    resultWriter.open();
+
+    Debug::Progress progress(cmReader.getSize());
+    for (size_t qi = 0; qi < cmReader.getSize(); ++qi) {
+        progress.updateProgress();
+        const unsigned int queryKey = cmReader.getDbKey(qi);
+        std::string cmText(cmReader.getData(qi, 0), cmReader.getEntryLen(qi));
+        const size_t nul = cmText.find('\0');
+        if (nul != std::string::npos) {
+            cmText.resize(nul);
+        }
+        std::istringstream iss(cmText);
+        InfernalExactModel model = parseInfernalCmExactModelFromStream(iss, "lolcmsearch[" + SSTR(queryKey) + "]");
+        const size_t rid = roughReader.getId(queryKey);
+        if (rid == UINT_MAX) {
+            resultWriter.writeData("", 0, queryKey, 0);
+            continue;
+        }
+
+        std::vector<Matcher::result_t> roughHits;
+        Matcher::readAlignmentResults(roughHits, roughReader.getData(rid, 0), false);
+        if (roughHits.empty()) {
+            resultWriter.writeData("", 0, queryKey, 0);
+            continue;
+        }
+
+        std::vector<Matcher::result_t> refined(roughHits.size());
+        std::vector<char> valid(roughHits.size(), 0);
+#pragma omp parallel num_threads(static_cast<int>(nThreads))
+        {
+            Sequence seqObjLocal(seqDbr.getMaxSeqLen(), Parameters::DBTYPE_NUCLEOTIDES, &nucMat, 0, false, false);
+#pragma omp for schedule(dynamic, 1)
+            for (long hi = 0; hi < static_cast<long>(roughHits.size()); ++hi) {
+                const Matcher::result_t &rough = roughHits[static_cast<size_t>(hi)];
+                const size_t tId = seqDbr.getId(rough.dbKey);
+                if (tId == UINT_MAX) {
+                    continue;
+                }
+                unsigned int thread_idx = 0;
+#ifdef OPENMP
+                thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                FastaSeq fs = decodeOneSequence(seqDbr, tId, subMat, seqObjLocal, thread_idx);
+                int fullLo = 0;
+                int fullHi = -1;
+                bool reverseStrand = false;
+                const std::string scanSeq = buildWindowSequenceFromHit(fs.seq, rough, flankFrac,
+                                                                       std::max<int>(model.clen, rough.qLen),
+                                                                       fullLo, fullHi, reverseStrand);
+                if (scanSeq.empty()) {
+                    continue;
+                }
+                std::vector<int> stateMinI, stateMaxI, stateMinJ, stateMaxJ;
+                std::vector<int> slicedMinI, slicedMaxI, slicedMinJ, slicedMaxJ;
+                buildLolStateBands(model, rough, fullLo, fullHi, reverseStrand,
+                                   static_cast<int>(scanSeq.size()), bandPad,
+                                   stateMinI, stateMaxI, stateMinJ, stateMaxJ);
+
+                std::string exactSeq = scanSeq;
+                int subLo = 1;
+                int subHi = static_cast<int>(scanSeq.size());
+                const std::vector<int> targetByConsensus =
+                    buildLolConsensusTargetMap(rough, fullLo, fullHi, reverseStrand,
+                                               static_cast<int>(scanSeq.size()),
+                                               std::max(0, model.clen));
+                computeLolRescoreWindow(targetByConsensus,
+                                        static_cast<int>(scanSeq.size()),
+                                        std::max(bandPad, rescorePad),
+                                        subLo,
+                                        subHi);
+                if (subLo > 1 || subHi < static_cast<int>(scanSeq.size())) {
+                    exactSeq = scanSeq.substr(static_cast<size_t>(subLo - 1),
+                                              static_cast<size_t>(subHi - subLo + 1));
+                    sliceLolStateBands(stateMinI, stateMaxI, stateMinJ, stateMaxJ,
+                                       subLo, subHi, static_cast<int>(scanSeq.size()),
+                                       slicedMinI, slicedMaxI, slicedMinJ, slicedMaxJ);
+                }
+
+                std::vector<Hit> exactHits;
+                const int dbSpan = std::max(1, std::abs(rough.dbEndPos - rough.dbStartPos) + 1);
+                const int modelSlack = static_cast<int>(model.clen * 1.5);
+                const int maxHitLen = std::max(dbSpan * 3, std::max(1, modelSlack));
+                runInfernalExactScanWithEnvelopeRescore(model, exactSeq, /*wantInside=*/false, exactHits, fs.id,
+                                                        maxHitLen, -1, -1, -1, -1,
+                                                        (slicedMinI.empty() ? (stateMinI.empty() ? NULL : stateMinI.data()) : slicedMinI.data()),
+                                                        (slicedMaxI.empty() ? (stateMaxI.empty() ? NULL : stateMaxI.data()) : slicedMaxI.data()),
+                                                        (slicedMinJ.empty() ? (stateMinJ.empty() ? NULL : stateMinJ.data()) : slicedMinJ.data()),
+                                                        (slicedMaxJ.empty() ? (stateMaxJ.empty() ? NULL : stateMaxJ.data()) : slicedMaxJ.data()));
+                if (exactHits.empty()) {
+                    continue;
+                }
+
+                Hit h = exactHits.front();
+                h.dbKey = rough.dbKey;
+                h.dbLen = static_cast<unsigned int>(fs.seq.size());
+                if (subLo > 1) {
+                    h.start1 += (subLo - 1);
+                    h.end1 += (subLo - 1);
+                }
+                if (!reverseStrand) {
+                    h.start1 += fullLo;
+                    h.end1 += fullLo;
+                } else {
+                    const int regionLen = static_cast<int>(scanSeq.size());
+                    const int fwdStart = regionLen - h.start1 + 1 + fullLo;
+                    const int fwdEnd = regionLen - h.end1 + 1 + fullLo;
+                    h.start1 = fwdStart;
+                    h.end1 = fwdEnd;
+                }
+
+                const int rawDbStart = std::max(0, h.start1 - 1);
+                const int rawDbEnd = std::max(0, h.end1 - 1);
+                const int qStartOut = (h.qStart >= 0) ? h.qStart : 0;
+                int qEndOut = (h.qEnd >= 0) ? h.qEnd : std::max(qStartOut, static_cast<int>(model.clen) - 1);
+                if (qEndOut < qStartOut) qEndOut = qStartOut;
+                const unsigned int qLen = static_cast<unsigned int>(std::max(1, model.clen));
+                const unsigned int alnLen = (h.cigarAlnLen > 0)
+                    ? h.cigarAlnLen
+                    : static_cast<unsigned int>(std::max(1, std::abs(rawDbEnd - rawDbStart) + 1));
+                const unsigned int qSpan = static_cast<unsigned int>(qEndOut - qStartOut + 1);
+                const unsigned int dbSpanOut = static_cast<unsigned int>(std::max(1, std::abs(rawDbEnd - rawDbStart) + 1));
+                const float qcov = static_cast<float>(qSpan) / static_cast<float>(qLen);
+                const float dbcov = static_cast<float>(dbSpanOut) / static_cast<float>(std::max(1u, h.dbLen));
+                const int bitScore = static_cast<int>(std::lrint(h.cyk));
+                const bool hasBacktrace = (!h.cigar.empty() && h.cigar != "NA");
+                std::string emitCigar;
+                if (hasBacktrace) {
+                    emitCigar.reserve(h.cigar.size());
+                    for (size_t ci = 0; ci < h.cigar.size(); ++ci) {
+                        const char c = h.cigar[ci];
+                        if (c == 'I') emitCigar.push_back('D');
+                        else if (c == 'D') emitCigar.push_back('I');
+                        else emitCigar.push_back(c);
+                    }
+                }
+                float seqIdVal = h.precomputedSeqId;
+                if (seqIdVal < 0.0f) {
+                    const unsigned int bitScorePos = static_cast<unsigned int>(std::max(0, bitScore));
+                    seqIdVal = Matcher::estimateSeqIdByScorePerCol(static_cast<uint16_t>(std::min(bitScorePos, 65535u)),
+                                                                    std::max(1u, alnLen),
+                                                                    std::max(1u, alnLen));
+                }
+                refined[static_cast<size_t>(hi)] = Matcher::result_t(h.dbKey,
+                                                                     bitScore,
+                                                                     std::min(1.0f, std::max(0.0f, qcov)),
+                                                                     std::min(1.0f, std::max(0.0f, dbcov)),
+                                                                     std::min(1.0f, std::max(0.0f, seqIdVal)),
+                                                                     h.hasEvalue ? h.evalue : rough.eval,
+                                                                     alnLen,
+                                                                     qStartOut,
+                                                                     qEndOut,
+                                                                     qLen,
+                                                                     rawDbStart,
+                                                                     rawDbEnd,
+                                                                     h.dbLen,
+                                                                     hasBacktrace ? emitCigar : std::string());
+                valid[static_cast<size_t>(hi)] = 1;
+            }
+        }
+
+        resultWriter.writeStart(0);
+        char buffer[4096];
+        size_t writtenRows = 0;
+        for (size_t i = 0; i < refined.size(); ++i) {
+            if (!valid[i]) {
+                continue;
+            }
+            const bool hasBacktrace = !refined[i].backtrace.empty();
+            const size_t len = Matcher::resultToBuffer(buffer, refined[i], hasBacktrace, false);
+            resultWriter.writeAdd(buffer, len, 0);
+            ++writtenRows;
+        }
+        resultWriter.writeEnd(queryKey, 0);
+        Debug(Debug::INFO) << "  query " << queryKey
+                           << ": rough hits=" << roughHits.size()
+                           << ", refined hits=" << writtenRows
+                           << "\n";
+    }
+
+    resultWriter.close();
+    seqDbr.close();
+    roughReader.close();
+    cmReader.close();
+    cleanup();
+    return EXIT_SUCCESS;
 }
 
 // =====================================================================

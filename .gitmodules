@@ -5,3 +5,6 @@
     path = lib/mmseqs/util/regression
     url = https://github.com/soedinglab/MMseqs2-Regression.git
     update = none
+[submodule "lib/LinearTurboFold"]
+	path = lib/LinearTurboFold
+	url = https://github.com/LinearFold/LinearTurboFold.git

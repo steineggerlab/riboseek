@@ -8,6 +8,8 @@ extern int rnaalign(int argc, const char **argv, const Command& command);
 extern int rnasearch(int argc, const char **argv, const Command& command);
 extern int generatecm(int argc, const char **argv, const Command& command);
 extern int cmbuild(int argc, const char **argv, const Command& command);
+extern int lolalign(int argc, const char **argv, const Command& command);
+extern int lolcmsearch(int argc, const char **argv, const Command& command);
 extern int cmsearch(int argc, const char **argv, const Command& command);
 extern int cmscan(int argc, const char **argv, const Command& command);
 

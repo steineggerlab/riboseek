@@ -1,4 +1,5 @@
 set(rnautils_source_files
+    rnautils/CmLite.cpp
     rnautils/CmScan.cpp
     rnautils/GenerateCm.cpp
     rnautils/splitstrand.cpp

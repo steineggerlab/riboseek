@@ -13,6 +13,7 @@
 #include "MultipleAlignment.h"
 #include "SubstitutionMatrix.h"
 #include "Util.h"
+#include "DinucleotideMapping.h"
 #ifdef HAVE_INFERNAL_BRIDGE
 #include "infernal/InfernalBridge.h"
 #endif
@@ -49,6 +50,13 @@ static inline char normalizeBase(char c) {
     return c;
 }
 
+static inline void convertTsToUs(std::string &seq) {
+    for (size_t i = 0; i < seq.size(); ++i) {
+        if (seq[i] == 'T') seq[i] = 'U';
+        else if (seq[i] == 't') seq[i] = 'u';
+    }
+}
+
 // Encode an aligned ACGU/N/'-' row into the byte format MsaFilter expects.
 // Residues map to 0..3 (so they pass `< NAA` and count toward coverage/identity);
 // 'N' maps to NAA (any-residue sentinel); '-' maps to GAP. Encoding doesn't use
@@ -73,7 +81,9 @@ static std::string buildStockholmText(const std::string &id,
     out << "# STOCKHOLM 1.0\n";
     out << "#=GF ID " << (id.empty() ? "mmseqs_model" : id) << "\n";
     for (size_t i = 0; i < seqs.size(); ++i) {
-        out << seqs[i].id << " " << seqs[i].aln << "\n";
+        std::string rnaAln = seqs[i].aln;
+        convertTsToUs(rnaAln);
+        out << seqs[i].id << " " << rnaAln << "\n";
     }
     // Force every alignment column to be a CM match column via --hand: RF line
     // of all 'x' makes consensus column c map 1:1 to query position c-1, so
@@ -140,6 +150,11 @@ int cmbuild(int argc, const char **argv, const Command &command) {
 
     Debug(Debug::INFO) << "Query database size: " << qDbr.getSize() << " type: " << qDbr.getDbTypeName() << "\n";
     Debug(Debug::INFO) << "Target database size: " << tDbr->getSize() << " type: " << tDbr->getDbTypeName() << "\n";
+    {
+        std::ostringstream msaEvalStream;
+        msaEvalStream << std::scientific << par.cmliteMsaEvalThr;
+        Debug(Debug::INFO) << "cmbuild seed E-value threshold: " << msaEvalStream.str() << "\n";
+    }
 
     Debug::Progress progress(resultReader.getSize());
 
@@ -233,6 +248,7 @@ int cmbuild(int argc, const char **argv, const Command &command) {
             for (size_t i = 0; i < alnResults.size(); i++) {
                 Matcher::result_t res = alnResults[i];
                 if (res.backtrace.empty()) continue;
+                if (res.eval > par.cmliteMsaEvalThr) continue;
                 const size_t targetId = tDbr->getId(res.dbKey);
                 if (targetId == UINT_MAX) continue;
                 // Infernal requires unique sequence names; skip duplicates.
@@ -240,6 +256,22 @@ int cmbuild(int argc, const char **argv, const Command &command) {
                 seenKeys.insert(res.dbKey);
 
                 const char *targetSeq = tDbr->getData(targetId, thread_idx);
+                std::string decodedTargetSeq;
+                // If tDbr is GPU db, get uncompressed sequence data
+                if (DBReader<unsigned int>::getExtendedDbtype(tDbr->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU) {
+                    const char *gpuTargetSeq = tDbr->getDataUncompressed(targetId);
+                    const size_t targetSeqLen = tDbr->getSeqLen(targetId);
+                    const unsigned char *dinucToNuc = getDinucToNucTable();
+                    decodedTargetSeq.resize(targetSeqLen);
+
+                    // Convert GPU dinucleotide-encoded bytes to nucleotide chars.
+                    for (size_t pos = 0; pos < targetSeqLen; ++pos) {
+                        const unsigned char dinucCode = static_cast<unsigned char>(gpuTargetSeq[pos]);
+                        const unsigned char nucCode = dinucToNuc[dinucCode];
+                        decodedTargetSeq[pos] = subMat.num2aa[nucCode];
+                    }
+                    targetSeq = decodedTargetSeq.c_str();
+                }
 
                 // Fold reverse-strand alignments onto the forward query frame
                 // (matches result2dnamsa.cpp). Strand handling lives here so
