@@ -5296,10 +5296,9 @@ static int runLolalignImpl(int argc,
     dbw.open();
 
     Debug::Progress progress(resReader.getSize());
-    const bool parallelQueries = (resReader.getSize() > 1 && par.threads > 1);
-    const bool parallelCandidates = (!parallelQueries && par.threads > 1);
-    Debug(Debug::INFO) << "  query parallelism: " << (parallelQueries ? "outer" : "serial") << "\n";
-    Debug(Debug::INFO) << "  target parallelism: " << (parallelCandidates ? "inner" : "shared across queries") << "\n";
+    const bool parallelCandidates = (par.threads > 1);
+    Debug(Debug::INFO) << "  query parallelism: serial\n";
+    Debug(Debug::INFO) << "  target parallelism: " << (parallelCandidates ? "inner" : "serial") << "\n";
 
     const auto processQuery = [&](size_t rid, unsigned int threadIdx) {
         progress.updateProgress();
@@ -5564,19 +5563,8 @@ static int runLolalignImpl(int argc,
         dbw.writeData(out.c_str(), out.size(), queryKey, threadIdx);
     };
 
-    if (parallelQueries) {
-#pragma omp parallel for schedule(dynamic, 1)
-        for (size_t rid = 0; rid < resReader.getSize(); ++rid) {
-            unsigned int threadIdx = 0;
-#ifdef OPENMP
-            threadIdx = static_cast<unsigned int>(omp_get_thread_num());
-#endif
-            processQuery(rid, threadIdx);
-        }
-    } else {
-        for (size_t rid = 0; rid < resReader.getSize(); ++rid) {
-            processQuery(rid, 0);
-        }
+    for (size_t rid = 0; rid < resReader.getSize(); ++rid) {
+        processQuery(rid, 0);
     }
 
     dbw.close(true);
