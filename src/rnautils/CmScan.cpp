@@ -9026,12 +9026,23 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
     }
 
     const double msaEvalThr = par.lolalignMsaEvalThr;
-    const float flankFrac = (par.cmRegionFlanking > 0.0f) ? par.cmRegionFlanking : 1.5f;
+    const float flankFrac = (par.cmRegionFlanking > 0.0f) ? par.cmRegionFlanking : 3.0f;
+    auto parseEnvFloatLocal = [](const char *name, float defVal) {
+        const char *env = std::getenv(name);
+        return (env != NULL) ? static_cast<float>(std::atof(env)) : defVal;
+    };
     const int bandPad = std::max(2, parseEnvIntLocal("MMSEQS_LOLCMSEARCH_BAND_PAD", 6));
     const int roughBeam = std::max(1, parseEnvIntLocal("MMSEQS_LOLALIGN_LINEARFOLD_BEAM", 10));
     const bool keepTmp = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_KEEP_TMP", 0) != 0);
     const bool skipBuild = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_SKIP_BUILD", 0) != 0);
     const bool skipRough = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_SKIP_ROUGH", 0) != 0);
+    const bool useSeedAsRough = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_USE_SEED_AS_ROUGH", 0) != 0);
+    const bool filterResult = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_FILTERRESULT", 1) != 0);
+    const float filterMaxSeqId = parseEnvFloatLocal("MMSEQS_LOLCMSEARCH_FILTER_MAX_SEQ_ID", 0.96f);
+    const float filterQid = parseEnvFloatLocal("MMSEQS_LOLCMSEARCH_FILTER_QID", 0.0f);
+    const float filterCov = parseEnvFloatLocal("MMSEQS_LOLCMSEARCH_FILTER_COV", 0.0f);
+    const float filterQsc = parseEnvFloatLocal("MMSEQS_LOLCMSEARCH_FILTER_QSC", -20.0f);
+    const int filterDiff = std::max(0, parseEnvIntLocal("MMSEQS_LOLCMSEARCH_FILTER_DIFF", 100000));
     const int rescorePad = std::max(0, parseEnvIntLocal("MMSEQS_CMSCAN_RESCORE_PAD", 5));
 
     const bool userTmpDir = !par.lolcmsearchTmpDir.empty();
@@ -9044,6 +9055,7 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
         return EXIT_FAILURE;
     }
     const std::string cmDb = tempDir + "/cmdb";
+    const std::string filteredResultDb = tempDir + "/filtered";
     const std::string roughDb = tempDir + "/rough";
     const std::vector<std::string> targetDbList = splitCommaList(rawTargetDbArg.empty() ? par.db2 : rawTargetDbArg);
     const std::vector<std::string> resultDbList = splitCommaList(rawResultDbArg.empty() ? par.db3 : rawResultDbArg);
@@ -9071,8 +9083,18 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
                        << ", lolalign msa e-value threshold: " << evalStr.str()
                        << ", state band pad: " << bandPad
                        << ", rough linearfold beam: " << roughBeam
+                       << ", rough source: " << (useSeedAsRough ? "seed resultDB" : "lolalign")
+                       << ", filterresult: " << (filterResult ? "enabled" : "disabled")
                        << ", tmp dir: " << tempDir
                        << "\n";
+    if (filterResult) {
+        Debug(Debug::INFO) << "  filterresult params: max-seq-id=" << filterMaxSeqId
+                           << ", qid=" << filterQid
+                           << ", cov=" << filterCov
+                           << ", qsc=" << filterQsc
+                           << ", diff=" << filterDiff
+                           << "\n";
+    }
 
     if (multiInput) {
         if (targetDbList.size() != resultDbList.size()) {
@@ -9122,13 +9144,45 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
         }
     }
 
-    if (!skipRough) {
+    std::string downstreamResultDb = inputResultDb;
+    if (filterResult) {
+        std::vector<std::string> args;
+        args.push_back(execPath);
+        args.push_back("filterresult");
+        args.push_back(par.db1);
+        args.push_back(inputTargetDb);
+        args.push_back(inputResultDb);
+        args.push_back(filteredResultDb);
+        args.push_back("--max-seq-id");
+        args.push_back(SSTR(filterMaxSeqId));
+        args.push_back("--qid");
+        args.push_back(SSTR(filterQid));
+        args.push_back("--cov");
+        args.push_back(SSTR(filterCov));
+        args.push_back("--qsc");
+        args.push_back(SSTR(filterQsc));
+        args.push_back("--diff");
+        args.push_back(SSTR(filterDiff));
+        args.push_back("--threads");
+        args.push_back(SSTR(std::max(1, par.threads)));
+        args.push_back("-v");
+        args.push_back("0");
+        std::string err;
+        if (!runExternalCommand(args, std::vector<std::pair<std::string, std::string>>(), err)) {
+            cleanup();
+            Debug(Debug::ERROR) << "lolcmsearch: filterresult failed: " << err << "\n";
+            return EXIT_FAILURE;
+        }
+        downstreamResultDb = filteredResultDb;
+    }
+
+    if (!useSeedAsRough && !skipRough) {
         std::vector<std::string> args;
         args.push_back(execPath);
         args.push_back("lolalign");
         args.push_back(par.db1);
         args.push_back(inputTargetDb);
-        args.push_back(inputResultDb);
+        args.push_back(downstreamResultDb);
         args.push_back(roughDb);
         args.push_back("-a");
         args.push_back("1");
@@ -9146,6 +9200,14 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
         env.push_back(std::make_pair("MMSEQS_LOLALIGN_ACCEPT_ALL", "1"));
         env.push_back(std::make_pair("MMSEQS_LOLALIGN_DEDUP_ROWS", "0"));
         env.push_back(std::make_pair("MMSEQS_LOLALIGN_LINEARFOLD_BEAM", SSTR(roughBeam)));
+        if (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_DOTBRACKET_ONLY", 0) != 0) {
+            env.push_back(std::make_pair("MMSEQS_LOLALIGN_DOTBRACKET_ONLY", "1"));
+        }
+        if (par.emsearchRnaPlfold) {
+            env.push_back(std::make_pair("MMSEQS_LOLALIGN_STRUCTURE_BACKEND", "rnaplfold"));
+            env.push_back(std::make_pair("MMSEQS_LOLALIGN_RNAPLFOLD_WINDOW", SSTR(std::max(0, par.emsearchRnaPlfoldWindow))));
+            env.push_back(std::make_pair("MMSEQS_LOLALIGN_RNAPLFOLD_SPAN", SSTR(std::max(0, par.emsearchRnaPlfoldSpan))));
+        }
         std::string err;
         if (!runExternalCommand(args, env, err)) {
             cleanup();
@@ -9154,7 +9216,9 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
         }
     }
 
-    if (!hasDbIndex(cmDb) || !hasDbIndex(roughDb)) {
+    const std::string roughInputDb = useSeedAsRough ? downstreamResultDb : roughDb;
+
+    if (!hasDbIndex(cmDb) || !hasDbIndex(roughInputDb)) {
         cleanup();
         Debug(Debug::ERROR) << "lolcmsearch: missing intermediate DBs in " << tempDir << "\n";
         return EXIT_FAILURE;
@@ -9165,7 +9229,7 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
                                     DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
     cmReader.open(DBReader<unsigned int>::NOSORT);
 
-    DBReader<unsigned int> roughReader(roughDb.c_str(), (roughDb + ".index").c_str(),
+    DBReader<unsigned int> roughReader(roughInputDb.c_str(), (roughInputDb + ".index").c_str(),
                                        std::max(1, par.threads),
                                        DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
     roughReader.open(DBReader<unsigned int>::NOSORT);

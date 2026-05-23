@@ -56,9 +56,17 @@ std::vector<Command> riboseekCommands = {
                                       {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}},
     {"lolcmsearch", lolcmsearch, &localPar.rnaalign, COMMAND_ALIGNMENT,
             "Full CM CYK refinement with LoLalign-derived state bands",
-            "riboseek lolcmsearch queryDB targetDB resultDB alignmentDB --cm-region 1.5 -e inf --lolalign-msa-eval 1e-3\n"
+            "riboseek lolcmsearch queryDB targetDB resultDB alignmentDB -e inf --lolalign-msa-eval 1e-3\n"
+            "Default pipeline: cmbuild(full seed) -> filterresult -> lolalign -> exact CM CYK.\n"
+            "Default cm-region flank is 3.0 for lolcmsearch.\n"
             "targetDB and resultDB may also be comma-separated lists of equal length.\n"
             "Environment overrides:\n"
+            "  MMSEQS_LOLCMSEARCH_FILTERRESULT=0\n"
+            "  MMSEQS_LOLCMSEARCH_FILTER_MAX_SEQ_ID=0.96\n"
+            "  MMSEQS_LOLCMSEARCH_FILTER_QID=0\n"
+            "  MMSEQS_LOLCMSEARCH_FILTER_COV=0\n"
+            "  MMSEQS_LOLCMSEARCH_FILTER_QSC=-20\n"
+            "  MMSEQS_LOLCMSEARCH_FILTER_DIFF=100000\n"
             "  MMSEQS_LOLCMSEARCH_BAND_PAD=N\n"
             "  MMSEQS_LOLCMSEARCH_KEEP_TMP=1\n"
             "  MMSEQS_LOLCMSEARCH_SKIP_BUILD=1\n"

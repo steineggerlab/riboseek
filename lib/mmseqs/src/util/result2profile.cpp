@@ -10,10 +10,41 @@
 #include "IndexReader.h"
 #include "Masker.h"
 #include "Sequence.h"
+#include <algorithm>
 
 #ifdef OPENMP
 #include <omp.h>
 #endif
+
+
+static inline bool isReverseStrandResult(const Matcher::result_t &res) {
+    const bool queryReverse = res.qStartPos > res.qEndPos;
+    const bool targetReverse = res.dbStartPos > res.dbEndPos;
+    return queryReverse != targetReverse;
+}
+
+static inline void normalizeResultForMultipleAlignment(Matcher::result_t &res) {
+    const bool queryReverse = res.qStartPos > res.qEndPos;
+    const bool targetReverse = res.dbStartPos > res.dbEndPos;
+
+    if (queryReverse == targetReverse) {
+        if (queryReverse) {
+            std::swap(res.qStartPos, res.qEndPos);
+            std::swap(res.dbStartPos, res.dbEndPos);
+            std::reverse(res.backtrace.begin(), res.backtrace.end());
+        }
+        return;
+    }
+
+    // MultipleAlignment encodes reverse-strand rows as qStart > qEnd with
+    // forward target coordinates. Convert target-only reverse records into
+    // that representation so reverse-complement rows are projected correctly.
+    if (!queryReverse && targetReverse) {
+        std::swap(res.qStartPos, res.qEndPos);
+        std::swap(res.dbStartPos, res.dbEndPos);
+        std::reverse(res.backtrace.begin(), res.backtrace.end());
+    }
+}
 
 int result2profile(int argc, const char **argv, const Command &command, bool returnAlnRes) {
     MMseqsMPI::init(argc, argv);
@@ -226,11 +257,13 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
                         EXIT(EXIT_FAILURE);
                     }
 
-                    // Parse alignment first to determine strand (reverse if qStartPos > qEndPos)
+                    // Parse alignment first to determine strand. RNA reverse-complement
+                    // hits can be encoded by either query or target coordinate reversal.
                     bool isReverse = false;
                     if (columns > Matcher::ALN_RES_WITHOUT_BT_COL_CNT) {
                         alnResults.emplace_back(Matcher::parseAlignmentRecord(data));
-                        isReverse = hasReverseMap && (alnResults.back().qStartPos > alnResults.back().qEndPos);
+                        isReverse = hasReverseMap && isReverseStrandResult(alnResults.back());
+                        normalizeResultForMultipleAlignment(alnResults.back());
                     }
 
                     if (isReverse) {
@@ -243,7 +276,7 @@ int result2profile(int argc, const char **argv, const Command &command, bool ret
                     if (DBReader<unsigned int>::getExtendedDbtype(tDbr->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU) {
                         char *dbSeqData = tDbr->getDataUncompressed(edgeId);
                         memcpy(edgeSequence.numSequence, dbSeqData, edgeSequence.L);
-                        if (alnResults.back().qStartPos > alnResults.back().qEndPos) {
+                        if (isReverse) {
                             unsigned char *numSequence = edgeSequence.numSequence;
                             unsigned int i = edgeSequence.L - 1;
                             for (; i >= 4; i -= 4) {
