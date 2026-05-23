@@ -9203,11 +9203,6 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
         if (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_DOTBRACKET_ONLY", 0) != 0) {
             env.push_back(std::make_pair("MMSEQS_LOLALIGN_DOTBRACKET_ONLY", "1"));
         }
-        if (par.emsearchRnaPlfold) {
-            env.push_back(std::make_pair("MMSEQS_LOLALIGN_STRUCTURE_BACKEND", "rnaplfold"));
-            env.push_back(std::make_pair("MMSEQS_LOLALIGN_RNAPLFOLD_WINDOW", SSTR(std::max(0, par.emsearchRnaPlfoldWindow))));
-            env.push_back(std::make_pair("MMSEQS_LOLALIGN_RNAPLFOLD_SPAN", SSTR(std::max(0, par.emsearchRnaPlfoldSpan))));
-        }
         std::string err;
         if (!runExternalCommand(args, env, err)) {
             cleanup();
