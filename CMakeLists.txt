@@ -5,6 +5,45 @@ endif()
 cmake_policy(SET CMP0074 NEW)
 project(riboseek C CXX)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/lib/mmseqs/cmake")
+set(RIBOSEEK_LINEAR_TURBOFOLD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/lib/LinearTurboFold")
+set(RIBOSEEK_LINEAR_TURBOFOLD_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/linear_turbofold_linearpartition_optimizations.patch")
+if (EXISTS "${RIBOSEEK_LINEAR_TURBOFOLD_ROOT}/src/LinearPartition/src/LinearPartition.cpp"
+    AND EXISTS "${RIBOSEEK_LINEAR_TURBOFOLD_PATCH}")
+    find_package(Git QUIET)
+    if (Git_FOUND)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C "${RIBOSEEK_LINEAR_TURBOFOLD_ROOT}"
+                    apply --unidiff-zero --ignore-whitespace --whitespace=nowarn --check "${RIBOSEEK_LINEAR_TURBOFOLD_PATCH}"
+            RESULT_VARIABLE RIBOSEEK_LINEAR_TURBOFOLD_PATCH_CAN_APPLY
+            OUTPUT_QUIET
+            ERROR_QUIET)
+        if (RIBOSEEK_LINEAR_TURBOFOLD_PATCH_CAN_APPLY EQUAL 0)
+            message(STATUS "Applying riboseek LinearPartition optimization patch")
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" -C "${RIBOSEEK_LINEAR_TURBOFOLD_ROOT}"
+                        apply --unidiff-zero --ignore-whitespace --whitespace=nowarn "${RIBOSEEK_LINEAR_TURBOFOLD_PATCH}"
+                RESULT_VARIABLE RIBOSEEK_LINEAR_TURBOFOLD_PATCH_APPLY_STATUS)
+            if (NOT RIBOSEEK_LINEAR_TURBOFOLD_PATCH_APPLY_STATUS EQUAL 0)
+                message(FATAL_ERROR "Failed to apply LinearPartition optimization patch")
+            endif ()
+        else ()
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" -C "${RIBOSEEK_LINEAR_TURBOFOLD_ROOT}"
+                        apply --unidiff-zero --ignore-whitespace --whitespace=nowarn --reverse --check "${RIBOSEEK_LINEAR_TURBOFOLD_PATCH}"
+                RESULT_VARIABLE RIBOSEEK_LINEAR_TURBOFOLD_PATCH_REVERSES
+                OUTPUT_QUIET
+                ERROR_QUIET)
+            if (NOT RIBOSEEK_LINEAR_TURBOFOLD_PATCH_REVERSES EQUAL 0)
+                message(FATAL_ERROR
+                        "LinearPartition optimization patch is neither applicable nor already applied")
+            endif ()
+        endif ()
+    else ()
+        message(FATAL_ERROR "Git is required to apply the LinearPartition optimization patch")
+    endif ()
+endif ()
+
 
 if(NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)

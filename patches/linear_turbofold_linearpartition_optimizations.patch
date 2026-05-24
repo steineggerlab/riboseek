@@ -1,0 +1,1553 @@
+diff --git a/src/LinearPartition/src/LinearPartition.cpp b/src/LinearPartition/src/LinearPartition.cpp
+index 4002764..592e691 100644
+--- a/src/LinearPartition/src/LinearPartition.cpp
++++ b/src/LinearPartition/src/LinearPartition.cpp
+@@ -3,2 +3,2 @@
+- The main code for LinearPartition: Linear-Time Approximation of
+-                                    RNA Folding Partition Function
++ The main code for LinearPartition: Linear-Time Approximation of
++                                    RNA Folding Partition Function
+@@ -21,2 +21,12 @@
+-#include <stdio.h>
+-#include <set>
++#include <stdio.h>
++#include <set>
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <stdint.h>
++
++#if defined(__GNUC__) || defined(__clang__)
++#pragma GCC optimize ("unroll-loops")
++#endif
+@@ -27 +37,71 @@
+-#include "bpp.h"
++#if defined(__GNUC__) || defined(__clang__)
++#define LP_LIKELY(x) __builtin_expect(!!(x), 1)
++#define LP_UNLIKELY(x) __builtin_expect(!!(x), 0)
++#define LP_ALWAYS_INLINE inline __attribute__((always_inline))
++#else
++#define LP_LIKELY(x) (x)
++#define LP_UNLIKELY(x) (x)
++#define LP_ALWAYS_INLINE inline
++#endif
++
++struct LpScoreOverKTTable {
++    static const int offset = 100000;
++    double values[200001];
++    LpScoreOverKTTable() {
++        for (int i = -offset; i <= offset; ++i) {
++            values[i + offset] = i / kT;
++        }
++    }
++};
++
++static const LpScoreOverKTTable lpScoreOverKTTable;
++
++static LP_ALWAYS_INLINE double lpScoreOverKT(int score) {
++    return lpScoreOverKTTable.values[score + LpScoreOverKTTable::offset];
++}
++
++struct LpSingleGenericBaseTable {
++    static const int notGeneric = -1000000000;
++    int values[31][31];
++    LpSingleGenericBaseTable() {
++        for (int left = 0; left <= 30; ++left) {
++            for (int right = 0; right <= 30; ++right) {
++                int nl = left > right ? left : right;
++                int ns = left > right ? right : left;
++                if (ns >= 3 || (ns == 2 && nl >= 4)) {
++                    values[left][right] = internal_loop37[left + right] + MIN2(MAX_NINIO, (nl - ns) * ninio37);
++                } else {
++                    values[left][right] = notGeneric;
++                }
++            }
++        }
++    }
++};
++
++static const LpSingleGenericBaseTable lpSingleGenericBaseTable;
++
++static LP_ALWAYS_INLINE void lpLogPlusEquals(float &x, float y) {
++    if (x == static_cast<float>(VALUE_MIN)) {
++        x = y;
++    } else {
++        Fast_LogPlusEquals(x, y);
++    }
++}
++
++static LP_ALWAYS_INLINE void lpLogPlusEqualsFinite(float &x, float y) {
++    if (x < y) {
++        const float tmp = x;
++        x = y;
++        y = tmp;
++    }
++    if (x-y < float(11.8624794162)) {
++        x = Fast_LogExpPlusOne(x-y) + y;
++    }
++}
++
++
++static inline unsigned lpBuildDensePfscoreLookup(std::unordered_map<int, State> *pfscore, unsigned seqLength);
++static inline State *lpFindDensePfscore(int q, int key, unsigned seqLength, unsigned generation);
++static inline unsigned lpBuildDenseMultiLookup(std::unordered_map<int, State> *maps, unsigned seqLength);
++static inline State *lpFindDenseMulti(int q, int key, unsigned seqLength, unsigned generation);
++
+@@ -39,0 +120,410 @@ using namespace std;
++struct LinearPartitionParseDetailTotals {
++    std::atomic<unsigned long long> calls;
++    std::atomic<unsigned long long> bases;
++    std::atomic<unsigned long long> prepareNs;
++    std::atomic<unsigned long long> insideNs;
++    std::atomic<unsigned long long> outsideNs;
++    std::atomic<unsigned long long> pruneNs;
++    std::atomic<unsigned long long> insideHNs;
++    std::atomic<unsigned long long> insideMultiNs;
++    std::atomic<unsigned long long> insidePNs;
++    std::atomic<unsigned long long> insideM2Ns;
++    std::atomic<unsigned long long> insideMNs;
++    std::atomic<unsigned long long> insideCNs;
++    std::atomic<unsigned long long> pStates;
++    std::atomic<unsigned long long> pSinglePVisits;
++    std::atomic<unsigned long long> pSingleQVisits;
++    std::atomic<unsigned long long> pM2Iterations;
++    LinearPartitionParseDetailTotals()
++        : calls(0), bases(0), prepareNs(0), insideNs(0), outsideNs(0), pruneNs(0),
++          insideHNs(0), insideMultiNs(0), insidePNs(0), insideM2Ns(0), insideMNs(0), insideCNs(0),
++          pStates(0), pSinglePVisits(0), pSingleQVisits(0), pM2Iterations(0) {}
++};
++
++static LinearPartitionParseDetailTotals &lpParseDetailTotals() {
++    static LinearPartitionParseDetailTotals totals;
++    return totals;
++}
++
++static inline bool lpParseDetailEnabled() {
++#ifdef RIBOSEEK_ENABLE_LP_PARSE_DETAIL
++    static const bool enabled = []() {
++        const char *value = std::getenv("RIBOSEEK_LP_PARSE_DETAIL");
++        return value != NULL && value[0] != 0 && std::strcmp(value, "0") != 0;
++    }();
++    return enabled;
++#else
++    return false;
++#endif
++}
++
++static unsigned long long lpElapsedNs(std::chrono::steady_clock::time_point a,
++                                      std::chrono::steady_clock::time_point b) {
++    return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
++}
++
++struct LinearPartitionParseDetailReporter {
++    ~LinearPartitionParseDetailReporter() {
++        if (!lpParseDetailEnabled()) {
++            return;
++        }
++        LinearPartitionParseDetailTotals &totals = lpParseDetailTotals();
++        const unsigned long long calls = totals.calls.load();
++        if (calls == 0) {
++            return;
++        }
++        const double nsToSec = 1.0e-9;
++        fprintf(stderr, "lp_parse_detail_calls\t%llu\n", calls);
++        fprintf(stderr, "lp_parse_detail_bases\t%llu\n", totals.bases.load());
++        fprintf(stderr, "lp_parse_detail_prepare_seconds\t%.6f\n", static_cast<double>(totals.prepareNs.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_inside_seconds\t%.6f\n", static_cast<double>(totals.insideNs.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_outside_seconds\t%.6f\n", static_cast<double>(totals.outsideNs.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_prune_seconds\t%.6f\n", static_cast<double>(totals.pruneNs.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_inside_h_seconds\t%.6f\n", static_cast<double>(totals.insideHNs.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_inside_multi_seconds\t%.6f\n", static_cast<double>(totals.insideMultiNs.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_inside_p_seconds\t%.6f\n", static_cast<double>(totals.insidePNs.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_inside_m2_seconds\t%.6f\n", static_cast<double>(totals.insideM2Ns.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_inside_m_seconds\t%.6f\n", static_cast<double>(totals.insideMNs.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_inside_c_seconds\t%.6f\n", static_cast<double>(totals.insideCNs.load()) * nsToSec);
++        fprintf(stderr, "lp_parse_detail_p_states\t%llu\n", totals.pStates.load());
++        fprintf(stderr, "lp_parse_detail_p_single_p_visits\t%llu\n", totals.pSinglePVisits.load());
++        fprintf(stderr, "lp_parse_detail_p_single_q_visits\t%llu\n", totals.pSingleQVisits.load());
++        fprintf(stderr, "lp_parse_detail_p_m2_iterations\t%llu\n", totals.pM2Iterations.load());
++    }
++};
++
++static LinearPartitionParseDetailReporter &lpParseDetailReporter() {
++    static LinearPartitionParseDetailReporter reporter;
++    return reporter;
++}
++
++static inline void lpLogPlusAlpha(std::unordered_map<int, State> &beamstep, int key, float value) {
++    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.try_emplace(key, value);
++    if (!inserted.second) {
++        lpLogPlusEquals(inserted.first->second.alpha, value);
++    }
++}
++
++struct LpAlphaCacheEntry {
++    const std::unordered_map<int, State> *map;
++    int key;
++    State *state;
++    unsigned generation;
++
++    LpAlphaCacheEntry() : map(NULL), key(0), state(NULL), generation(0) {}
++};
++
++static const std::size_t lpAlphaCacheSize = 1u << 16;
++static thread_local std::vector<LpAlphaCacheEntry> lpAlphaCache;
++static thread_local unsigned lpAlphaCacheGeneration = 0;
++
++static inline unsigned lpBeginAlphaCacheGeneration() {
++    if (lpAlphaCache.empty()) {
++        lpAlphaCache.resize(lpAlphaCacheSize);
++    }
++    ++lpAlphaCacheGeneration;
++    if (lpAlphaCacheGeneration == 0) {
++        for (LpAlphaCacheEntry &entry : lpAlphaCache) {
++            entry.generation = 0;
++        }
++        lpAlphaCacheGeneration = 1;
++    }
++    return lpAlphaCacheGeneration;
++}
++
++static inline void lpLogPlusAlphaCached(std::unordered_map<int, State> &beamstep, int key, float value, unsigned generation) {
++    const std::uintptr_t mapBits = reinterpret_cast<std::uintptr_t>(&beamstep) >> 4;
++    const std::size_t idx = (mapBits ^ (static_cast<unsigned>(key) * 2654435761u)) & (lpAlphaCacheSize - 1);
++    LpAlphaCacheEntry &entry = lpAlphaCache[idx];
++    if (entry.generation == generation && entry.map == &beamstep && entry.key == key) {
++        lpLogPlusEquals(entry.state->alpha, value);
++        return;
++    }
++
++    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.try_emplace(key, value);
++    if (!inserted.second) {
++        lpLogPlusEquals(inserted.first->second.alpha, value);
++    }
++    entry.map = &beamstep;
++    entry.key = key;
++    entry.state = &inserted.first->second;
++    entry.generation = generation;
++}
++
++static const unsigned lpDenseAlphaMaxLen = 1024;
++static thread_local std::vector<State *> lpDenseAlphaPtrs;
++static thread_local std::vector<unsigned> lpDenseAlphaGenerations;
++static thread_local unsigned lpDenseAlphaGeneration = 0;
++
++static inline unsigned lpBeginDenseAlphaGeneration(unsigned seqLength) {
++    if (seqLength == 0 || seqLength > lpDenseAlphaMaxLen) {
++        return 0;
++    }
++    const std::size_t total = static_cast<std::size_t>(seqLength) * static_cast<std::size_t>(seqLength);
++    if (lpDenseAlphaPtrs.size() < total) {
++        lpDenseAlphaPtrs.resize(total, NULL);
++        lpDenseAlphaGenerations.resize(total, 0);
++    }
++    ++lpDenseAlphaGeneration;
++    if (lpDenseAlphaGeneration == 0) {
++        std::fill(lpDenseAlphaGenerations.begin(), lpDenseAlphaGenerations.end(), 0);
++        lpDenseAlphaGeneration = 1;
++    }
++    return lpDenseAlphaGeneration;
++}
++static thread_local std::vector<State *> lpDenseMultiAlphaPtrs;
++static thread_local std::vector<unsigned> lpDenseMultiAlphaGenerations;
++static thread_local unsigned lpDenseMultiAlphaGeneration = 0;
++
++static inline unsigned lpBeginDenseMultiAlphaGeneration(unsigned seqLength) {
++    if (seqLength == 0 || seqLength > lpDenseAlphaMaxLen) {
++        return 0;
++    }
++    const std::size_t total = static_cast<std::size_t>(seqLength) * static_cast<std::size_t>(seqLength);
++    if (lpDenseMultiAlphaPtrs.size() < total) {
++        lpDenseMultiAlphaPtrs.resize(total, NULL);
++        lpDenseMultiAlphaGenerations.resize(total, 0);
++    }
++    ++lpDenseMultiAlphaGeneration;
++    if (lpDenseMultiAlphaGeneration == 0) {
++        std::fill(lpDenseMultiAlphaGenerations.begin(), lpDenseMultiAlphaGenerations.end(), 0);
++        lpDenseMultiAlphaGeneration = 1;
++    }
++    return lpDenseMultiAlphaGeneration;
++}
++
++static inline void lpLogPlusAlphaIndexedPfscore(std::unordered_map<int, State> *pfscore, int q, int key,
++                                                float value, unsigned seqLength,
++                                                unsigned denseGeneration, unsigned cacheGeneration) {
++    if (denseGeneration != 0) {
++        const std::size_t idx = static_cast<std::size_t>(q) * static_cast<std::size_t>(seqLength) + static_cast<std::size_t>(key);
++        if (LP_LIKELY(lpDenseAlphaGenerations[idx] == denseGeneration)) {
++            lpLogPlusEqualsFinite(lpDenseAlphaPtrs[idx]->alpha, value);
++            return;
++        }
++
++        std::unordered_map<int, State> &beamstep = pfscore[q];
++        std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.try_emplace(key, value);
++        if (!inserted.second) {
++            lpLogPlusEquals(inserted.first->second.alpha, value);
++        }
++        lpDenseAlphaPtrs[idx] = &inserted.first->second;
++        lpDenseAlphaGenerations[idx] = denseGeneration;
++        return;
++    }
++
++    lpLogPlusAlphaCached(pfscore[q], key, value, cacheGeneration);
++}
++
++static inline unsigned lpBuildDensePfscoreLookup(std::unordered_map<int, State> *pfscore, unsigned seqLength) {
++    if (seqLength == 0 || seqLength > lpDenseAlphaMaxLen) {
++        return 0;
++    }
++    const std::size_t total = static_cast<std::size_t>(seqLength) * static_cast<std::size_t>(seqLength);
++    if (lpDenseAlphaPtrs.size() < total) {
++        lpDenseAlphaPtrs.resize(total, NULL);
++        lpDenseAlphaGenerations.resize(total, 0);
++    }
++    ++lpDenseAlphaGeneration;
++    if (lpDenseAlphaGeneration == 0) {
++        std::fill(lpDenseAlphaGenerations.begin(), lpDenseAlphaGenerations.end(), 0);
++        lpDenseAlphaGeneration = 1;
++    }
++    const unsigned generation = lpDenseAlphaGeneration;
++    for (unsigned q = 0; q < seqLength; ++q) {
++        for (std::unordered_map<int, State>::iterator it = pfscore[q].begin(); it != pfscore[q].end(); ++it) {
++            const int key = it->first;
++            if (key >= 0 && static_cast<unsigned>(key) < seqLength) {
++                const std::size_t idx = static_cast<std::size_t>(q) * static_cast<std::size_t>(seqLength) + static_cast<std::size_t>(key);
++                lpDenseAlphaPtrs[idx] = &it->second;
++                lpDenseAlphaGenerations[idx] = generation;
++            }
++        }
++    }
++    return generation;
++}
++
++static inline State *lpFindDensePfscore(int q, int key, unsigned seqLength, unsigned generation) {
++    if (generation == 0 || key < 0 || static_cast<unsigned>(key) >= seqLength) {
++        return NULL;
++    }
++    const std::size_t idx = static_cast<std::size_t>(q) * static_cast<std::size_t>(seqLength) + static_cast<std::size_t>(key);
++    return lpDenseAlphaGenerations[idx] == generation ? lpDenseAlphaPtrs[idx] : NULL;
++}
++
++static thread_local std::vector<State *> lpDenseOutsideMultiPtrs;
++static thread_local std::vector<unsigned> lpDenseOutsideMultiGenerations;
++static thread_local unsigned lpDenseOutsideMultiGeneration = 0;
++
++static inline unsigned lpBuildDenseMultiLookup(std::unordered_map<int, State> *maps, unsigned seqLength) {
++    if (seqLength == 0 || seqLength > lpDenseAlphaMaxLen) {
++        return 0;
++    }
++    const std::size_t total = static_cast<std::size_t>(seqLength) * static_cast<std::size_t>(seqLength);
++    if (lpDenseOutsideMultiPtrs.size() < total) {
++        lpDenseOutsideMultiPtrs.resize(total, NULL);
++        lpDenseOutsideMultiGenerations.resize(total, 0);
++    }
++    ++lpDenseOutsideMultiGeneration;
++    if (lpDenseOutsideMultiGeneration == 0) {
++        std::fill(lpDenseOutsideMultiGenerations.begin(), lpDenseOutsideMultiGenerations.end(), 0);
++        lpDenseOutsideMultiGeneration = 1;
++    }
++    const unsigned generation = lpDenseOutsideMultiGeneration;
++    for (unsigned q = 0; q < seqLength; ++q) {
++        for (std::unordered_map<int, State>::iterator it = maps[q].begin(); it != maps[q].end(); ++it) {
++            const int key = it->first;
++            if (key >= 0 && static_cast<unsigned>(key) < seqLength) {
++                const std::size_t idx = static_cast<std::size_t>(q) * static_cast<std::size_t>(seqLength) + static_cast<std::size_t>(key);
++                lpDenseOutsideMultiPtrs[idx] = &it->second;
++                lpDenseOutsideMultiGenerations[idx] = generation;
++            }
++        }
++    }
++    return generation;
++}
++
++static inline State *lpFindDenseMulti(int q, int key, unsigned seqLength, unsigned generation) {
++    if (generation == 0 || key < 0 || static_cast<unsigned>(key) >= seqLength) {
++        return NULL;
++    }
++    const std::size_t idx = static_cast<std::size_t>(q) * static_cast<std::size_t>(seqLength) + static_cast<std::size_t>(key);
++    return lpDenseOutsideMultiGenerations[idx] == generation ? lpDenseOutsideMultiPtrs[idx] : NULL;
++}
++static LP_ALWAYS_INLINE State *lpFindDenseMatrixRaw(State **ptrs, unsigned *generations, int q, int key, unsigned seqLength, unsigned generation) {
++    if (generation == 0 || key < 0 || static_cast<unsigned>(key) >= seqLength) {
++        return NULL;
++    }
++    const std::size_t idx = static_cast<std::size_t>(q) * static_cast<std::size_t>(seqLength) + static_cast<std::size_t>(key);
++    return generations[idx] == generation ? ptrs[idx] : NULL;
++}
++
++static LP_ALWAYS_INLINE State *lpFindDenseKeyRaw(State **ptrs, unsigned *generations, int key, unsigned seqLength, unsigned generation) {
++    if (generation == 0 || key < 0 || static_cast<unsigned>(key) >= seqLength) {
++        return NULL;
++    }
++    const std::size_t idx = static_cast<std::size_t>(key);
++    return generations[idx] == generation ? ptrs[idx] : NULL;
++}
++
++struct LpPfscoreByPEntry {
++    int q;
++    int8_t outerMismatch;
++    State *state;
++};
++
++static LP_ALWAYS_INLINE bool lpPfscoreByPEntryLessThanQ(const LpPfscoreByPEntry &entry, int q) {
++    return entry.q < q;
++}
++
++static LP_ALWAYS_INLINE int lpScoreSingleCachedGeneric(const int *genericBaseRow, int leftLoop, int rightLoop, int outerGenericMismatch,
++                                            int p, int q, int nucp, const int *nucs, const int *nuc37s,
++                                            int sp1, int sq1, int innerPairType, int innerGenericMismatch) {
++    const int genericBase = genericBaseRow[rightLoop];
++    if (genericBase != LpSingleGenericBaseTable::notGeneric) {
++        return genericBase + outerGenericMismatch + innerGenericMismatch;
++    }
++
++    const int outerPairType = lpPairType[nucp][nucs[q]];
++    return v_score_single_precomputed_n(leftLoop, rightLoop,
++                                        nuc37s[p + 1], nuc37s[q - 1],
++                                        sp1, sq1, outerPairType, innerPairType);
++}
++
++struct LpDenseKeyAlphaIndex {
++    std::vector<State *> ptrs;
++    std::vector<unsigned> generations;
++    unsigned generation;
++    unsigned seqLength;
++
++    LpDenseKeyAlphaIndex() : generation(0), seqLength(0) {}
++
++    unsigned begin(unsigned len) {
++        if (len == 0 || len > lpDenseAlphaMaxLen) {
++            seqLength = 0;
++            return 0;
++        }
++        if (ptrs.size() < len) {
++            ptrs.resize(len, NULL);
++            generations.resize(len, 0);
++        }
++        ++generation;
++        if (generation == 0) {
++            std::fill(generations.begin(), generations.end(), 0);
++            generation = 1;
++        }
++        seqLength = len;
++        return generation;
++    }
++
++    void logPlusAlpha(std::unordered_map<int, State> &beamstep, int key, float value, unsigned activeGeneration) {
++        if (activeGeneration != 0 && key >= 0 && static_cast<unsigned>(key) < seqLength) {
++            const std::size_t idx = static_cast<std::size_t>(key);
++            if (LP_LIKELY(generations[idx] == activeGeneration)) {
++                lpLogPlusEqualsFinite(ptrs[idx]->alpha, value);
++                return;
++            }
++
++            std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.try_emplace(key, value);
++            if (!inserted.second) {
++                lpLogPlusEquals(inserted.first->second.alpha, value);
++            }
++            ptrs[idx] = &inserted.first->second;
++            generations[idx] = activeGeneration;
++            return;
++        }
++
++        lpLogPlusAlpha(beamstep, key, value);
++    }
++};
++
++static thread_local LpDenseKeyAlphaIndex lpDenseKeyAlphaIndexA;
++static thread_local LpDenseKeyAlphaIndex lpDenseKeyAlphaIndexB;
++
++struct LpDenseKeyLookup {
++    std::vector<State *> ptrs;
++    std::vector<unsigned> generations;
++    unsigned generation;
++    unsigned seqLength;
++
++    LpDenseKeyLookup() : generation(0), seqLength(0) {}
++
++    unsigned build(std::unordered_map<int, State> &beamstep, unsigned len) {
++        if (len == 0 || len > lpDenseAlphaMaxLen) {
++            seqLength = 0;
++            return 0;
++        }
++        if (ptrs.size() < len) {
++            ptrs.resize(len, NULL);
++            generations.resize(len, 0);
++        }
++        ++generation;
++        if (generation == 0) {
++            std::fill(generations.begin(), generations.end(), 0);
++            generation = 1;
++        }
++        seqLength = len;
++        for (std::unordered_map<int, State>::iterator it = beamstep.begin(); it != beamstep.end(); ++it) {
++            const int key = it->first;
++            if (key >= 0 && static_cast<unsigned>(key) < seqLength) {
++                ptrs[static_cast<std::size_t>(key)] = &it->second;
++                generations[static_cast<std::size_t>(key)] = generation;
++            }
++        }
++        return generation;
++    }
++
++    State *find(int key, unsigned activeGeneration) {
++        if (activeGeneration == 0 || key < 0 || static_cast<unsigned>(key) >= seqLength) {
++            return NULL;
++        }
++        const std::size_t idx = static_cast<std::size_t>(key);
++        return generations[idx] == activeGeneration ? ptrs[idx] : NULL;
++    }
++};
++
++static thread_local LpDenseKeyLookup lpDenseKeyLookupA;
++static thread_local LpDenseKeyLookup lpDenseKeyLookupB;
++
++#include "bpp.h"
++
+@@ -53,6 +543,12 @@ float quickselect(vector<pair<float, int>>& scores, unsigned long lower, unsigne
+-    if ( lower == upper ) return scores[lower].first;
+-    unsigned long split = quickselect_partition(scores, lower, upper);
+-    unsigned long length = split - lower + 1;
+-    if (length == k) return scores[split].first;
+-    else if (k  < length) return quickselect(scores, lower, split-1, k);
+-    else return quickselect(scores, split+1, upper, k - length);
++    while (lower != upper) {
++        unsigned long split = quickselect_partition(scores, lower, upper);
++        unsigned long length = split - lower + 1;
++        if (length == k) return scores[split].first;
++        if (k < length) {
++            upper = split - 1;
++        } else {
++            lower = split + 1;
++            k -= length;
++        }
++    }
++    return scores[lower].first;
+@@ -63 +559,4 @@ float BeamCKYParser::beam_prune(std::unordered_map<int, State> &beamstep) {
+-    scores.clear();
++    const bool detailTiming = lpParseDetailEnabled();
++    const auto pruneStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
++    scores.resize(beamstep.size());
++    std::size_t scoreIndex = 0;
+@@ -69 +568 @@ float BeamCKYParser::beam_prune(std::unordered_map<int, State> &beamstep) {
+-        scores.push_back(make_pair(newalpha, i));
++        scores[scoreIndex++] = std::make_pair(newalpha, i);
+@@ -71 +569,0 @@ float BeamCKYParser::beam_prune(std::unordered_map<int, State> &beamstep) {
+-    if (scores.size() <= beam) return VALUE_MIN;
+@@ -76,0 +575,3 @@ float BeamCKYParser::beam_prune(std::unordered_map<int, State> &beamstep) {
++    if (detailTiming) {
++        lpParseDetailTotals().pruneNs.fetch_add(lpElapsedNs(pruneStart, std::chrono::steady_clock::now()));
++    }
+@@ -81 +582,3 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
+-    if (beam < 0 || beamstep.size() <= beam) {
++    const bool detailTiming = lpParseDetailEnabled();
++    const auto pruneStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
++    if (beam < 0 || beamstep.size() <= beam) {
+@@ -93 +596 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
+-            }
++            }
+@@ -111 +614 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
+-            scores.push_back(make_pair(newalpha, i));
++            scores.emplace_back(newalpha, i);
+@@ -113 +616 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
+-
++
+@@ -119 +622 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
+-        }
++        }
+@@ -121,0 +625,3 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
++    if (detailTiming) {
++        lpParseDetailTotals().pruneNs.fetch_add(lpElapsedNs(pruneStart, std::chrono::steady_clock::now()));
++    }
+@@ -129,0 +636 @@ void BeamCKYParser::prepare(unsigned len) {
++        delete[] nuc37s;
+@@ -139,0 +647 @@ void BeamCKYParser::prepare(unsigned len) {
++    nuc37s = new int[seq_length];
+@@ -146 +654 @@ void BeamCKYParser::prepare(unsigned len) {
+-
++
+@@ -151,0 +660,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++    const bool detailTiming = lpParseDetailEnabled();
++    if (detailTiming) {
++        lpParseDetailReporter();
++    }
++    const auto prepareStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+@@ -153 +666,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-    replace(seq.begin(), seq.end(), 'T', 'U');
++    if (seq.find('T') != string::npos) {
++        replace(seq.begin(), seq.end(), 'T', 'U');
++    }
+@@ -157,2 +672,22 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-    for (int i = 0; i < seq_length; ++i)
+-        nucs[i] = GET_ACGU_NUM(seq[i]);
++    for (int i = 0; i < seq_length; ++i) {
++        const int nuc = GET_ACGU_NUM(seq[i]);
++        nucs[i] = nuc;
++        nuc37s[i] = lpNuc37ByNuc[nuc];
++    }
++
++    static thread_local std::vector<int8_t> genericOuterMismatchStorage;
++    genericOuterMismatchStorage.resize(static_cast<std::size_t>(seq_length) * static_cast<std::size_t>(seq_length));
++    int8_t *genericOuterMismatch = genericOuterMismatchStorage.data();
++    {
++        const std::size_t denseStride = static_cast<std::size_t>(seq_length);
++        for (int q = 1; q < seq_length; ++q) {
++            const std::size_t qBase = static_cast<std::size_t>(q) * denseStride;
++            const int nucq = nucs[q];
++            const int sj1 = nuc37s[q - 1];
++            for (int p2 = 0; p2 < q; ++p2) {
++                const int outerType = lpPairType[nucs[p2]][nucq];
++                genericOuterMismatchStorage[qBase + static_cast<std::size_t>(p2)] =
++                    static_cast<int8_t>(outerType != 0 ? mismatchI37[outerType][nuc37s[p2 + 1]][sj1] : 0);
++            }
++        }
++    }
+@@ -160 +695,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-    vector<int> next_pair[NOTON];
++    static thread_local std::vector<int> nextPairStorage;
++    nextPairStorage.resize(static_cast<std::size_t>(NOTON) * static_cast<std::size_t>(seq_length));
++    int *next_pair_rows[NOTON];
+@@ -161,0 +699 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++        int *nextPairBase = nextPairStorage.data();
+@@ -163,2 +701,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-            // next_pair
+-            next_pair[nuci].resize(seq_length, -1);
++            int *row = nextPairBase + static_cast<std::size_t>(nuci) * static_cast<std::size_t>(seq_length);
++            next_pair_rows[nuci] = row;
+@@ -167 +705 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                next_pair[nuci][j] = next;
++                row[j] = next;
+@@ -179,0 +718,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++    const auto insideStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
++    if (detailTiming) {
++        lpParseDetailTotals().prepareNs.fetch_add(lpElapsedNs(prepareStart, insideStart));
++    }
++
+@@ -180,0 +724,7 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++    const unsigned alphaDenseGeneration = lpBeginDenseAlphaGeneration(seq_length);
++    const unsigned alphaCacheGeneration = alphaDenseGeneration == 0 ? lpBeginAlphaCacheGeneration() : 0;
++    const unsigned multiDenseGeneration = lpBeginDenseMultiAlphaGeneration(seq_length);
++    unsigned long long detailPStates = 0;
++    unsigned long long detailPSinglePVisits = 0;
++    unsigned long long detailPSingleQVisits = 0;
++    unsigned long long detailPM2Iterations = 0;
+@@ -183 +733 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-        int nucj1 = (j+1) < seq_length ? nucs[j+1] : -1;
++        int nucj1_37 = (j+1) < seq_length ? nuc37s[j+1] : -1;
+@@ -190,0 +741,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++        unsigned beamstepMIndexGeneration = 0;
++        unsigned beamstepM2IndexGeneration = 0;
+@@ -193,0 +746 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+@@ -195 +747,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-
+@@ -198,2 +750,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                int jnext = next_pair[nucj][j];
+-                if (no_sharp_turn) while (jnext - j < 4 && jnext != -1) jnext = next_pair[nucj][jnext];
++                int *nextRowJ = next_pair_rows[nucj];
++                int jnext = nextRowJ[j];
++                if (no_sharp_turn) while (jnext - j < 4 && jnext != -1) jnext = nextRowJ[jnext];
+@@ -202 +754,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                    int nucjnext_1 = (jnext - 1) > -1 ? nucs[jnext - 1] : -1;
+@@ -212,2 +764,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        newscore = - v_score_hairpin(j, jnext, nucj, nucj1, nucjnext_1, nucjnext, tetra_hex_tri);
+-                        Fast_LogPlusEquals(bestH[jnext][j].alpha, newscore/kT);
++                        newscore = -v_score_hairpin_precomputed(j, jnext, lpPairType[nucj][nucjnext],
++                                                                  nucj1_37, nuc37s[jnext - 1], tetra_hex_tri);
++                        const float hAlpha = lpScoreOverKT(newscore);
++                        lpLogPlusAlpha(bestH[jnext], j, hAlpha);
+@@ -225 +779,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                    int jnext = next_pair[nuci][j];
++                    int *nextRowI = next_pair_rows[nuci];
++                    int jnext = nextRowI[j];
+@@ -228 +782,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        int nuci1 = (i + 1) < seq_length ? nucs[i + 1] : -1;
+@@ -230 +783,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        int nucjnext_1 = (jnext - 1) > -1 ? nucs[jnext - 1] : -1;
+@@ -244,2 +797,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        newscore = - v_score_hairpin(i, jnext, nuci, nuci1, nucjnext_1, nucjnext, tetra_hex_tri);
+-                        Fast_LogPlusEquals(bestH[jnext][i].alpha, (newscore/kT));
++                        newscore = -v_score_hairpin_precomputed(i, jnext, lpPairType[nuci][nucjnext],
++                                                                  ((i + 1) < seq_length ? nuc37s[i + 1] : -1),
++                                                                  nuc37s[jnext - 1], tetra_hex_tri);
++                        const float hAlpha = lpScoreOverKT(newscore);
++                        lpLogPlusAlpha(bestH[jnext], i, hAlpha);
+@@ -249 +805 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                    Fast_LogPlusEquals(beamstepP[i].alpha, state.alpha);
++                    lpLogPlusAlpha(beamstepP, i, state.alpha);
+@@ -251,0 +808,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            if (detailTiming) {
++                lpParseDetailTotals().insideHNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
++            }
+@@ -256,0 +816 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+@@ -264,2 +824 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                int nuci1 = nucs[i+1];
+-                int jnext = next_pair[nuci][j];
++                int jnext = next_pair_rows[nuci][j];
+@@ -270 +829,18 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        Fast_LogPlusEquals(bestMulti[jnext][i].alpha, (state.alpha));
++                        if (multiDenseGeneration != 0) {
++                            const std::size_t idx = static_cast<std::size_t>(jnext) * static_cast<std::size_t>(seq_length) + static_cast<std::size_t>(i);
++                            State **multiDensePtrs = lpDenseMultiAlphaPtrs.data();
++                            unsigned *multiDenseGens = lpDenseMultiAlphaGenerations.data();
++                            if (LP_LIKELY(multiDenseGens[idx] == multiDenseGeneration)) {
++                                lpLogPlusEqualsFinite(multiDensePtrs[idx]->alpha, state.alpha);
++                            } else {
++                                std::unordered_map<int, State> &targetBeamstep = bestMulti[jnext];
++                                std::pair<std::unordered_map<int, State>::iterator, bool> inserted = targetBeamstep.try_emplace(i, state.alpha);
++                                if (!inserted.second) {
++                                    lpLogPlusEquals(inserted.first->second.alpha, state.alpha);
++                                }
++                                multiDensePtrs[idx] = &inserted.first->second;
++                                multiDenseGens[idx] = multiDenseGeneration;
++                            }
++                        } else {
++                            lpLogPlusAlpha(bestMulti[jnext], i, state.alpha);
++                        }
+@@ -276,2 +852,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                    value_type score_multi = - v_score_multi(i, j, nuci, nuci1, nucs[j-1], nucj, seq_length);
+-                    Fast_LogPlusEquals(beamstepP[i].alpha, (state.alpha + score_multi/kT));
++                    int score_multi = -v_score_multi_precomputed(lpPairType[nucj][nuci], nuc37s[i+1], nuc37s[j-1]);
++                    lpLogPlusAlpha(beamstepP, i, state.alpha + lpScoreOverKT(score_multi));
+@@ -279,0 +856,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            if (detailTiming) {
++                lpParseDetailTotals().insideMultiNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
++            }
+@@ -283 +862,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-        {
++        {
++            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
++            beamstepMIndexGeneration = lpDenseKeyAlphaIndexA.begin(seq_length);
++            beamstepM2IndexGeneration = lpDenseKeyAlphaIndexB.begin(seq_length);
+@@ -289,0 +872,8 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            State **denseKeyPtrsA = lpDenseKeyAlphaIndexA.ptrs.data();
++            unsigned *denseKeyGensA = lpDenseKeyAlphaIndexA.generations.data();
++            State **denseKeyPtrsB = lpDenseKeyAlphaIndexB.ptrs.data();
++            unsigned *denseKeyGensB = lpDenseKeyAlphaIndexB.generations.data();
++            const unsigned denseStride = seq_length;
++            State **denseAlphaPtrs = lpDenseAlphaPtrs.data();
++            unsigned *denseAlphaGens = lpDenseAlphaGenerations.data();
++
+@@ -295,0 +886 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++                if (detailTiming) ++detailPStates;
+@@ -298 +889 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-
++
+@@ -300 +891,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                int nuci_1 = (i-1>-1) ? nucs[i-1] : -1;
++                int nuci_1_37 = (i-1>-1) ? nuc37s[i-1] : -1;
++                const int outerPairType = lpPairType[nuci][nucj];
+@@ -305,20 +897,55 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                    for (int p = i - 1; p >= std::max(i - SINGLE_MAX_LEN, 0); --p) {
+-                        int nucp = nucs[p];
+-                        int nucp1 = nucs[p + 1];
+-                        int q = next_pair[nucp][j];
+-                        while (q != -1 && ((i - p) + (q - j) - 2 <= SINGLE_MAX_LEN)) {
+-                            int nucq = nucs[q];
+-                            int nucq_1 = nucs[q - 1];
+-
+-                            if (p == i - 1 && q == j + 1) {
+-                                // helix
+-                                int score_single = -v_score_single(p,q,i,j, nucp, nucp1, nucq_1, nucq,
+-                                                            nuci_1, nuci, nucj, nucj1);
+-                                Fast_LogPlusEquals(pfscore[q][p].alpha, (state.alpha + score_single/kT));
+-                                // Fast_LogPlusEquals(bestP[q][p].alpha, (state.alpha + score_single/kT));
+-                            } else {
+-                                // single branch
+-                                int score_single = - v_score_single(p,q,i,j, nucp, nucp1, nucq_1, nucq,
+-                                                nuci_1, nuci, nucj, nucj1);
+-                                Fast_LogPlusEquals(pfscore[q][p].alpha, (state.alpha + score_single/kT));
+-                                // Fast_LogPlusEquals(bestP[q][p].alpha, (state.alpha + score_single/kT));
++                    const int innerPairType = lpPairType[nucj][nuci];
++                    const int innerGenericMismatch = mismatchI37[innerPairType][nucj1_37][nuci_1_37];
++                    if (alphaDenseGeneration != 0) {
++                        const int pMin = (i > SINGLE_MAX_LEN) ? (i - SINGLE_MAX_LEN) : 0;
++                        for (int p = i - 1, leftLoop = 0; p >= pMin; --p, ++leftLoop) {
++                            if (detailTiming) ++detailPSinglePVisits;
++                            int nucp = nucs[p];
++                            int *nextRowP = next_pair_rows[nucp];
++                            const int *genericBaseRow = lpSingleGenericBaseTable.values[leftLoop];
++                            const int qMax = j + SINGLE_MAX_LEN - leftLoop + 1;
++                            int q = nextRowP[j];
++                            while (q != -1 && q <= qMax) {
++                                if (detailTiming) ++detailPSingleQVisits;
++                                const int rightLoop = q - j - 1;
++                                const unsigned idx = static_cast<unsigned>(q) * denseStride + static_cast<unsigned>(p);
++                                const int score_single = -lpScoreSingleCachedGeneric(genericBaseRow, leftLoop, rightLoop,
++                                                                        genericOuterMismatch[idx],
++                                                                        p, q, nucp, nucs, nuc37s,
++                                                                        nuci_1_37, nucj1_37,
++                                                                        innerPairType, innerGenericMismatch);
++                                const float updateAlpha = state.alpha + lpScoreOverKT(score_single);
++                                if (LP_LIKELY(denseAlphaGens[idx] == alphaDenseGeneration)) {
++                                    lpLogPlusEqualsFinite(denseAlphaPtrs[idx]->alpha, updateAlpha);
++                                } else {
++                                    std::unordered_map<int, State> &targetBeamstep = pfscore[q];
++                                    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = targetBeamstep.try_emplace(p, updateAlpha);
++                                    if (!inserted.second) {
++                                        lpLogPlusEquals(inserted.first->second.alpha, updateAlpha);
++                                    }
++                                    denseAlphaPtrs[idx] = &inserted.first->second;
++                                    denseAlphaGens[idx] = alphaDenseGeneration;
++                                }
++                                q = nextRowP[q];
++                            }
++                        }
++                    } else {
++                        const int pMin = (i > SINGLE_MAX_LEN) ? (i - SINGLE_MAX_LEN) : 0;
++                        for (int p = i - 1, leftLoop = 0; p >= pMin; --p, ++leftLoop) {
++                            if (detailTiming) ++detailPSinglePVisits;
++                            int nucp = nucs[p];
++                            int *nextRowP = next_pair_rows[nucp];
++                            const int *genericBaseRow = lpSingleGenericBaseTable.values[leftLoop];
++                            const int qMax = j + SINGLE_MAX_LEN - leftLoop + 1;
++                            int q = nextRowP[j];
++                            while (q != -1 && q <= qMax) {
++                                if (detailTiming) ++detailPSingleQVisits;
++                                const int rightLoop = q - j - 1;
++                                const int score_single = -lpScoreSingleCachedGeneric(genericBaseRow, leftLoop, rightLoop,
++                                                                        genericOuterMismatch[static_cast<std::size_t>(q) * static_cast<std::size_t>(seq_length) + static_cast<std::size_t>(p)],
++                                                                        p, q, nucp, nucs, nuc37s,
++                                                                        nuci_1_37, nucj1_37,
++                                                                        innerPairType, innerGenericMismatch);
++                                lpLogPlusAlphaIndexedPfscore(pfscore, q, p, state.alpha + lpScoreOverKT(score_single),
++                                                               seq_length, alphaDenseGeneration, alphaCacheGeneration);
++                                q = nextRowP[q];
+@@ -326 +952,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                            q = next_pair[nucp][q];
+@@ -330,0 +957,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++                int m1Score = 0;
++                bool m1ScoreReady = false;
++
+@@ -333,2 +962,18 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        int score_M1 = - v_score_M1(i, j, j, nuci_1, nuci, nucj, nucj1, seq_length);
+-                        Fast_LogPlusEquals(beamstepM[i].alpha, (state.alpha + score_M1/kT));
++                        m1Score = -v_score_M1_precomputed(outerPairType, nuci_1_37, nucj1_37);
++                        m1ScoreReady = true;
++                        const float mAlpha = state.alpha + lpScoreOverKT(m1Score);
++                        if (beamstepMIndexGeneration != 0) {
++                            const std::size_t idx = static_cast<std::size_t>(i);
++                            if (LP_LIKELY(denseKeyGensA[idx] == beamstepMIndexGeneration)) {
++                                lpLogPlusEqualsFinite(denseKeyPtrsA[idx]->alpha, mAlpha);
++                            } else {
++                                std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstepM.try_emplace(i, mAlpha);
++                                if (!inserted.second) {
++                                    lpLogPlusEquals(inserted.first->second.alpha, mAlpha);
++                                }
++                                denseKeyPtrsA[idx] = &inserted.first->second;
++                                denseKeyGensA[idx] = beamstepMIndexGeneration;
++                            }
++                        } else {
++                            lpDenseKeyAlphaIndexA.logPlusAlpha(beamstepM, i, mAlpha, beamstepMIndexGeneration);
++                        }
+@@ -340,6 +985,30 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                    int M1_score = - v_score_M1(i, j, j, nuci_1, nuci, nucj, nucj1, seq_length);
+-                    float m1_alpha = state.alpha + M1_score/kT;
+-                    for (auto &m : bestM[k]) {
+-                        int newi = m.first;
+-                        State& m_state = m.second;
+-                        Fast_LogPlusEquals(beamstepM2[newi].alpha, m_state.alpha + m1_alpha);
++                    if (!m1ScoreReady) {
++                        m1Score = -v_score_M1_precomputed(outerPairType, nuci_1_37, nucj1_37);
++                    }
++                    float m1_alpha = state.alpha + lpScoreOverKT(m1Score);
++                    if (beamstepM2IndexGeneration != 0) {
++                        for (auto &m : bestM[k]) {
++                            if (detailTiming) ++detailPM2Iterations;
++                            int newi = m.first;
++                            State& m_state = m.second;
++                            const float m2Alpha = m_state.alpha + m1_alpha;
++                            const std::size_t idx = static_cast<std::size_t>(newi);
++                            if (LP_LIKELY(denseKeyGensB[idx] == beamstepM2IndexGeneration)) {
++                                lpLogPlusEqualsFinite(denseKeyPtrsB[idx]->alpha, m2Alpha);
++                            } else {
++                                std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstepM2.try_emplace(newi, m2Alpha);
++                                if (!inserted.second) {
++                                    lpLogPlusEquals(inserted.first->second.alpha, m2Alpha);
++                                }
++                                denseKeyPtrsB[idx] = &inserted.first->second;
++                                denseKeyGensB[idx] = beamstepM2IndexGeneration;
++                            }
++                        }
++                    } else {
++                        for (auto &m : bestM[k]) {
++                            if (detailTiming) ++detailPM2Iterations;
++                            int newi = m.first;
++                            State& m_state = m.second;
++                            const float m2Alpha = m_state.alpha + m1_alpha;
++                            lpDenseKeyAlphaIndexB.logPlusAlpha(beamstepM2, newi, m2Alpha, beamstepM2IndexGeneration);
++                        }
+@@ -354,6 +1023,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        int nuck = nuci_1;
+-                        int nuck1 = nuci;
+-                        int score_external_paired = - v_score_external_paired(k+1, j, nuck, nuck1,
+-                                                             nucj, nucj1, seq_length);
+-                        state.score_external = score_external_paired/kT + prefix_C.alpha;
+-                        Fast_LogPlusEquals(beamstepC.alpha, prefix_C.alpha + state.alpha + score_external_paired/kT);
++                        int score_external_paired = -v_score_external_paired_precomputed(outerPairType,
++                                                             nuci_1_37, nucj1_37);
++                        const double externalPairedAlpha = lpScoreOverKT(score_external_paired);
++                        state.score_external = externalPairedAlpha + prefix_C.alpha;
++                        lpLogPlusEquals(beamstepC.alpha, prefix_C.alpha + state.alpha + externalPairedAlpha);
+@@ -361,4 +1029,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        int score_external_paired = - v_score_external_paired(0, j, -1, nucs[0],
+-                                                                 nucj, nucj1, seq_length);
+-                        state.score_external = score_external_paired/kT;
+-                        Fast_LogPlusEquals(beamstepC.alpha, state.alpha + score_external_paired/kT);
++                        int score_external_paired = -v_score_external_paired_precomputed(outerPairType,
++                                                                 -1, nucj1_37);
++                        const double externalPairedAlpha = lpScoreOverKT(score_external_paired);
++                        state.score_external = externalPairedAlpha;
++                        lpLogPlusEquals(beamstepC.alpha, state.alpha + externalPairedAlpha);
+@@ -367,0 +1037,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            if (detailTiming) {
++                lpParseDetailTotals().insidePNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
++            }
+@@ -371,0 +1044 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+@@ -373,0 +1047,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            State **multiDensePtrs = lpDenseMultiAlphaPtrs.data();
++            unsigned *multiDenseGens = lpDenseMultiAlphaGenerations.data();
++            const std::size_t denseStride = static_cast<std::size_t>(seq_length);
++
+@@ -380 +1057,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                    for (int p = i-1; p >= std::max(i - SINGLE_MAX_LEN, 0); --p) {
++                    const int pMin = (i > SINGLE_MAX_LEN) ? (i - SINGLE_MAX_LEN) : 0;
++                    for (int p = i-1; p >= pMin; --p) {
+@@ -382 +1060 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        int q = next_pair[nucp][j];
++                        int q = next_pair_rows[nucp][j];
+@@ -384 +1062,16 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                        Fast_LogPlusEquals(bestMulti[q][p].alpha, state.alpha);
++                            if (multiDenseGeneration != 0) {
++                                const std::size_t idx = static_cast<std::size_t>(q) * denseStride + static_cast<std::size_t>(p);
++                                if (LP_LIKELY(multiDenseGens[idx] == multiDenseGeneration)) {
++                                    lpLogPlusEqualsFinite(multiDensePtrs[idx]->alpha, state.alpha);
++                                } else {
++                                    std::unordered_map<int, State> &targetBeamstep = bestMulti[q];
++                                    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = targetBeamstep.try_emplace(p, state.alpha);
++                                    if (!inserted.second) {
++                                        lpLogPlusEquals(inserted.first->second.alpha, state.alpha);
++                                    }
++                                    multiDensePtrs[idx] = &inserted.first->second;
++                                    multiDenseGens[idx] = multiDenseGeneration;
++                                }
++                            } else {
++                                lpLogPlusAlpha(bestMulti[q], p, state.alpha);
++                            }
+@@ -390 +1083,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                Fast_LogPlusEquals(beamstepM[i].alpha, state.alpha);
++                lpDenseKeyAlphaIndexA.logPlusAlpha(beamstepM, i, state.alpha, beamstepMIndexGeneration);
++            }
++            if (detailTiming) {
++                lpParseDetailTotals().insideM2Ns.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
+@@ -395,0 +1092 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+@@ -404 +1101 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                    Fast_LogPlusEquals(bestM[j+1][i].alpha, state.alpha);
++                    bestM[j+1].try_emplace(i, state.alpha);
+@@ -406,0 +1104,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            if (detailTiming) {
++                lpParseDetailTotals().insideMNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
++            }
+@@ -410,0 +1111 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+@@ -413 +1114,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-                Fast_LogPlusEquals(bestC[j+1].alpha, beamstepC.alpha);
++                bestC[j+1].alpha = beamstepC.alpha;
++            }
++            if (detailTiming) {
++                lpParseDetailTotals().insideCNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
+@@ -418 +1122 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-
++
+@@ -424,0 +1129,6 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
++    const auto insideEnd = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
++    if (detailTiming) {
++        LinearPartitionParseDetailTotals &totals = lpParseDetailTotals();
++        totals.insideNs.fetch_add(lpElapsedNs(insideStart, insideEnd));
++    }
++
+@@ -426 +1136,12 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-    outside(outer, i_seq, i_iter, next_pair, pfscore, ext_info);
++    outside(outer, i_seq, i_iter, next_pair_rows, genericOuterMismatch, pfscore, ext_info);
++    const auto outsideEnd = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
++    if (detailTiming) {
++        LinearPartitionParseDetailTotals &totals = lpParseDetailTotals();
++        totals.outsideNs.fetch_add(lpElapsedNs(insideEnd, outsideEnd));
++        totals.calls.fetch_add(1);
++        totals.bases.fetch_add(static_cast<unsigned long long>(seq_length));
++        totals.pStates.fetch_add(detailPStates);
++        totals.pSinglePVisits.fetch_add(detailPSinglePVisits);
++        totals.pSingleQVisits.fetch_add(detailPSingleQVisits);
++        totals.pM2Iterations.fetch_add(detailPM2Iterations);
++    }
+@@ -428 +1149 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-    if (!bppSaveFile.empty()){
++    if (!bppSaveFile.empty()){
+@@ -433 +1154 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-    if (!pfSaveFile.empty()){
++    if (!pfSaveFile.empty()){
+@@ -442 +1163 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+-void BeamCKYParser::print_states(FILE *fptr, unordered_map<int, State>& states, int j, string label, bool inside_only, double threshold) {
++void BeamCKYParser::print_states(FILE *fptr, unordered_map<int, State>& states, int j, string label, bool inside_only, double threshold) {
+@@ -455 +1176 @@ void BeamCKYParser::print_states(FILE *fptr, unordered_map<int, State>& states,
+-void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore, bool inside_only) {
++void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore, bool inside_only) {
+@@ -467 +1188 @@ void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore,
+-  for (j = 0; j < n; j++)
++  for (j = 0; j < n; j++)
+@@ -469 +1190 @@ void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore,
+-  for (j = 0; j < n; j++)
++  for (j = 0; j < n; j++)
+@@ -471 +1192 @@ void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore,
+-  for (j = 0; j < n; j++)
++  for (j = 0; j < n; j++)
+@@ -473 +1194 @@ void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore,
+-  for (j = 0; j < n; j++)
++  for (j = 0; j < n; j++)
+@@ -481,2 +1202,2 @@ BeamCKYParser::BeamCKYParser(int beam_size,
+-    : beam(beam_size),
+-      no_sharp_turn(nosharpturn),
++    : beam(beam_size),
++      no_sharp_turn(nosharpturn),
+@@ -485 +1206,10 @@ BeamCKYParser::BeamCKYParser(int beam_size,
+-      initialize();
++      seq_length = 0;
++      bestH = NULL;
++      bestM2 = NULL;
++      bestMulti = NULL;
++      bestM = NULL;
++      bestC = NULL;
++      nucs = NULL;
++      nuc37s = NULL;
++      static std::once_flag initializeOnce;
++      std::call_once(initializeOnce, initialize);
+@@ -489,0 +1220 @@ BeamCKYParser::~BeamCKYParser(){
++    delete[] nuc37s;
+diff --git a/src/LinearPartition/src/LinearPartition.h b/src/LinearPartition/src/LinearPartition.h
+index 3705546..3e6374e 100644
+--- a/src/LinearPartition/src/LinearPartition.h
++++ b/src/LinearPartition/src/LinearPartition.h
+@@ -16 +16 @@
+-#include <math.h>
++#include <math.h>
+@@ -24 +24 @@
+-#define NEG_INF -2e20
++#define NEG_INF -2e20
+@@ -61,3 +61,3 @@ enum Manner {
+-// A hash function used to hash a pair of any kind
+-struct hash_pair {
+-    template <class T1, class T2>
++// A hash function used to hash a pair of any kind
++struct hash_pair {
++    template <class T1, class T2>
+@@ -65,5 +65,5 @@ struct hash_pair {
+-    {
+-        auto hash1 = hash<T1>{}(p.first);
+-        auto hash2 = hash<T2>{}(p.second);
+-        return hash1 ^ hash2;
+-    }
++    {
++        auto hash1 = hash<T1>{}(p.first);
++        auto hash2 = hash<T2>{}(p.second);
++        return hash1 ^ hash2;
++    }
+@@ -82,0 +83 @@ struct State {
++    explicit State(float a): alpha(a), beta(VALUE_MIN) {};
+@@ -93 +94 @@ public:
+-
++
+@@ -116 +117 @@ private:
+-
++
+@@ -123,0 +125 @@ private:
++    int *nuc37s;
+@@ -128 +130 @@ private:
+-    void cal_PairProb(State& viterbi, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info);
++    void cal_PairProb(State& viterbi, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info);
+@@ -130 +132 @@ private:
+-    void outside(LinearTurboFold* outer, int i_seq, int i_iter, vector<int> next_pair[], unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info);
++    void outside(LinearTurboFold* outer, int i_seq, int i_iter, int *next_pair_rows[], int8_t *genericOuterMismatch, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info);
+@@ -149 +151 @@ inline float Fast_LogExpPlusOne(float x){
+-
++
+@@ -160 +162 @@ inline float Fast_LogExpPlusOne(float x){
+-
++
+@@ -191 +193 @@ inline float Fast_LogExpPlusOne(float x){
+-
++
+@@ -222 +224 @@ inline float Fast_Exp(float x)
+-
++
+diff --git a/src/LinearPartition/src/Utils/utility_v.h b/src/LinearPartition/src/Utils/utility_v.h
+index 4528e76..ae5fe30 100644
+--- a/src/LinearPartition/src/Utils/utility_v.h
++++ b/src/LinearPartition/src/Utils/utility_v.h
+@@ -15,0 +16,10 @@
++static const int lpNuc37ByNuc[5] = {1, 2, 3, 4, 0};
++static const int lpPairType[5][5] = {
++    {0, 0, 0, 5, 0},
++    {0, 0, 1, 0, 0},
++    {0, 2, 0, 3, 0},
++    {6, 0, 4, 0, 0},
++    {0, 0, 0, 0, 0}
++};
++
++
+@@ -30,0 +41 @@ inline int MAX2(int a, int b) {if (a >= b)return a;else return b;}
++
+@@ -108,0 +120,27 @@ inline int v_score_hairpin(int i, int j, int nuci, int nuci1, int nucj_1, int nu
++inline int v_score_hairpin_precomputed(int i, int j, int type, int si1, int sj1, int tetra_hex_tri_index = -1) {
++    int size = j-i-1;
++    int energy;
++
++    if(size <= 30)
++        energy = hairpin37[size];
++    else
++        energy = hairpin37[30] + (int)(lxc37*log((size)/30.));
++
++    if(size < 3) return energy;
++#ifdef SPECIAL_HP
++        if (size == 4 && tetra_hex_tri_index > -1)
++            return Tetraloop37[tetra_hex_tri_index];
++        else if (size == 6 && tetra_hex_tri_index > -1)
++            return Hexaloop37[tetra_hex_tri_index];
++        else if (size == 3) {
++            if (tetra_hex_tri_index > -1)
++                return Triloop37[tetra_hex_tri_index];
++            return (energy + (type>2 ? TerminalAU37 : 0));
++        }
++#endif
++
++    energy += mismatchH37[type][si1][sj1];
++
++    return energy;
++}
++
+@@ -178,0 +217,85 @@ inline int v_score_single(int i, int j, int p, int q,
++inline int v_score_single_precomputed_n(int n1, int n2,
++                        int si1, int sj1, int sp1, int sq1,
++                        int type, int type_2){
++    int nl, ns, u, energy;
++    energy = 0;
++
++    if (n1>n2) { nl=n1; ns=n2;}
++    else {nl=n2; ns=n1;}
++
++    if (nl == 0)
++        return stack37[type][type_2];
++
++    // Parser call sites enforce n1+n2 <= SINGLE_MAX_LEN == MAXLOOP.
++    if (ns==0) {
++        energy = bulge37[nl];
++    if (nl==1) energy += stack37[type][type_2];
++    else {
++      if (type>2) energy += TerminalAU37;
++      if (type_2>2) energy += TerminalAU37;
++    }
++    return energy;
++  }
++  else {
++    if (ns==1) {
++      if (nl==1)
++        return int11_37[type][type_2][si1][sj1];
++      if (nl==2) {
++        if (n1==1)
++          energy = int21_37[type][type_2][si1][sq1][sj1];
++        else
++          energy = int21_37[type_2][type][sq1][si1][sp1];
++        return energy;
++      }
++      else {
++        energy = internal_loop37[nl+1];
++        energy += MIN2(MAX_NINIO, (nl-ns)*ninio37);
++        energy += mismatch1nI37[type][si1][sj1] + mismatch1nI37[type_2][sq1][sp1];
++        return energy;
++      }
++    }
++    else if (ns==2) {
++      if(nl==2)      {
++        return int22_37[type][type_2][si1][sp1][sq1][sj1];}
++      else if (nl==3){
++        energy = internal_loop37[5]+ninio37;
++        energy += mismatch23I37[type][si1][sj1] + mismatch23I37[type_2][sq1][sp1];
++        return energy;
++      }
++
++    }
++    {
++      u = nl + ns;
++      energy = internal_loop37[u];
++
++      energy += MIN2(MAX_NINIO, (nl-ns)*ninio37);
++
++      energy += mismatchI37[type][si1][sj1] + mismatchI37[type_2][sq1][sp1];
++    }
++  }
++  return energy;
++}
++
++inline int v_score_single_precomputed(int i, int j, int p, int q,
++                        int si1, int sj1, int sp1, int sq1,
++                        int type, int type_2){
++    return v_score_single_precomputed_n(p-i-1, j-q-1, si1, sj1, sp1, sq1, type, type_2);
++}
++
++inline int v_score_single_precomputed_n_fast_generic(int n1, int n2,
++                        int si1, int sj1, int sp1, int sq1,
++                        int type, int type_2, int inner_generic_mismatch){
++    int nl, ns;
++    if (n1>n2) { nl=n1; ns=n2; }
++    else { nl=n2; ns=n1; }
++
++    if (ns >= 3 || (ns == 2 && nl >= 4)) {
++        return internal_loop37[nl + ns]
++             + MIN2(MAX_NINIO, (nl-ns)*ninio37)
++             + mismatchI37[type][si1][sj1]
++             + inner_generic_mismatch;
++    }
++
++    return v_score_single_precomputed_n(n1, n2, si1, sj1, sp1, sq1, type, type_2);
++}
++
+@@ -212,0 +336,4 @@ inline int v_score_M1(int i, int j, int k, int nuci_1, int nuci, int nuck, int n
++inline int v_score_M1_precomputed(int type, int sp1, int sq1) {
++    return E_MLstem(type, sp1, sq1);
++}
++
+@@ -224,0 +352,4 @@ inline int v_score_multi(int i, int j, int nuci, int nuci1, int nucj_1, int nucj
++inline int v_score_multi_precomputed(int type, int si1, int sj1) {
++    return E_MLstem(type, sj1, si1) + ML_closing37;
++}
++
+@@ -246,0 +378,18 @@ inline int v_score_external_paired(int i, int j, int nuci_1, int nuci, int nucj,
++inline int v_score_external_paired_precomputed(int type, int si1, int sj1) {
++    int energy = 0;
++
++    if(si1 >= 0 && sj1 >= 0){
++        energy += mismatchExt37[type][si1][sj1];
++    }
++    else if (si1 >= 0){
++        energy += dangle5_37[type][si1];
++    }
++    else if (sj1 >= 0){
++        energy += dangle3_37[type][sj1];
++    }
++
++    if(type > 2)
++        energy += TerminalAU37;
++  return energy;
++}
++
+diff --git a/src/LinearPartition/src/bpp.h b/src/LinearPartition/src/bpp.h
+index 26be8a9..47b55b8 100644
+--- a/src/LinearPartition/src/bpp.h
++++ b/src/LinearPartition/src/bpp.h
+@@ -9 +9 @@
+-#include <stdio.h>
++#include <stdio.h>
+@@ -21,5 +21,5 @@ void BeamCKYParser::output_to_file(string file_name, const char * type) {
+-        // printf("Outputing base pairing probability matrix to %s...\n", file_name.c_str());
+-        FILE *fptr = fopen(file_name.c_str(), type);
+-        if (fptr == NULL) {
+-            printf("Could not open file!\n");
+-            return;
++        // printf("Outputing base pairing probability matrix to %s...\n", file_name.c_str());
++        FILE *fptr = fopen(file_name.c_str(), type);
++        if (fptr == NULL) {
++            printf("Could not open file!\n");
++            return;
+@@ -39,2 +39,2 @@ void BeamCKYParser::output_to_file(string file_name, const char * type) {
+-        fclose(fptr);
+-        // printf("Done!\n");
++        fclose(fptr);
++        // printf("Done!\n");
+@@ -51,2 +51,2 @@ void BeamCKYParser::cal_PairProb(State& viterbi, unordered_map<int, State>* &pfs
+-            State state = item.second;
+-
++            const State &state = item.second;
++
+@@ -71,5 +71 @@ void BeamCKYParser::cal_PairProb(State& viterbi, unordered_map<int, State>* &pfs
+-void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vector<int> next_pair[], unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info){
+-
+-    struct timeval parse_starttime, parse_endtime;
+-
+-    gettimeofday(&parse_starttime, NULL);
++void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, int *next_pair_rows[], int8_t *genericOuterMismatch, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info){
+@@ -78,0 +75,53 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
++    const unsigned pfscoreLookupGeneration = lpBuildDensePfscoreLookup(pfscore, seq_length);
++    State **pfscoreLookupPtrs = lpDenseAlphaPtrs.data();
++    unsigned *pfscoreLookupGenerations = lpDenseAlphaGenerations.data();
++
++    static thread_local std::vector<std::vector<LpPfscoreByPEntry> > pfscoreByPStorage;
++    static thread_local std::vector<unsigned> pfscoreByPActiveRows;
++    for (unsigned p : pfscoreByPActiveRows) {
++        if (p < pfscoreByPStorage.size()) {
++            pfscoreByPStorage[p].clear();
++        }
++    }
++    pfscoreByPActiveRows.clear();
++    if (pfscoreByPStorage.size() < seq_length) {
++        pfscoreByPStorage.resize(seq_length);
++    }
++    for (unsigned q = 0; q < seq_length; ++q) {
++        for (std::unordered_map<int, State>::iterator it = pfscore[q].begin(); it != pfscore[q].end(); ++it) {
++            const int p = it->first;
++            if (p >= 0 && static_cast<unsigned>(p) < seq_length && _allowed_pairs[nucs[p]][nucs[q]]) {
++                std::vector<LpPfscoreByPEntry> &entries = pfscoreByPStorage[static_cast<std::size_t>(p)];
++                if (entries.empty()) {
++                    pfscoreByPActiveRows.push_back(static_cast<unsigned>(p));
++                }
++                LpPfscoreByPEntry entry;
++                entry.q = static_cast<int>(q);
++                entry.outerMismatch = genericOuterMismatch[static_cast<std::size_t>(q) * static_cast<std::size_t>(seq_length) + static_cast<std::size_t>(p)];
++                entry.state = &it->second;
++                entries.push_back(entry);
++            }
++        }
++    }
++
++    static thread_local std::vector<uint16_t> pfscoreByPFirstAfterJStorage;
++    const bool usePfscoreByPFirstAfterJ = seq_length <= lpDenseAlphaMaxLen;
++    const std::size_t firstAfterStride = static_cast<std::size_t>(seq_length) + 1;
++    if (usePfscoreByPFirstAfterJ) {
++        pfscoreByPFirstAfterJStorage.resize(static_cast<std::size_t>(seq_length) * firstAfterStride);
++        for (unsigned p : pfscoreByPActiveRows) {
++            const std::vector<LpPfscoreByPEntry> &entries = pfscoreByPStorage[p];
++            std::size_t idx = entries.size();
++            for (int jj = static_cast<int>(seq_length); jj >= 0; --jj) {
++                while (idx > 0 && entries[idx - 1].q > jj) {
++                    --idx;
++                }
++                pfscoreByPFirstAfterJStorage[static_cast<std::size_t>(p) * firstAfterStride + static_cast<std::size_t>(jj)] = static_cast<uint16_t>(idx);
++            }
++        }
++    }
++
++    const unsigned multiLookupGeneration = lpBuildDenseMultiLookup(bestMulti, seq_length);
++    State **multiLookupPtrs = lpDenseOutsideMultiPtrs.data();
++    unsigned *multiLookupGenerations = lpDenseOutsideMultiGenerations.data();
++
+@@ -83 +132 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-        int nucj1 = (j+1) < seq_length ? nucs[j+1] : -1;
++        int nucj1_37 = (j+1) < seq_length ? nuc37s[j+1] : -1;
+@@ -96 +145 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                Fast_LogPlusEquals(beamstepC.beta, (bestC[j+1].beta));
++                lpLogPlusEquals(beamstepC.beta, (bestC[j+1].beta));
+@@ -101 +150 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-
++
+@@ -103,0 +153,4 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
++            const unsigned nextMGeneration = (j < seq_length-1) ? lpDenseKeyLookupA.build(bestM[j+1], seq_length) : 0;
++            State **nextMPtrs = lpDenseKeyLookupA.ptrs.data();
++            unsigned *nextMGenerations = lpDenseKeyLookupA.generations.data();
++            const unsigned nextMLen = lpDenseKeyLookupA.seqLength;
+@@ -108 +161,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                    Fast_LogPlusEquals(state.beta, bestM[j+1][i].beta);
++                    State *mNextState = lpFindDenseKeyRaw(nextMPtrs, nextMGenerations, i, nextMLen, nextMGeneration);
++                    if (mNextState != NULL) {
++                        lpLogPlusEquals(state.beta, mNextState->beta);
++                    } else if (nextMGeneration == 0) {
++                        std::unordered_map<int, State>::iterator mNextIt = bestM[j+1].find(i);
++                        if (mNextIt != bestM[j+1].end()) {
++                            lpLogPlusEquals(state.beta, mNextIt->second.beta);
++                        }
++                    }
+@@ -112,0 +174,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
++        const unsigned currentMGeneration = lpDenseKeyLookupA.build(beamstepM, seq_length);
++        State **currentMPtrs = lpDenseKeyLookupA.ptrs.data();
++        unsigned *currentMGenerations = lpDenseKeyLookupA.generations.data();
++        const unsigned currentMLen = lpDenseKeyLookupA.seqLength;
++        const unsigned currentM2Generation = lpDenseKeyLookupB.build(beamstepM2, seq_length);
++        State **currentM2Ptrs = lpDenseKeyLookupB.ptrs.data();
++        unsigned *currentM2Generations = lpDenseKeyLookupB.generations.data();
++        const unsigned currentM2Len = lpDenseKeyLookupB.seqLength;
++
+@@ -123 +193 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                        int q = next_pair[nucp][j];
++                        int q = next_pair_rows[nucp][j];
+@@ -125 +195,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                            Fast_LogPlusEquals(state.beta, bestMulti[q][p].beta);
++                            State *multiState = lpFindDenseMatrixRaw(multiLookupPtrs, multiLookupGenerations, q, p, seq_length, multiLookupGeneration);
++                            if (multiState != NULL) {
++                                lpLogPlusEquals(state.beta, multiState->beta);
++                            } else if (multiLookupGeneration == 0) {
++                                std::unordered_map<int, State>::iterator multiIt = bestMulti[q].find(p);
++                                if (multiIt != bestMulti[q].end()) {
++                                    lpLogPlusEquals(state.beta, multiIt->second.beta);
++                                }
++                            }
+@@ -131 +209,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                Fast_LogPlusEquals(state.beta, beamstepM[i].beta);
++                State *mState = lpFindDenseKeyRaw(currentMPtrs, currentMGenerations, i, currentMLen, currentMGeneration);
++                if (mState != NULL) {
++                    lpLogPlusEquals(state.beta, mState->beta);
++                } else if (currentMGeneration == 0) {
++                    std::unordered_map<int, State>::iterator mIt = beamstepM.find(i);
++                    if (mIt != beamstepM.end()) {
++                        lpLogPlusEquals(state.beta, mIt->second.beta);
++                    }
++                }
+@@ -136 +222 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-        {
++        {
+@@ -141,2 +227 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                int nuci_1 = (i-1>-1) ? nucs[i-1] : -1;
+-
++                int nuci_1_37 = (i-1>-1) ? nuc37s[i-1] : -1;
+@@ -144 +229,4 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                    for (int p = i - 1; p >= std::max(i - SINGLE_MAX_LEN, 0); --p) {
++                    const int innerPairType = lpPairType[nucj][nuci];
++                    const int innerGenericMismatch = mismatchI37[innerPairType][nucj1_37][nuci_1_37];
++                    const int pMin = std::max(i - SINGLE_MAX_LEN, 0);
++                    for (int p = i - 1, leftLoop = 0; p >= pMin; --p, ++leftLoop) {
+@@ -146,21 +234,22 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                        int nucp1 = nucs[p + 1];
+-                        int q = next_pair[nucp][j];
+-                        while (q != -1 && ((i - p) + (q - j) - 2 <= SINGLE_MAX_LEN)) {
+-                            int nucq = nucs[q];
+-                            int nucq_1 = nucs[q - 1];
+-
+-                            // lisiz: if (bestP[q].find(p) != bestP[q].end()) {
+-                            if (pfscore[q].find(p) != pfscore[q].end()) {
+-                                if (p == i - 1 && q == j + 1) {
+-                                    // helix
+-                                    int score_single = -v_score_single(p,q,i,j, nucp, nucp1, nucq_1, nucq,
+-                                                                nuci_1, nuci, nucj, nucj1);
+-                                    Fast_LogPlusEquals(state.beta, (pfscore[q][p].beta + score_single/kT));
+-                                    // Fast_LogPlusEquals(state.beta, (bestP[q][p].beta + score_single/kT));
+-                                } else {
+-                                    // single branch
+-                                    int score_single = - v_score_single(p,q,i,j, nucp, nucp1, nucq_1, nucq,
+-                                                    nuci_1, nuci, nucj, nucj1);
+-                                    Fast_LogPlusEquals(state.beta, (pfscore[q][p].beta + score_single/kT));
+-                                    // Fast_LogPlusEquals(state.beta, (bestP[q][p].beta + score_single/kT));
+-                                }
++                        const std::vector<LpPfscoreByPEntry> &qStates = pfscoreByPStorage[static_cast<std::size_t>(p)];
++                        if (qStates.empty()) {
++                            continue;
++                        }
++                        const int *genericBaseRow = lpSingleGenericBaseTable.values[leftLoop];
++                        const int qMax = j + SINGLE_MAX_LEN - leftLoop + 1;
++                        std::size_t qIndex;
++                        std::size_t qEnd;
++                        if (usePfscoreByPFirstAfterJ) {
++                            const std::size_t firstAfterBase = static_cast<std::size_t>(p) * firstAfterStride;
++                            qIndex = pfscoreByPFirstAfterJStorage[firstAfterBase + static_cast<std::size_t>(j)];
++                            const int qMaxClamped = qMax < static_cast<int>(seq_length) ? qMax : static_cast<int>(seq_length);
++                            qEnd = pfscoreByPFirstAfterJStorage[firstAfterBase + static_cast<std::size_t>(qMaxClamped)];
++                        } else {
++                            qIndex = static_cast<std::size_t>(std::lower_bound(qStates.begin(), qStates.end(), j + 1, lpPfscoreByPEntryLessThanQ) - qStates.begin());
++                            qEnd = qStates.size();
++                        }
++                        for (; qIndex < qEnd; ++qIndex) {
++                            const LpPfscoreByPEntry &qEntry = qStates[qIndex];
++                            const int q = qEntry.q;
++                            if (!usePfscoreByPFirstAfterJ && (i - p) + (q - j) - 2 > SINGLE_MAX_LEN) {
++                                break;
+@@ -168 +257,8 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                            q = next_pair[nucp][q];
++                            State *pfState = qEntry.state;
++                            const int rightLoop = q - j - 1;
++                            const int score_single = -lpScoreSingleCachedGeneric(genericBaseRow, leftLoop, rightLoop,
++                                                                    qEntry.outerMismatch,
++                                                                    p, q, nucp, nucs, nuc37s,
++                                                                    nuci_1_37, nucj1_37,
++                                                                    innerPairType, innerGenericMismatch);
++                            lpLogPlusEquals(state.beta, pfState->beta + lpScoreOverKT(score_single));
+@@ -172,0 +269,3 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
++                int m1Score = 0;
++                bool m1ScoreReady = false;
++
+@@ -175,2 +274,11 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                        int score_M1 = - v_score_M1(i, j, j, nuci_1, nuci, nucj, nucj1, seq_length);
+-                        Fast_LogPlusEquals(state.beta, (beamstepM[i].beta + score_M1/kT));
++                        m1Score = -v_score_M1_precomputed(lpPairType[nuci][nucj], nuci_1_37, nucj1_37);
++                        m1ScoreReady = true;
++                        State *mState = lpFindDenseKeyRaw(currentMPtrs, currentMGenerations, i, currentMLen, currentMGeneration);
++                        if (mState != NULL) {
++                            lpLogPlusEquals(state.beta, (mState->beta + lpScoreOverKT(m1Score)));
++                        } else if (currentMGeneration == 0) {
++                            std::unordered_map<int, State>::iterator mIt = beamstepM.find(i);
++                            if (mIt != beamstepM.end()) {
++                                lpLogPlusEquals(state.beta, (mIt->second.beta + lpScoreOverKT(m1Score)));
++                            }
++                        }
+@@ -182,2 +290,4 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                    int M1_score = - v_score_M1(i, j, j, nuci_1, nuci, nucj, nucj1, seq_length);
+-                    float m1_alpha = M1_score/kT;
++                    if (!m1ScoreReady) {
++                        m1Score = -v_score_M1_precomputed(lpPairType[nuci][nucj], nuci_1_37, nucj1_37);
++                    }
++                    float m1_alpha = lpScoreOverKT(m1Score);
+@@ -188,2 +298,11 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                        Fast_LogPlusEquals(state.beta, (beamstepM2[newi].beta + m_state.alpha + m1_alpha));
+-                        Fast_LogPlusEquals(m_state.beta, (beamstepM2[newi].beta + m1_plus_P_alpha));
++                        State *m2State = lpFindDenseKeyRaw(currentM2Ptrs, currentM2Generations, newi, currentM2Len, currentM2Generation);
++                        if (m2State != NULL) {
++                            lpLogPlusEquals(state.beta, (m2State->beta + m_state.alpha + m1_alpha));
++                            lpLogPlusEquals(m_state.beta, (m2State->beta + m1_plus_P_alpha));
++                        } else if (currentM2Generation == 0) {
++                            std::unordered_map<int, State>::iterator m2It = beamstepM2.find(newi);
++                            if (m2It != beamstepM2.end()) {
++                                lpLogPlusEquals(state.beta, (m2It->second.beta + m_state.alpha + m1_alpha));
++                                lpLogPlusEquals(m_state.beta, (m2It->second.beta + m1_plus_P_alpha));
++                            }
++                        }
+@@ -197 +315,0 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                        int nuck = nuci_1;
+@@ -199,5 +317,5 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                        int score_external_paired = - v_score_external_paired(k+1, j, nuck, nuck1,
+-                                                                 nucj, nucj1, seq_length);
+-                        float external_paired_alpha_plus_beamstepC_beta = beamstepC.beta + score_external_paired/kT;
+-                        Fast_LogPlusEquals(bestC[k].beta, state.alpha + external_paired_alpha_plus_beamstepC_beta);
+-                        Fast_LogPlusEquals(state.beta, bestC[k].alpha + external_paired_alpha_plus_beamstepC_beta);
++                        int score_external_paired = -v_score_external_paired_precomputed(lpPairType[nuck1][nucj],
++                                                                 nuci_1_37, nucj1_37);
++                        float external_paired_alpha_plus_beamstepC_beta = beamstepC.beta + lpScoreOverKT(score_external_paired);
++                        lpLogPlusEquals(bestC[k].beta, state.alpha + external_paired_alpha_plus_beamstepC_beta);
++                        lpLogPlusEquals(state.beta, bestC[k].alpha + external_paired_alpha_plus_beamstepC_beta);
+@@ -206,3 +324,3 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                        int score_external_paired = - v_score_external_paired(0, j, -1, nucs[0],
+-                                                                 nucj, nucj1, seq_length);
+-                        Fast_LogPlusEquals(state.beta, (beamstepC.beta + score_external_paired/kT));
++                        int score_external_paired = -v_score_external_paired_precomputed(lpPairType[nucs[0]][nucj],
++                                                                 -1, nucj1_37);
++                        lpLogPlusEquals(state.beta, (beamstepC.beta + lpScoreOverKT(score_external_paired)));
+@@ -223,2 +341 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                int nuci1 = nucs[i+1];
+-                int jnext = next_pair[nuci][j];
++                int jnext = next_pair_rows[nuci][j];
+@@ -229 +346,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                        Fast_LogPlusEquals(state.beta, (bestMulti[jnext][i].beta));
++                        State *multiNextState = lpFindDenseMatrixRaw(multiLookupPtrs, multiLookupGenerations, jnext, i, seq_length, multiLookupGeneration);
++                        if (multiNextState != NULL) {
++                            lpLogPlusEquals(state.beta, multiNextState->beta);
++                        } else if (multiLookupGeneration == 0) {
++                            std::unordered_map<int, State>::iterator multiNextIt = bestMulti[jnext].find(i);
++                            if (multiNextIt != bestMulti[jnext].end()) {
++                                lpLogPlusEquals(state.beta, multiNextIt->second.beta);
++                            }
++                        }
+@@ -235,3 +360,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-                    int score_multi = - v_score_multi(i, j, nuci, nuci1, nucs[j-1], nucj, seq_length);
+-                    if (beamstepP.find(i) == beamstepP.end()) continue;
+-                    Fast_LogPlusEquals(state.beta, (beamstepP[i].beta + score_multi/kT));
++                    int score_multi = -v_score_multi_precomputed(lpPairType[nucj][nuci], nuc37s[i+1], nuc37s[j-1]);
++                    State *pState = lpFindDenseMatrixRaw(pfscoreLookupPtrs, pfscoreLookupGenerations, j, i, seq_length, pfscoreLookupGeneration);
++                    if (pState != NULL) {
++                        lpLogPlusEquals(state.beta, (pState->beta + lpScoreOverKT(score_multi)));
++                    } else if (pfscoreLookupGeneration == 0) {
++                        std::unordered_map<int, State>::iterator pIt = beamstepP.find(i);
++                        if (pIt == beamstepP.end()) continue;
++                        lpLogPlusEquals(state.beta, (pIt->second.beta + lpScoreOverKT(score_multi)));
++                    }
+@@ -243,3 +373,0 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+-    gettimeofday(&parse_endtime, NULL);
+-    double parse_elapsed_time = parse_endtime.tv_sec - parse_starttime.tv_sec + (parse_endtime.tv_usec-parse_starttime.tv_usec)/1000000.0;
+-
