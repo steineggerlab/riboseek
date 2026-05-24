@@ -3555,6 +3555,107 @@ static void removePathRecursively(const std::string &path) {
     std::system(cmd.c_str());
 }
 
+static bool lolcmsearchDbComplete(const std::string &db) {
+    if (!FileUtil::fileExists((db + ".index").c_str())
+        || !FileUtil::fileExists((db + ".dbtype").c_str())) {
+        return false;
+    }
+    const std::vector<std::string> dataFiles = FileUtil::findDatafiles(db.c_str());
+    return !dataFiles.empty();
+}
+
+static bool lolcmsearchFileFingerprint(const std::string &path, std::ostringstream &oss) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        oss << path << "{missing};";
+        return false;
+    }
+    oss << path << "{" << static_cast<unsigned long long>(st.st_size)
+        << "," << static_cast<long long>(st.st_mtime) << "};";
+    return true;
+}
+
+static void lolcmsearchDbFingerprint(const std::string &label,
+                                      const std::string &db,
+                                      std::ostringstream &oss) {
+    oss << label << "=" << db << "\n";
+    lolcmsearchFileFingerprint(db + ".index", oss);
+    lolcmsearchFileFingerprint(db + ".dbtype", oss);
+    const std::vector<std::string> dataFiles = FileUtil::findDatafiles(db.c_str());
+    for (size_t i = 0; i < dataFiles.size(); ++i) {
+        lolcmsearchFileFingerprint(dataFiles[i], oss);
+    }
+    if (FileUtil::fileExists((db + ".lookup").c_str())) {
+        lolcmsearchFileFingerprint(db + ".lookup", oss);
+    }
+    oss << "\n";
+}
+
+static std::string lolcmsearchStageMarker(const std::string &path) {
+    return path + ".lolcmsearch.done";
+}
+
+static bool lolcmsearchReadTextFile(const std::string &path, std::string &out) {
+    std::ifstream in(path.c_str(), std::ios::in | std::ios::binary);
+    if (!in.good()) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+static bool lolcmsearchWriteTextFile(const std::string &path, const std::string &text) {
+    std::ofstream out(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!out.good()) {
+        return false;
+    }
+    out << text;
+    return out.good();
+}
+
+static bool lolcmsearchStageReady(const std::string &markerPath,
+                                   const std::vector<std::string> &dbs,
+                                   const std::string &signature,
+                                   std::string &reason) {
+    for (size_t i = 0; i < dbs.size(); ++i) {
+        if (!lolcmsearchDbComplete(dbs[i])) {
+            reason = "missing or incomplete DB " + dbs[i];
+            return false;
+        }
+    }
+    std::string oldSignature;
+    if (!lolcmsearchReadTextFile(markerPath, oldSignature)) {
+        reason = "missing completion marker " + markerPath;
+        return false;
+    }
+    if (oldSignature != signature) {
+        reason = "completion marker does not match current inputs/options";
+        return false;
+    }
+    return true;
+}
+
+static void lolcmsearchRemoveDbAndMarker(const std::string &db) {
+    DBReader<unsigned int>::removeDb(db);
+    const std::string marker = lolcmsearchStageMarker(db);
+    if (FileUtil::fileExists(marker.c_str())) {
+        FileUtil::remove(marker.c_str());
+    }
+}
+
+static void lolcmsearchRemoveMergedInputs(const std::string &targetDb,
+                                          const std::string &resultDb) {
+    lolcmsearchRemoveDbAndMarker(targetDb);
+    lolcmsearchRemoveDbAndMarker(targetDb + "_h");
+    lolcmsearchRemoveDbAndMarker(resultDb);
+    const std::string marker = lolcmsearchStageMarker(targetDb + ".merge");
+    if (FileUtil::fileExists(marker.c_str())) {
+        FileUtil::remove(marker.c_str());
+    }
+}
+
 // Decode a single sequence from an open DBReader by internal index.
 static FastaSeq decodeOneSequence(DBReader<unsigned int> &dbr,
                                   size_t id,
@@ -9036,6 +9137,8 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
     const bool keepTmp = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_KEEP_TMP", 0) != 0);
     const bool skipBuild = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_SKIP_BUILD", 0) != 0);
     const bool skipRough = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_SKIP_ROUGH", 0) != 0);
+    const bool resumeIntermediate = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_RESUME", 1) != 0);
+    const bool forceIntermediate = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_FORCE", 0) != 0);
     const bool useSeedAsRough = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_USE_SEED_AS_ROUGH", 0) != 0);
     const bool filterResult = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_FILTERRESULT", 1) != 0);
     const float filterMaxSeqId = parseEnvFloatLocal("MMSEQS_LOLCMSEARCH_FILTER_MAX_SEQ_ID", 0.96f);
@@ -9048,6 +9151,7 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
     const bool userTmpDir = !par.lolcmsearchTmpDir.empty();
     const std::string tempDir = userTmpDir ? par.lolcmsearchTmpDir
                                            : createTempDir("riboseek_lolcmsearch");
+    const bool resumeUnmarked = (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_RESUME_UNMARKED", userTmpDir ? 1 : 0) != 0);
     if ((!userTmpDir && tempDir.empty())
         || (userTmpDir && !ensureDirectoryRecursive(tempDir))) {
         Debug(Debug::ERROR) << "lolcmsearch: failed to prepare tmp dir"
@@ -9085,6 +9189,7 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
                        << ", rough linearfold beam: " << roughBeam
                        << ", rough source: " << (useSeedAsRough ? "seed resultDB" : "lolalign")
                        << ", filterresult: " << (filterResult ? "enabled" : "disabled")
+                       << ", resume tmp intermediates: " << ((resumeIntermediate && !forceIntermediate) ? "enabled" : "disabled")
                        << ", tmp dir: " << tempDir
                        << "\n";
     if (filterResult) {
@@ -9096,6 +9201,55 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
                            << "\n";
     }
 
+    const auto buildStageSignature = [&](const std::string &stage,
+                                         const std::vector<std::string> &targetDbsForSig,
+                                         const std::vector<std::string> &resultDbsForSig,
+                                         const std::string &extra) -> std::string {
+        std::ostringstream sig;
+        sig << "lolcmsearch-stage-v1\n";
+        sig << "stage=" << stage << "\n";
+        sig << "extra=" << extra << "\n";
+        lolcmsearchDbFingerprint("query", par.db1, sig);
+        for (size_t i = 0; i < targetDbsForSig.size(); ++i) {
+            lolcmsearchDbFingerprint("target" + SSTR(i), targetDbsForSig[i], sig);
+        }
+        for (size_t i = 0; i < resultDbsForSig.size(); ++i) {
+            lolcmsearchDbFingerprint("result" + SSTR(i), resultDbsForSig[i], sig);
+        }
+        return sig.str();
+    };
+
+    const auto stageIsReady = [&](const std::string &label,
+                                  const std::string &markerPath,
+                                  const std::vector<std::string> &dbs,
+                                  const std::string &signature) -> bool {
+        if (!resumeIntermediate || forceIntermediate) {
+            return false;
+        }
+        std::string reason;
+        if (lolcmsearchStageReady(markerPath, dbs, signature, reason)) {
+            Debug(Debug::INFO) << "lolcmsearch: reusing " << label << " from tmp dir\n";
+            return true;
+        }
+        if (resumeUnmarked && reason.find("missing completion marker") == 0) {
+            bool complete = true;
+            for (size_t i = 0; i < dbs.size(); ++i) {
+                if (!lolcmsearchDbComplete(dbs[i])) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (complete) {
+                lolcmsearchWriteTextFile(markerPath, signature);
+                Debug(Debug::INFO) << "lolcmsearch: reusing unmarked " << label
+                                   << " from tmp dir and writing completion marker\n";
+                return true;
+            }
+        }
+        Debug(Debug::INFO) << "lolcmsearch: not reusing " << label << ": " << reason << "\n";
+        return false;
+    };
+
     if (multiInput) {
         if (targetDbList.size() != resultDbList.size()) {
             cleanup();
@@ -9105,109 +9259,150 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
         }
         inputTargetDb = tempDir + "/input_target_merged";
         inputResultDb = tempDir + "/input_result_merged";
-        std::string mergeErr;
-        if (!mergeLolcmsearchInputs(par.db1,
-                                    targetDbList,
-                                    resultDbList,
-                                    inputTargetDb,
-                                    inputResultDb,
-                                    std::max(1, par.threads),
-                                    mergeErr)) {
-            cleanup();
-            Debug(Debug::ERROR) << "lolcmsearch: failed to merge multi-DB input: " << mergeErr << "\n";
-            return EXIT_FAILURE;
+        const std::string mergeSignature = buildStageSignature("merge", targetDbList, resultDbList, "threads=" + SSTR(std::max(1, par.threads)));
+        const std::string mergeMarker = lolcmsearchStageMarker(inputTargetDb + ".merge");
+        if (!stageIsReady("merged input DBs", mergeMarker, std::vector<std::string>{inputTargetDb, inputResultDb}, mergeSignature)) {
+            lolcmsearchRemoveMergedInputs(inputTargetDb, inputResultDb);
+            std::string mergeErr;
+            if (!mergeLolcmsearchInputs(par.db1,
+                                        targetDbList,
+                                        resultDbList,
+                                        inputTargetDb,
+                                        inputResultDb,
+                                        std::max(1, par.threads),
+                                        mergeErr)) {
+                cleanup();
+                Debug(Debug::ERROR) << "lolcmsearch: failed to merge multi-DB input: " << mergeErr << "\n";
+                return EXIT_FAILURE;
+            }
+            lolcmsearchWriteTextFile(mergeMarker, mergeSignature);
+            Debug(Debug::INFO) << "  merged " << targetDbList.size()
+                               << " target/result DB pairs into " << inputTargetDb
+                               << " and " << inputResultDb << "\n";
         }
-        Debug(Debug::INFO) << "  merged " << targetDbList.size()
-                           << " target/result DB pairs into " << inputTargetDb
-                           << " and " << inputResultDb << "\n";
     }
 
     if (!skipBuild) {
-        std::vector<std::string> args;
-        args.push_back(execPath);
-        args.push_back("cmbuild");
-        args.push_back(par.db1);
-        args.push_back(inputTargetDb);
-        args.push_back(inputResultDb);
-        args.push_back(cmDb);
-        args.push_back("--cmlite-msa-eval");
-        args.push_back(SSTR(msaEvalThr));
-        args.push_back("--threads");
-        args.push_back(SSTR(std::max(1, par.threads)));
-        args.push_back("-v");
-        args.push_back("0");
-        std::string err;
-        if (!runExternalCommand(args, std::vector<std::pair<std::string, std::string>>(), err)) {
-            cleanup();
-            Debug(Debug::ERROR) << "lolcmsearch: cmbuild failed: " << err << "\n";
-            return EXIT_FAILURE;
+        const std::string buildExtra = "msaEval=" + SSTR(msaEvalThr);
+        const std::string buildSignature = buildStageSignature("cmbuild",
+                                                               std::vector<std::string>{inputTargetDb},
+                                                               std::vector<std::string>{inputResultDb},
+                                                               buildExtra);
+        if (!stageIsReady("cmbuild CM DB", lolcmsearchStageMarker(cmDb), std::vector<std::string>{cmDb}, buildSignature)) {
+            lolcmsearchRemoveDbAndMarker(cmDb);
+            std::vector<std::string> args;
+            args.push_back(execPath);
+            args.push_back("cmbuild");
+            args.push_back(par.db1);
+            args.push_back(inputTargetDb);
+            args.push_back(inputResultDb);
+            args.push_back(cmDb);
+            args.push_back("--cmlite-msa-eval");
+            args.push_back(SSTR(msaEvalThr));
+            args.push_back("--threads");
+            args.push_back(SSTR(std::max(1, par.threads)));
+            args.push_back("-v");
+            args.push_back("0");
+            std::string err;
+            if (!runExternalCommand(args, std::vector<std::pair<std::string, std::string>>(), err)) {
+                cleanup();
+                Debug(Debug::ERROR) << "lolcmsearch: cmbuild failed: " << err << "\n";
+                return EXIT_FAILURE;
+            }
+            lolcmsearchWriteTextFile(lolcmsearchStageMarker(cmDb), buildSignature);
         }
     }
 
     std::string downstreamResultDb = inputResultDb;
     if (filterResult) {
-        std::vector<std::string> args;
-        args.push_back(execPath);
-        args.push_back("filterresult");
-        args.push_back(par.db1);
-        args.push_back(inputTargetDb);
-        args.push_back(inputResultDb);
-        args.push_back(filteredResultDb);
-        args.push_back("--max-seq-id");
-        args.push_back(SSTR(filterMaxSeqId));
-        args.push_back("--qid");
-        args.push_back(SSTR(filterQid));
-        args.push_back("--cov");
-        args.push_back(SSTR(filterCov));
-        args.push_back("--qsc");
-        args.push_back(SSTR(filterQsc));
-        args.push_back("--diff");
-        args.push_back(SSTR(filterDiff));
-        args.push_back("--threads");
-        args.push_back(SSTR(std::max(1, par.threads)));
-        args.push_back("-v");
-        args.push_back("0");
-        std::string err;
-        if (!runExternalCommand(args, std::vector<std::pair<std::string, std::string>>(), err)) {
-            cleanup();
-            Debug(Debug::ERROR) << "lolcmsearch: filterresult failed: " << err << "\n";
-            return EXIT_FAILURE;
+        const std::string filterExtra = "maxSeqId=" + SSTR(filterMaxSeqId)
+            + ";qid=" + SSTR(filterQid)
+            + ";cov=" + SSTR(filterCov)
+            + ";qsc=" + SSTR(filterQsc)
+            + ";diff=" + SSTR(filterDiff);
+        const std::string filterSignature = buildStageSignature("filterresult",
+                                                                std::vector<std::string>{inputTargetDb},
+                                                                std::vector<std::string>{inputResultDb},
+                                                                filterExtra);
+        if (!stageIsReady("filterresult DB", lolcmsearchStageMarker(filteredResultDb), std::vector<std::string>{filteredResultDb}, filterSignature)) {
+            lolcmsearchRemoveDbAndMarker(filteredResultDb);
+            std::vector<std::string> args;
+            args.push_back(execPath);
+            args.push_back("filterresult");
+            args.push_back(par.db1);
+            args.push_back(inputTargetDb);
+            args.push_back(inputResultDb);
+            args.push_back(filteredResultDb);
+            args.push_back("--max-seq-id");
+            args.push_back(SSTR(filterMaxSeqId));
+            args.push_back("--qid");
+            args.push_back(SSTR(filterQid));
+            args.push_back("--cov");
+            args.push_back(SSTR(filterCov));
+            args.push_back("--qsc");
+            args.push_back(SSTR(filterQsc));
+            args.push_back("--diff");
+            args.push_back(SSTR(filterDiff));
+            args.push_back("--threads");
+            args.push_back(SSTR(std::max(1, par.threads)));
+            args.push_back("-v");
+            args.push_back("0");
+            std::string err;
+            if (!runExternalCommand(args, std::vector<std::pair<std::string, std::string>>(), err)) {
+                cleanup();
+                Debug(Debug::ERROR) << "lolcmsearch: filterresult failed: " << err << "\n";
+                return EXIT_FAILURE;
+            }
+            lolcmsearchWriteTextFile(lolcmsearchStageMarker(filteredResultDb), filterSignature);
         }
         downstreamResultDb = filteredResultDb;
     }
 
     if (!useSeedAsRough && !skipRough) {
-        std::vector<std::string> args;
-        args.push_back(execPath);
-        args.push_back("lolalign");
-        args.push_back(par.db1);
-        args.push_back(inputTargetDb);
-        args.push_back(downstreamResultDb);
-        args.push_back(roughDb);
-        args.push_back("-a");
-        args.push_back("1");
-        args.push_back("--cm-region");
-        args.push_back(SSTR(flankFrac));
-        args.push_back("-e");
-        args.push_back("inf");
-        args.push_back("--lolalign-msa-eval");
-        args.push_back(SSTR(msaEvalThr));
-        args.push_back("--threads");
-        args.push_back(SSTR(std::max(1, par.threads)));
-        args.push_back("-v");
-        args.push_back("0");
-        std::vector<std::pair<std::string, std::string>> env;
-        env.push_back(std::make_pair("MMSEQS_LOLALIGN_ACCEPT_ALL", "1"));
-        env.push_back(std::make_pair("MMSEQS_LOLALIGN_DEDUP_ROWS", "0"));
-        env.push_back(std::make_pair("MMSEQS_LOLALIGN_LINEARFOLD_BEAM", SSTR(roughBeam)));
-        if (parseEnvIntLocal("MMSEQS_LOLCMSEARCH_DOTBRACKET_ONLY", 0) != 0) {
-            env.push_back(std::make_pair("MMSEQS_LOLALIGN_DOTBRACKET_ONLY", "1"));
-        }
-        std::string err;
-        if (!runExternalCommand(args, env, err)) {
-            cleanup();
-            Debug(Debug::ERROR) << "lolcmsearch: lolalign failed: " << err << "\n";
-            return EXIT_FAILURE;
+        const bool dotBracketOnly = parseEnvIntLocal("MMSEQS_LOLCMSEARCH_DOTBRACKET_ONLY", 0) != 0;
+        const std::string roughExtra = "flank=" + SSTR(flankFrac)
+            + ";msaEval=" + SSTR(msaEvalThr)
+            + ";beam=" + SSTR(roughBeam)
+            + ";dotBracketOnly=" + SSTR(dotBracketOnly ? 1 : 0);
+        const std::string roughSignature = buildStageSignature("lolalign",
+                                                               std::vector<std::string>{inputTargetDb},
+                                                               std::vector<std::string>{downstreamResultDb},
+                                                               roughExtra);
+        if (!stageIsReady("lolalign rough DB", lolcmsearchStageMarker(roughDb), std::vector<std::string>{roughDb}, roughSignature)) {
+            lolcmsearchRemoveDbAndMarker(roughDb);
+            std::vector<std::string> args;
+            args.push_back(execPath);
+            args.push_back("lolalign");
+            args.push_back(par.db1);
+            args.push_back(inputTargetDb);
+            args.push_back(downstreamResultDb);
+            args.push_back(roughDb);
+            args.push_back("-a");
+            args.push_back("1");
+            args.push_back("--cm-region");
+            args.push_back(SSTR(flankFrac));
+            args.push_back("-e");
+            args.push_back("inf");
+            args.push_back("--lolalign-msa-eval");
+            args.push_back(SSTR(msaEvalThr));
+            args.push_back("--threads");
+            args.push_back(SSTR(std::max(1, par.threads)));
+            args.push_back("-v");
+            args.push_back("0");
+            std::vector<std::pair<std::string, std::string>> env;
+            env.push_back(std::make_pair("MMSEQS_LOLALIGN_ACCEPT_ALL", "1"));
+            env.push_back(std::make_pair("MMSEQS_LOLALIGN_DEDUP_ROWS", "0"));
+            env.push_back(std::make_pair("MMSEQS_LOLALIGN_LINEARFOLD_BEAM", SSTR(roughBeam)));
+            if (dotBracketOnly) {
+                env.push_back(std::make_pair("MMSEQS_LOLALIGN_DOTBRACKET_ONLY", "1"));
+            }
+            std::string err;
+            if (!runExternalCommand(args, env, err)) {
+                cleanup();
+                Debug(Debug::ERROR) << "lolcmsearch: lolalign failed: " << err << "\n";
+                return EXIT_FAILURE;
+            }
+            lolcmsearchWriteTextFile(lolcmsearchStageMarker(roughDb), roughSignature);
         }
     }
 
