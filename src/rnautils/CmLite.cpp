@@ -288,6 +288,26 @@ static int parseEnvInt(const char *name, int defaultValue) {
     return (env != NULL) ? std::atoi(env) : defaultValue;
 }
 
+static unsigned long long parseEnvUnsignedLongLong(const char *name, unsigned long long defaultValue) {
+    const char *env = std::getenv(name);
+    if (env == NULL || *env == '\0') {
+        return defaultValue;
+    }
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno != 0 || end == env) {
+        return defaultValue;
+    }
+    return parsed;
+}
+
+static unsigned long long densePairMatrixBytesForLength(size_t len) {
+    return static_cast<unsigned long long>(len)
+         * static_cast<unsigned long long>(len)
+         * static_cast<unsigned long long>(sizeof(float));
+}
+
 static std::vector<int> dotBracketToPartners(const std::string &dot) {
     std::vector<int> partners(dot.size(), -1);
     std::vector<int> stack;
@@ -664,6 +684,91 @@ static FoldResult foldSequenceStructure(const std::string &seq,
         }
     }
     return out;
+}
+
+static unsigned long long lolalignAvailableMemoryBytes() {
+    std::ifstream in("/proc/meminfo");
+    if (in) {
+        std::string key;
+        unsigned long long value = 0;
+        std::string unit;
+        while (in >> key >> value >> unit) {
+            if (key == "MemAvailable:") {
+                return value * 1024ULL;
+            }
+        }
+    }
+#ifdef _SC_AVPHYS_PAGES
+    const long pages = sysconf(_SC_AVPHYS_PAGES);
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && pageSize > 0) {
+        return static_cast<unsigned long long>(pages) * static_cast<unsigned long long>(pageSize);
+    }
+#endif
+    return 0ULL;
+}
+
+static unsigned long long saturatingAddBytes(unsigned long long a, unsigned long long b) {
+    if (ULLONG_MAX - a < b) {
+        return ULLONG_MAX;
+    }
+    return a + b;
+}
+
+static unsigned long long saturatingMulBytes(unsigned long long a, unsigned long long b) {
+    if (a != 0ULL && b > ULLONG_MAX / a) {
+        return ULLONG_MAX;
+    }
+    return a * b;
+}
+
+static unsigned long long scaleBytes(unsigned long long bytes, float scale) {
+    if (bytes == 0ULL || scale <= 0.0f) {
+        return 0ULL;
+    }
+    const long double scaled = static_cast<long double>(bytes) * static_cast<long double>(scale);
+    if (scaled >= static_cast<long double>(ULLONG_MAX)) {
+        return ULLONG_MAX;
+    }
+    return static_cast<unsigned long long>(scaled);
+}
+
+static bool lolalignDensePairLikely(const StructureSettings &settings, size_t len) {
+    if (len == 0) {
+        return false;
+    }
+    const std::string &backend = settings.backend;
+    if (backend == "canonical" || backend == "rnafold") {
+        return false;
+    }
+    if (backend == "auto") {
+        return static_cast<int>(len) >= settings.linearfoldMinLength;
+    }
+    return true;
+}
+
+static unsigned long long lolalignLinearFoldBytesForLength(size_t len) {
+    const unsigned long long linearBytes = static_cast<unsigned long long>(len)
+        * static_cast<unsigned long long>(sizeof(StructVec) + sizeof(int) + 64U);
+    return linearBytes;
+}
+
+static unsigned long long lolalignRetainedFoldBytes(size_t len, const StructureSettings &settings) {
+    unsigned long long bytes = lolalignLinearFoldBytesForLength(len);
+    if (lolalignDensePairLikely(settings, len)) {
+        bytes = saturatingAddBytes(bytes, densePairMatrixBytesForLength(len));
+    }
+    return bytes;
+}
+
+static unsigned long long lolalignScratchFoldBytes(size_t len,
+                                                   const StructureSettings &settings,
+                                                   float scratchMultiplier) {
+    unsigned long long bytes = lolalignLinearFoldBytesForLength(len);
+    if (lolalignDensePairLikely(settings, len)) {
+        bytes = saturatingAddBytes(bytes, scaleBytes(densePairMatrixBytesForLength(len), scratchMultiplier));
+    }
+    return bytes;
 }
 
 static std::vector<StemPattern> buildStemPatterns(const std::string &querySeq,
@@ -5363,6 +5468,62 @@ static int runLolalignImpl(int argc,
                       return RnaMatcher::compareHits(a.raw, b.raw);
                   });
 
+        size_t maxWindowLen = 0;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            maxWindowLen = std::max(maxWindowLen, candidates[i].window.seq.size());
+        }
+
+        const unsigned long long MiB = 1024ULL * 1024ULL;
+        const bool memoryGuardEnabled = parseEnvInt("MMSEQS_LOLALIGN_MEMORY_GUARD", 1) != 0;
+        const unsigned long long explicitBudgetMb = parseEnvUnsignedLongLong("MMSEQS_LOLALIGN_MEMORY_BUDGET_MB", 0ULL);
+        const float memoryBudgetFrac = clampf(parseEnvFloat("MMSEQS_LOLALIGN_MEMORY_FRACTION", 0.8f), 0.05f, 1.0f);
+        const unsigned long long detectedAvailableBytes = lolalignAvailableMemoryBytes();
+        const unsigned long long memoryBudgetBytes = explicitBudgetMb > 0ULL
+            ? explicitBudgetMb * MiB
+            : scaleBytes(detectedAvailableBytes, memoryBudgetFrac);
+        int effectiveBatchSize = candidateBatchSize;
+        if (memoryGuardEnabled && memoryBudgetBytes > 0ULL) {
+            const unsigned long long baseOverheadBytes = parseEnvUnsignedLongLong("MMSEQS_LOLALIGN_MEMORY_BASE_MB", 512ULL) * MiB;
+            const float scratchMultiplier = std::max(1.0f, parseEnvFloat("MMSEQS_LOLALIGN_MEMORY_SCRATCH_MULTIPLIER", 6.0f));
+            const int workerThreads = std::max(1, par.threads);
+            unsigned long long fixedBytes = saturatingAddBytes(baseOverheadBytes,
+                lolalignRetainedFoldBytes(querySeq.size(), structureSettings));
+            fixedBytes = saturatingAddBytes(fixedBytes, densePairMatrixBytesForLength(querySeq.size()));
+            const unsigned long long perWindowRetainedBytes = lolalignRetainedFoldBytes(maxWindowLen, structureSettings);
+            const unsigned long long perConcurrentFoldBytes = lolalignScratchFoldBytes(maxWindowLen, structureSettings, scratchMultiplier);
+
+            const auto estimateBatchPeak = [&](int batchSize) -> unsigned long long {
+                const unsigned long long batchBytes = saturatingMulBytes(perWindowRetainedBytes,
+                    static_cast<unsigned long long>(std::max(1, batchSize)));
+                const unsigned long long concurrentBytes = saturatingMulBytes(perConcurrentFoldBytes,
+                    static_cast<unsigned long long>(std::min(workerThreads, std::max(1, batchSize))));
+                return saturatingAddBytes(fixedBytes, saturatingAddBytes(batchBytes, concurrentBytes));
+            };
+
+            int lo = 1;
+            int hi = effectiveBatchSize;
+            int best = 1;
+            while (lo <= hi) {
+                const int mid = lo + (hi - lo) / 2;
+                if (estimateBatchPeak(mid) <= memoryBudgetBytes) {
+                    best = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            effectiveBatchSize = std::max(1, std::min(effectiveBatchSize, best));
+            if (effectiveBatchSize < candidateBatchSize || parseEnvInt("MMSEQS_LOLALIGN_MEMORY_VERBOSE", 0) != 0) {
+                Debug(Debug::INFO) << "  lolalign memory estimate: query=" << qLen
+                                   << ", max target window=" << maxWindowLen
+                                   << ", threads=" << workerThreads
+                                   << ", budget MB=" << (memoryBudgetBytes / MiB)
+                                   << ", estimated peak MB=" << (estimateBatchPeak(effectiveBatchSize) / MiB)
+                                   << ", batch=" << effectiveBatchSize
+                                   << "\n";
+            }
+        }
+
         std::vector<ModelHit> modelHits;
         modelHits.reserve(uncappedModelHits ? candidates.size() : static_cast<size_t>(maxModelHits));
         for (size_t i = 0; i < candidates.size(); ++i) {
@@ -5436,8 +5597,8 @@ static int runLolalignImpl(int argc,
             seenRows.reserve(candidates.size() * 2);
         }
         char buffer[4096];
-        for (size_t batchStart = 0; batchStart < candidates.size(); batchStart += static_cast<size_t>(candidateBatchSize)) {
-            const size_t batchEnd = std::min(candidates.size(), batchStart + static_cast<size_t>(candidateBatchSize));
+        for (size_t batchStart = 0; batchStart < candidates.size(); batchStart += static_cast<size_t>(effectiveBatchSize)) {
+            const size_t batchEnd = std::min(candidates.size(), batchStart + static_cast<size_t>(effectiveBatchSize));
             const size_t batchLen = batchEnd - batchStart;
 
 #pragma omp parallel for schedule(dynamic, 32) if(parallelCandidates)

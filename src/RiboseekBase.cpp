@@ -71,6 +71,9 @@ std::vector<Command> riboseekCommands = {
             "  MMSEQS_LOLCMSEARCH_KEEP_TMP=1\n"
             "  MMSEQS_LOLCMSEARCH_SKIP_BUILD=1\n"
             "  MMSEQS_LOLCMSEARCH_SKIP_ROUGH=1\n"
+            "  MMSEQS_LOLALIGN_MEMORY_GUARD=0|1\n"
+            "  MMSEQS_LOLALIGN_MEMORY_BUDGET_MB=N\n"
+            "  MMSEQS_LOLALIGN_MEMORY_FRACTION=F (default: 0.8 * MemAvailable)\n"
             "Argument:\n"
             "  --lolcmsearch-tmpdir DIR\n",
             "OpenAI Codex",
