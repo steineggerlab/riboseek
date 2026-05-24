@@ -2,14 +2,22 @@ diff --git a/src/LinearPartition/src/LinearPartition.cpp b/src/LinearPartition/s
 index 4002764..592e691 100644
 --- a/src/LinearPartition/src/LinearPartition.cpp
 +++ b/src/LinearPartition/src/LinearPartition.cpp
-@@ -3,2 +3,2 @@
-- The main code for LinearPartition: Linear-Time Approximation of
--                                    RNA Folding Partition Function
+@@ -1,7 +1,7 @@
+ /*
+  *LinearPartition.cpp*
+- The main code for LinearPartition: Linear-Time Approximation of 
+-                                    RNA Folding Partition Function 
 + The main code for LinearPartition: Linear-Time Approximation of
 +                                    RNA Folding Partition Function
-@@ -21,2 +21,12 @@
--#include <stdio.h>
--#include <set>
+                                     and Base Pairing Probabilities
+ 
+  author: He Zhang
+@@ -18,13 +18,93 @@
+ #include <algorithm>
+ #include <string>
+ #include <map>
+-#include <stdio.h> 
+-#include <set> 
 +#include <stdio.h>
 +#include <set>
 +#include <atomic>
@@ -22,7 +30,10 @@ index 4002764..592e691 100644
 +#if defined(__GNUC__) || defined(__clang__)
 +#pragma GCC optimize ("unroll-loops")
 +#endif
-@@ -27 +37,71 @@
+ 
+ #include "LinearPartition.h"
+ #include "Utils/utility.h"
+ #include "Utils/utility_v.h"
 -#include "bpp.h"
 +#if defined(__GNUC__) || defined(__clang__)
 +#define LP_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -95,7 +106,13 @@ index 4002764..592e691 100644
 +static inline unsigned lpBuildDenseMultiLookup(std::unordered_map<int, State> *maps, unsigned seqLength);
 +static inline State *lpFindDenseMulti(int q, int key, unsigned seqLength, unsigned generation);
 +
-@@ -39,0 +120,410 @@ using namespace std;
+ #include "../../SeqFold.h"
+ #include "../../utils/pfunction_math.h"
+ #include "../../utils/math/xlog_math.h"
+@@ -37,6 +117,416 @@
+ 
+ using namespace std;
+ 
 +struct LinearPartitionParseDetailTotals {
 +    std::atomic<unsigned long long> calls;
 +    std::atomic<unsigned long long> bases;
@@ -506,7 +523,13 @@ index 4002764..592e691 100644
 +
 +#include "bpp.h"
 +
-@@ -53,6 +543,12 @@ float quickselect(vector<pair<float, int>>& scores, unsigned long lower, unsigne
+ unsigned long quickselect_partition(vector<pair<float, int>>& scores, unsigned long lower, unsigned long upper) {
+     float pivot = scores[upper].first;
+     while (lower < upper) {
+@@ -50,35 +540,48 @@ unsigned long quickselect_partition(vector<pair<float, int>>& scores, unsigned l
+ 
+ // in-place quick-select
+ float quickselect(vector<pair<float, int>>& scores, unsigned long lower, unsigned long upper, unsigned long k) {
 -    if ( lower == upper ) return scores[lower].first;
 -    unsigned long split = quickselect_partition(scores, lower, upper);
 -    unsigned long length = split - lower + 1;
@@ -525,61 +548,115 @@ index 4002764..592e691 100644
 +        }
 +    }
 +    return scores[lower].first;
-@@ -63 +559,4 @@ float BeamCKYParser::beam_prune(std::unordered_map<int, State> &beamstep) {
+ }
+ 
+ 
+ float BeamCKYParser::beam_prune(std::unordered_map<int, State> &beamstep) {
 -    scores.clear();
 +    const bool detailTiming = lpParseDetailEnabled();
 +    const auto pruneStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 +    scores.resize(beamstep.size());
 +    std::size_t scoreIndex = 0;
-@@ -69 +568 @@ float BeamCKYParser::beam_prune(std::unordered_map<int, State> &beamstep) {
+     for (auto &item : beamstep) {
+         int i = item.first;
+         State &cand = item.second;
+         int k = i - 1;
+         float newalpha = (k >= 0 ? bestC[k].alpha : 0.0) + cand.alpha;
 -        scores.push_back(make_pair(newalpha, i));
 +        scores[scoreIndex++] = std::make_pair(newalpha, i);
-@@ -71 +569,0 @@ float BeamCKYParser::beam_prune(std::unordered_map<int, State> &beamstep) {
+     }
 -    if (scores.size() <= beam) return VALUE_MIN;
-@@ -76,0 +575,3 @@ float BeamCKYParser::beam_prune(std::unordered_map<int, State> &beamstep) {
+     float threshold = quickselect(scores, 0, scores.size() - 1, scores.size() - beam);
+     for (auto &p : scores) {
+         if (p.first < threshold) beamstep.erase(p.second);
+     }
+ 
 +    if (detailTiming) {
 +        lpParseDetailTotals().pruneNs.fetch_add(lpElapsedNs(pruneStart, std::chrono::steady_clock::now()));
 +    }
-@@ -81 +582,3 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
--    if (beam < 0 || beamstep.size() <= beam) {
+     return threshold;
+ }
+ 
+ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordered_map<int, State> &beamstep, int j, unordered_map<int, ExtValue>* &ext_info) {
+-    if (beam < 0 || beamstep.size() <= beam) { 
 +    const bool detailTiming = lpParseDetailEnabled();
 +    const auto pruneStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 +    if (beam < 0 || beamstep.size() <= beam) {
-@@ -93 +596 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
--            }
+         auto it = beamstep.begin();
+         while (it != beamstep.end())
+         {
+@@ -90,7 +593,7 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
+                 ext_info[j+1][i+1].score = 0.3 * ex_info;
+                 beamstep[i].alpha = PROD(beamstep[i].alpha, ext_info[j+1][i+1].score);
+                 it ++;
+-            } 
 +            }
-@@ -111 +614 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
+         }
+     } else {
+         scores.clear();
+@@ -108,17 +611,20 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
+                 cand.alpha = PROD(cand.alpha, ext_info[j+1][i+1].score);
+             }
+             float newalpha = PROD((k >= 0 ? bestC[k].alpha : 0.0), (ex_info>LOG_OF_ZERO) ? cand.alpha : LOG_OF_ZERO);
 -            scores.push_back(make_pair(newalpha, i));
 +            scores.emplace_back(newalpha, i);
-@@ -113 +616 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
--
+         }
+-        
 +
-@@ -119 +622 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
--        }
+         float threshold = quickselect(scores, 0, scores.size() - 1, scores.size() - beam);
+         for (auto &p : scores) {
+             if ((p.first < threshold) || (p.first <= -700000.0f)) { // lisiz: log_of_zero (-709783)
+                 beamstep.erase(p.second);
+             }
+-        } 
 +        }
-@@ -121,0 +625,3 @@ float BeamCKYParser::beam_prune(int i_seq, LinearTurboFold* outer, std::unordere
+     }
+ 
 +    if (detailTiming) {
 +        lpParseDetailTotals().pruneNs.fetch_add(lpElapsedNs(pruneStart, std::chrono::steady_clock::now()));
 +    }
-@@ -129,0 +636 @@ void BeamCKYParser::prepare(unsigned len) {
+     return VALUE_MIN;
+ }
+ 
+@@ -127,6 +633,7 @@ void BeamCKYParser::prepare(unsigned len) {
+ 
+     if (allocate) {
+         delete[] nucs;
 +        delete[] nuc37s;
-@@ -139,0 +647 @@ void BeamCKYParser::prepare(unsigned len) {
+         delete[] bestC;
+         delete[] bestH;
+         // delete[] bestP;
+@@ -137,34 +644,65 @@ void BeamCKYParser::prepare(unsigned len) {
+     allocate = true;
+ 
+     nucs = new int[seq_length];
 +    nuc37s = new int[seq_length];
-@@ -146 +654 @@ void BeamCKYParser::prepare(unsigned len) {
--
+     bestC = new State[seq_length];
+     bestH = new unordered_map<int, State>[seq_length];
+     // bestP = new unordered_map<int, State>[seq_length];
+     bestM = new unordered_map<int, State>[seq_length];
+     bestM2 = new unordered_map<int, State>[seq_length];
+     bestMulti = new unordered_map<int, State>[seq_length];
+-    
 +
-@@ -151,0 +660,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+     scores.reserve(seq_length);
+ }
+ 
+ 
+ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, string& seq, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info, string pfSaveFile, string bppSaveFile) {
 +    const bool detailTiming = lpParseDetailEnabled();
 +    if (detailTiming) {
 +        lpParseDetailReporter();
 +    }
 +    const auto prepareStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-@@ -153 +666,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+     // convert T to U
 -    replace(seq.begin(), seq.end(), 'T', 'U');
 +    if (seq.find('T') != string::npos) {
 +        replace(seq.begin(), seq.end(), 'T', 'U');
 +    }
-@@ -157,2 +672,22 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+ 
+     prepare(static_cast<unsigned>(seq.length()));
+ 
 -    for (int i = 0; i < seq_length; ++i)
 -        nucs[i] = GET_ACGU_NUM(seq[i]);
 +    for (int i = 0; i < seq_length; ++i) {
@@ -604,28 +681,35 @@ index 4002764..592e691 100644
 +            }
 +        }
 +    }
-@@ -160 +695,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+ 
 -    vector<int> next_pair[NOTON];
 +    static thread_local std::vector<int> nextPairStorage;
 +    nextPairStorage.resize(static_cast<std::size_t>(NOTON) * static_cast<std::size_t>(seq_length));
 +    int *next_pair_rows[NOTON];
-@@ -161,0 +699 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+     {
 +        int *nextPairBase = nextPairStorage.data();
-@@ -163,2 +701,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+         for (int nuci = 0; nuci < NOTON; ++nuci) {
 -            // next_pair
 -            next_pair[nuci].resize(seq_length, -1);
 +            int *row = nextPairBase + static_cast<std::size_t>(nuci) * static_cast<std::size_t>(seq_length);
 +            next_pair_rows[nuci] = row;
-@@ -167 +705 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+             int next = -1;
+             for (int j = seq_length-1; j >=0; --j) {
 -                next_pair[nuci][j] = next;
 +                row[j] = next;
-@@ -179,0 +718,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 if (_allowed_pairs[nuci][nucs[j]]) next = j;
+             }
+         }
+@@ -177,10 +715,22 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+     if(seq_length > 0) bestC[0].alpha = 0.0;
+     if(seq_length > 1) bestC[1].alpha = 0.0;
+ 
 +    const auto insideStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 +    if (detailTiming) {
 +        lpParseDetailTotals().prepareNs.fetch_add(lpElapsedNs(prepareStart, insideStart));
 +    }
 +
-@@ -180,0 +724,7 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+     value_type newscore;
 +    const unsigned alphaDenseGeneration = lpBeginDenseAlphaGeneration(seq_length);
 +    const unsigned alphaCacheGeneration = alphaDenseGeneration == 0 ? lpBeginAlphaCacheGeneration() : 0;
 +    const unsigned multiDenseGeneration = lpBeginDenseMultiAlphaGeneration(seq_length);
@@ -633,40 +717,70 @@ index 4002764..592e691 100644
 +    unsigned long long detailPSinglePVisits = 0;
 +    unsigned long long detailPSingleQVisits = 0;
 +    unsigned long long detailPM2Iterations = 0;
-@@ -183 +733 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+     for(int j = 0; j < seq_length; ++j) {
+         int nucj = nucs[j];
 -        int nucj1 = (j+1) < seq_length ? nucs[j+1] : -1;
 +        int nucj1_37 = (j+1) < seq_length ? nuc37s[j+1] : -1;
-@@ -190,0 +741,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+ 
+         unordered_map<int, State>& beamstepH = bestH[j];
+         unordered_map<int, State>& beamstepMulti = bestMulti[j];
+@@ -188,18 +738,20 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+         unordered_map<int, State>& beamstepM2 = bestM2[j];
+         unordered_map<int, State>& beamstepM = bestM[j];
+         State& beamstepC = bestC[j];
 +        unsigned beamstepMIndexGeneration = 0;
 +        unsigned beamstepM2IndexGeneration = 0;
-@@ -193,0 +746 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+ 
+         // beam of H
+         {
 +            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-@@ -195 +747,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+             if (beam > 0 && beamstepH.size() > beam) beam_prune(beamstepH);
 -
-@@ -198,2 +750,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+             {
+                 // for nucj put H(j, j_next) into H[j_next]
 -                int jnext = next_pair[nucj][j];
 -                if (no_sharp_turn) while (jnext - j < 4 && jnext != -1) jnext = next_pair[nucj][jnext];
 +                int *nextRowJ = next_pair_rows[nucj];
 +                int jnext = nextRowJ[j];
 +                if (no_sharp_turn) while (jnext - j < 4 && jnext != -1) jnext = nextRowJ[jnext];
-@@ -202 +754,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 if (jnext != -1) {
+                     int nucjnext = nucs[jnext];
 -                    int nucjnext_1 = (jnext - 1) > -1 ? nucs[jnext - 1] : -1;
-@@ -212,2 +764,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                         int tetra_hex_tri = -1;
+ #ifdef SPECIAL_HP
+                         if (jnext-j-1 == 4) // 6:tetra
+@@ -209,8 +761,10 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                         else if (jnext-j-1 == 3) // 5:tri
+                             tetra_hex_tri = if_triloops[j];
+ #endif
 -                        newscore = - v_score_hairpin(j, jnext, nucj, nucj1, nucjnext_1, nucjnext, tetra_hex_tri);
 -                        Fast_LogPlusEquals(bestH[jnext][j].alpha, newscore/kT);
 +                        newscore = -v_score_hairpin_precomputed(j, jnext, lpPairType[nucj][nucjnext],
 +                                                                  nucj1_37, nuc37s[jnext - 1], tetra_hex_tri);
 +                        const float hAlpha = lpScoreOverKT(newscore);
 +                        lpLogPlusAlpha(bestH[jnext], j, hAlpha);
-@@ -225 +779,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 }
+             }
+ 
+@@ -222,12 +776,11 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                     int i = item.first;
+                     State &state = item.second;
+                     int nuci = nucs[i];
 -                    int jnext = next_pair[nuci][j];
 +                    int *nextRowI = next_pair_rows[nuci];
 +                    int jnext = nextRowI[j];
-@@ -228 +782,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+ 
+                     if (jnext != -1) {
 -                        int nuci1 = (i + 1) < seq_length ? nucs[i + 1] : -1;
-@@ -230 +783,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                         int nucjnext = nucs[jnext];
 -                        int nucjnext_1 = (jnext - 1) > -1 ? nucs[jnext - 1] : -1;
-@@ -244,2 +797,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+ 
+                         // 1. extend h(i, j) to h(i, jnext)
+                         // value_type newscore;
+@@ -241,19 +794,26 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                         else if (jnext-i-1 == 3) // 5:tri
+                             tetra_hex_tri = if_triloops[i];
+ #endif
 -                        newscore = - v_score_hairpin(i, jnext, nuci, nuci1, nucjnext_1, nucjnext, tetra_hex_tri);
 -                        Fast_LogPlusEquals(bestH[jnext][i].alpha, (newscore/kT));
 +                        newscore = -v_score_hairpin_precomputed(i, jnext, lpPairType[nuci][nucjnext],
@@ -674,20 +788,36 @@ index 4002764..592e691 100644
 +                                                                  nuc37s[jnext - 1], tetra_hex_tri);
 +                        const float hAlpha = lpScoreOverKT(newscore);
 +                        lpLogPlusAlpha(bestH[jnext], i, hAlpha);
-@@ -249 +805 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--                    Fast_LogPlusEquals(beamstepP[i].alpha, state.alpha);
+                     }
+ 
+                     // 2. generate p(i, j)
+-                    Fast_LogPlusEquals(beamstepP[i].alpha, state.alpha);  
 +                    lpLogPlusAlpha(beamstepP, i, state.alpha);
-@@ -251,0 +808,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 }
+             }
 +            if (detailTiming) {
 +                lpParseDetailTotals().insideHNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
 +            }
-@@ -256,0 +816 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+         }
+         if (j == 0) continue;
+ 
+         // beam of Multi
+         {
 +            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-@@ -264,2 +824 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+             if (beam > 0 && beamstepMulti.size() > beam) beam_prune(beamstepMulti);
+ 
+             for(auto& item : beamstepMulti) {
+@@ -261,88 +821,197 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 State& state = item.second;
+ 
+                 int nuci = nucs[i];
 -                int nuci1 = nucs[i+1];
 -                int jnext = next_pair[nuci][j];
 +                int jnext = next_pair_rows[nuci][j];
-@@ -270 +829,18 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+ 
+                 // 1. extend (i, j) to (i, jnext)
+                 {
+                     if (jnext != -1) {
 -                        Fast_LogPlusEquals(bestMulti[jnext][i].alpha, (state.alpha));
 +                        if (multiDenseGeneration != 0) {
 +                            const std::size_t idx = static_cast<std::size_t>(jnext) * static_cast<std::size_t>(seq_length) + static_cast<std::size_t>(i);
@@ -707,22 +837,34 @@ index 4002764..592e691 100644
 +                        } else {
 +                            lpLogPlusAlpha(bestMulti[jnext], i, state.alpha);
 +                        }
-@@ -276,2 +852,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                     }
+                 }
+ 
+                 // 2. generate P (i, j)
+                 {
 -                    value_type score_multi = - v_score_multi(i, j, nuci, nuci1, nucs[j-1], nucj, seq_length);
 -                    Fast_LogPlusEquals(beamstepP[i].alpha, (state.alpha + score_multi/kT));
 +                    int score_multi = -v_score_multi_precomputed(lpPairType[nucj][nuci], nuc37s[i+1], nuc37s[j-1]);
 +                    lpLogPlusAlpha(beamstepP, i, state.alpha + lpScoreOverKT(score_multi));
-@@ -279,0 +856,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 }
+             }
 +            if (detailTiming) {
 +                lpParseDetailTotals().insideMultiNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
 +            }
-@@ -283 +862,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--        {
+         }
+ 
+         // beam of P
+-        {   
 +        {
 +            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 +            beamstepMIndexGeneration = lpDenseKeyAlphaIndexA.begin(seq_length);
 +            beamstepM2IndexGeneration = lpDenseKeyAlphaIndexB.begin(seq_length);
-@@ -289,0 +872,8 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+             if (i_iter == 0){
+                 if (beam > 0 && beamstepP.size() > beam) beam_prune(beamstepP);
+             } else {
+                 beam_prune(i_seq, outer, beamstepP, j, ext_info);
+             }
+ 
 +            State **denseKeyPtrsA = lpDenseKeyAlphaIndexA.ptrs.data();
 +            unsigned *denseKeyGensA = lpDenseKeyAlphaIndexA.generations.data();
 +            State **denseKeyPtrsB = lpDenseKeyAlphaIndexB.ptrs.data();
@@ -731,19 +873,28 @@ index 4002764..592e691 100644
 +            State **denseAlphaPtrs = lpDenseAlphaPtrs.data();
 +            unsigned *denseAlphaGens = lpDenseAlphaGenerations.data();
 +
-@@ -295,0 +886 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+             // for every state in P[j]
+             //   1. generate new helix/bulge
+             //   2. M = P
+             //   3. M2 = M + P
+             //   4. C = C + P
+             for(auto& item : beamstepP) {
 +                if (detailTiming) ++detailPStates;
-@@ -298 +889 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--
+                 int i = item.first;
+                 State& state = item.second;
+-                
 +
-@@ -300 +891,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 int nuci = nucs[i];
 -                int nuci_1 = (i-1>-1) ? nucs[i-1] : -1;
 +                int nuci_1_37 = (i-1>-1) ? nuc37s[i-1] : -1;
 +                const int outerPairType = lpPairType[nuci][nucj];
-@@ -305,20 +897,55 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+ 
+                 // 1. generate new helix / single_branch
+                 // new state is of shape p..i..j..q
+                 if (i >0 && j<seq_length-1) {
 -                    for (int p = i - 1; p >= std::max(i - SINGLE_MAX_LEN, 0); --p) {
 -                        int nucp = nucs[p];
--                        int nucp1 = nucs[p + 1];
+-                        int nucp1 = nucs[p + 1]; 
 -                        int q = next_pair[nucp][j];
 -                        while (q != -1 && ((i - p) + (q - j) - 2 <= SINGLE_MAX_LEN)) {
 -                            int nucq = nucs[q];
@@ -816,13 +967,17 @@ index 4002764..592e691 100644
 +                                lpLogPlusAlphaIndexedPfscore(pfscore, q, p, state.alpha + lpScoreOverKT(score_single),
 +                                                               seq_length, alphaDenseGeneration, alphaCacheGeneration);
 +                                q = nextRowP[q];
-@@ -326 +952,0 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                             }
 -                            q = next_pair[nucp][q];
-@@ -330,0 +957,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                         }
+                     }
+                 }
+ 
 +                int m1Score = 0;
 +                bool m1ScoreReady = false;
 +
-@@ -333,2 +962,18 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 // 2. M = P
+                 if(i > 0 && j < seq_length-1){
 -                        int score_M1 = - v_score_M1(i, j, j, nuci_1, nuci, nucj, nucj1, seq_length);
 -                        Fast_LogPlusEquals(beamstepM[i].alpha, (state.alpha + score_M1/kT));
 +                        m1Score = -v_score_M1_precomputed(outerPairType, nuci_1_37, nucj1_37);
@@ -843,7 +998,11 @@ index 4002764..592e691 100644
 +                        } else {
 +                            lpDenseKeyAlphaIndexA.logPlusAlpha(beamstepM, i, mAlpha, beamstepMIndexGeneration);
 +                        }
-@@ -340,6 +985,30 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 }
+ 
+                 // 3. M2 = M + P
+                 int k = i - 1;
+                 if ( k > 0 && !bestM[k].empty()) {
 -                    int M1_score = - v_score_M1(i, j, j, nuci_1, nuci, nucj, nucj1, seq_length);
 -                    float m1_alpha = state.alpha + M1_score/kT;
 -                    for (auto &m : bestM[k]) {
@@ -880,47 +1039,64 @@ index 4002764..592e691 100644
 +                            const float m2Alpha = m_state.alpha + m1_alpha;
 +                            lpDenseKeyAlphaIndexB.logPlusAlpha(beamstepM2, newi, m2Alpha, beamstepM2IndexGeneration);
 +                        }
-@@ -354,6 +1023,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                     }
+                 }
+ 
+@@ -351,48 +1020,76 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                     int k = i - 1;
+                     if (k >= 0) {
+                       State& prefix_C = bestC[k];
 -                        int nuck = nuci_1;
 -                        int nuck1 = nuci;
 -                        int score_external_paired = - v_score_external_paired(k+1, j, nuck, nuck1,
 -                                                             nucj, nucj1, seq_length);
--                        state.score_external = score_external_paired/kT + prefix_C.alpha;
--                        Fast_LogPlusEquals(beamstepC.alpha, prefix_C.alpha + state.alpha + score_external_paired/kT);
+-                        state.score_external = score_external_paired/kT + prefix_C.alpha;                   
+-                        Fast_LogPlusEquals(beamstepC.alpha, prefix_C.alpha + state.alpha + score_external_paired/kT);      
 +                        int score_external_paired = -v_score_external_paired_precomputed(outerPairType,
 +                                                             nuci_1_37, nucj1_37);
 +                        const double externalPairedAlpha = lpScoreOverKT(score_external_paired);
 +                        state.score_external = externalPairedAlpha + prefix_C.alpha;
 +                        lpLogPlusEquals(beamstepC.alpha, prefix_C.alpha + state.alpha + externalPairedAlpha);
-@@ -361,4 +1029,5 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                     } else {
 -                        int score_external_paired = - v_score_external_paired(0, j, -1, nucs[0],
 -                                                                 nucj, nucj1, seq_length);
 -                        state.score_external = score_external_paired/kT;
--                        Fast_LogPlusEquals(beamstepC.alpha, state.alpha + score_external_paired/kT);
+-                        Fast_LogPlusEquals(beamstepC.alpha, state.alpha + score_external_paired/kT); 
 +                        int score_external_paired = -v_score_external_paired_precomputed(outerPairType,
 +                                                                 -1, nucj1_37);
 +                        const double externalPairedAlpha = lpScoreOverKT(score_external_paired);
 +                        state.score_external = externalPairedAlpha;
 +                        lpLogPlusEquals(beamstepC.alpha, state.alpha + externalPairedAlpha);
-@@ -367,0 +1037,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                     }
+                 }
+             }
 +            if (detailTiming) {
 +                lpParseDetailTotals().insidePNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
 +            }
-@@ -371,0 +1044 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+         }
+ 
+         // beam of M2
+         {
 +            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-@@ -373,0 +1047,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+             if (beam > 0 && beamstepM2.size() > beam) beam_prune(beamstepM2);
+ 
 +            State **multiDensePtrs = lpDenseMultiAlphaPtrs.data();
 +            unsigned *multiDenseGens = lpDenseMultiAlphaGenerations.data();
 +            const std::size_t denseStride = static_cast<std::size_t>(seq_length);
 +
-@@ -380 +1057,2 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+             for(auto& item : beamstepM2) {
+                 int i = item.first;
+                 State& state = item.second;
+ 
+                 // 1. multi-loop
+                 {
 -                    for (int p = i-1; p >= std::max(i - SINGLE_MAX_LEN, 0); --p) {
 +                    const int pMin = (i > SINGLE_MAX_LEN) ? (i - SINGLE_MAX_LEN) : 0;
 +                    for (int p = i-1; p >= pMin; --p) {
-@@ -382 +1060 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                         int nucp = nucs[p];
 -                        int q = next_pair[nucp][j];
 +                        int q = next_pair_rows[nucp][j];
-@@ -384 +1062,16 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                         if (q != -1 && ((i - p - 1) <= SINGLE_MAX_LEN)) {
 -                        Fast_LogPlusEquals(bestMulti[q][p].alpha, state.alpha);
 +                            if (multiDenseGeneration != 0) {
 +                                const std::size_t idx = static_cast<std::size_t>(q) * denseStride + static_cast<std::size_t>(p);
@@ -938,40 +1114,67 @@ index 4002764..592e691 100644
 +                            } else {
 +                                lpLogPlusAlpha(bestMulti[q], p, state.alpha);
 +                            }
-@@ -390 +1083,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--                Fast_LogPlusEquals(beamstepM[i].alpha, state.alpha);
+                         }
+                     }
+                 }
+ 
+                 // 2. M = M2
+-                Fast_LogPlusEquals(beamstepM[i].alpha, state.alpha);  
 +                lpDenseKeyAlphaIndexA.logPlusAlpha(beamstepM, i, state.alpha, beamstepMIndexGeneration);
 +            }
 +            if (detailTiming) {
 +                lpParseDetailTotals().insideM2Ns.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
-@@ -395,0 +1092 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+             }
+         }
+ 
+         // beam of M
+         {
 +            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-@@ -404 +1101 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--                    Fast_LogPlusEquals(bestM[j+1][i].alpha, state.alpha);
+             // float threshold = VALUE_MIN;
+             // if (beam > 0 && beamstepM.size() > beam) threshold = beam_prune(beamstepM);
+             if (beam > 0 && beamstepM.size() > beam) beam_prune(beamstepM);
+@@ -401,36 +1098,60 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 int i = item.first;
+                 State& state = item.second;
+                 if (j < seq_length-1) {
+-                    Fast_LogPlusEquals(bestM[j+1][i].alpha, state.alpha); 
 +                    bestM[j+1].try_emplace(i, state.alpha);
-@@ -406,0 +1104,3 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+                 }
+             }
 +            if (detailTiming) {
 +                lpParseDetailTotals().insideMNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
 +            }
-@@ -410,0 +1111 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+         }
+ 
+         // beam of C
+         {
 +            const auto blockStart = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-@@ -413 +1114,4 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--                Fast_LogPlusEquals(bestC[j+1].alpha, beamstepC.alpha);
+             // C = C + U
+             if (j < seq_length-1) {
+-                Fast_LogPlusEquals(bestC[j+1].alpha, beamstepC.alpha); 
 +                bestC[j+1].alpha = beamstepC.alpha;
 +            }
 +            if (detailTiming) {
 +                lpParseDetailTotals().insideCNs.fetch_add(lpElapsedNs(blockStart, std::chrono::steady_clock::now()));
-@@ -418 +1122 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--
+             }
+         }
+ 
+     }  // end of for-loo j
+-    
 +
-@@ -424,0 +1129,6 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+     State& viterbi = bestC[seq_length-1];
+ 
+     if(is_verbose) printf("Iter %d Seq %d Free Energy of Ensemble: %.10f kcal/mol\n", i_iter, i_seq, -kT * viterbi.alpha / 100.0);
+ 
+     fflush(stdout);
+ 
 +    const auto insideEnd = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 +    if (detailTiming) {
 +        LinearPartitionParseDetailTotals &totals = lpParseDetailTotals();
 +        totals.insideNs.fetch_add(lpElapsedNs(insideStart, insideEnd));
 +    }
 +
-@@ -426 +1136,12 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+     // outside phrase
 -    outside(outer, i_seq, i_iter, next_pair, pfscore, ext_info);
 +    outside(outer, i_seq, i_iter, next_pair_rows, genericOuterMismatch, pfscore, ext_info);
 +    const auto outsideEnd = detailTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
@@ -985,36 +1188,64 @@ index 4002764..592e691 100644
 +        totals.pSingleQVisits.fetch_add(detailPSingleQVisits);
 +        totals.pM2Iterations.fetch_add(detailPM2Iterations);
 +    }
-@@ -428 +1149 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--    if (!bppSaveFile.empty()){
+ 
+-    if (!bppSaveFile.empty()){ 
 +    if (!bppSaveFile.empty()){
-@@ -433 +1154 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--    if (!pfSaveFile.empty()){
+         bpp_file = bppSaveFile;
+         cal_PairProb(viterbi, pfscore, ext_info);
+     }
+ 
+-    if (!pfSaveFile.empty()){ 
 +    if (!pfSaveFile.empty()){
-@@ -442 +1163 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
--void BeamCKYParser::print_states(FILE *fptr, unordered_map<int, State>& states, int j, string label, bool inside_only, double threshold) {
+         forest_file = pfSaveFile;
+         dump_forest(seq, pfscore, true);
+     }
+@@ -439,7 +1160,7 @@ double BeamCKYParser::parse(int i_iter, int i_seq, LinearTurboFold* outer, strin
+ }
+ 
+ // dump forest
+-void BeamCKYParser::print_states(FILE *fptr, unordered_map<int, State>& states, int j, string label, bool inside_only, double threshold) {    
 +void BeamCKYParser::print_states(FILE *fptr, unordered_map<int, State>& states, int j, string label, bool inside_only, double threshold) {
-@@ -455 +1176 @@ void BeamCKYParser::print_states(FILE *fptr, unordered_map<int, State>& states,
--void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore, bool inside_only) {
+     for (auto & item : states) {
+         int i = item.first;
+         State & state = item.second;
+@@ -452,7 +1173,7 @@ void BeamCKYParser::print_states(FILE *fptr, unordered_map<int, State>& states,
+ }
+ 
+ // dump forest
+-void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore, bool inside_only) {  
 +void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore, bool inside_only) {
-@@ -467 +1188 @@ void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore,
--  for (j = 0; j < n; j++)
+ //   printf("Dumping (%s) Forest to %s...\n", (inside_only ? "Inside-Only" : "Inside-Outside"), forest_file.c_str());
+   FILE *fptr = fopen(forest_file.c_str(), "w");  // lhuang: should be fout >>
+   fprintf(fptr, "%s\n", seq.c_str());
+@@ -464,13 +1185,13 @@ void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore,
+         fprintf(fptr, "E %d %.5lf %.5lf\n", j+1, bestC[j].alpha, bestC[j].beta);
+   }
+   double threshold = bestC[n-1].alpha - 9.91152; // lhuang -9.xxx or ?
+-  for (j = 0; j < n; j++) 
 +  for (j = 0; j < n; j++)
-@@ -469 +1190 @@ void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore,
--  for (j = 0; j < n; j++)
+     print_states(fptr, pfscore[j], j, "P", inside_only, threshold);
+-  for (j = 0; j < n; j++) 
 +  for (j = 0; j < n; j++)
-@@ -471 +1192 @@ void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore,
--  for (j = 0; j < n; j++)
+     print_states(fptr, bestM[j], j, "M", inside_only, threshold);
+-  for (j = 0; j < n; j++) 
 +  for (j = 0; j < n; j++)
-@@ -473 +1194 @@ void BeamCKYParser::dump_forest(string seq, unordered_map<int, State>* &pfscore,
--  for (j = 0; j < n; j++)
+     print_states(fptr, bestM2[j], j, "M2", inside_only, threshold);
+-  for (j = 0; j < n; j++) 
 +  for (j = 0; j < n; j++)
-@@ -481,2 +1202,2 @@ BeamCKYParser::BeamCKYParser(int beam_size,
--    : beam(beam_size),
--      no_sharp_turn(nosharpturn),
+     print_states(fptr, bestMulti[j], j, "Multi", inside_only, threshold);
+ }
+ 
+@@ -478,15 +1199,25 @@ BeamCKYParser::BeamCKYParser(int beam_size,
+                              bool nosharpturn,
+                              bool verbose,
+                              bool pf_allocate)
+-    : beam(beam_size), 
+-      no_sharp_turn(nosharpturn), 
 +    : beam(beam_size),
 +      no_sharp_turn(nosharpturn),
-@@ -485 +1206,10 @@ BeamCKYParser::BeamCKYParser(int beam_size,
+       is_verbose(verbose),
+       allocate(pf_allocate) {
 -      initialize();
 +      seq_length = 0;
 +      bestH = NULL;
@@ -1026,69 +1257,147 @@ index 4002764..592e691 100644
 +      nuc37s = NULL;
 +      static std::once_flag initializeOnce;
 +      std::call_once(initializeOnce, initialize);
-@@ -489,0 +1220 @@ BeamCKYParser::~BeamCKYParser(){
+ }
+ 
+ BeamCKYParser::~BeamCKYParser(){
+     delete[] nucs;
 +    delete[] nuc37s;
+     delete[] bestC;
+     delete[] bestH;
+     // delete[] bestP;
 diff --git a/src/LinearPartition/src/LinearPartition.h b/src/LinearPartition/src/LinearPartition.h
 index 3705546..3e6374e 100644
 --- a/src/LinearPartition/src/LinearPartition.h
 +++ b/src/LinearPartition/src/LinearPartition.h
-@@ -16 +16 @@
--#include <math.h>
+@@ -13,7 +13,7 @@
+ #include <limits>
+ #include <vector>
+ #include <unordered_map>
+-#include <math.h> 
 +#include <math.h>
-@@ -24 +24 @@
--#define NEG_INF -2e20
+ 
+ #include "../../utils/pfunction_math.h"
+ #include "../../utils/structure.h"
+@@ -21,7 +21,7 @@
+ // #define MIN_CUBE_PRUNING_SIZE 20
+ #define kT 61.63207755
+ 
+-#define NEG_INF -2e20 
 +#define NEG_INF -2e20
-@@ -61,3 +61,3 @@ enum Manner {
--// A hash function used to hash a pair of any kind
--struct hash_pair {
--    template <class T1, class T2>
+ // #define testtime
+ 
+ using namespace std;
+@@ -58,15 +58,15 @@ enum Manner {
+   MANNER_C_eq_C_plus_P,         // 13: C = C + P
+ };
+ 
+-// A hash function used to hash a pair of any kind 
+-struct hash_pair { 
+-    template <class T1, class T2> 
 +// A hash function used to hash a pair of any kind
 +struct hash_pair {
 +    template <class T1, class T2>
-@@ -65,5 +65,5 @@ struct hash_pair {
--    {
--        auto hash1 = hash<T1>{}(p.first);
--        auto hash2 = hash<T2>{}(p.second);
--        return hash1 ^ hash2;
--    }
+     size_t operator()(const pair<T1, T2>& p) const
+-    { 
+-        auto hash1 = hash<T1>{}(p.first); 
+-        auto hash2 = hash<T2>{}(p.second); 
+-        return hash1 ^ hash2; 
+-    } 
 +    {
 +        auto hash1 = hash<T1>{}(p.first);
 +        auto hash2 = hash<T2>{}(p.second);
 +        return hash1 ^ hash2;
 +    }
-@@ -82,0 +83 @@ struct State {
+ };
+ 
+ struct ExtValue {
+@@ -80,6 +80,7 @@ struct State {
+     float score_external;
+ 
+     State(): alpha(VALUE_MIN), beta(VALUE_MIN) {};
 +    explicit State(float a): alpha(a), beta(VALUE_MIN) {};
-@@ -93 +94 @@ public:
--
+ };
+ 
+ class LinearTurboFold;
+@@ -90,7 +91,7 @@ public:
+     bool is_verbose;
+     string bpp_file;
+     string forest_file;
+-   
 +
-@@ -116 +117 @@ private:
--
+     struct DecoderResult {
+         float alpha;
+         // unsigned long num_states;
+@@ -113,7 +114,7 @@ private:
+     unsigned seq_length;
+ 
+     unordered_map<int, State> *bestH, *bestM2, *bestMulti, *bestM; // *bestP -> pfscore
+- 
 +
-@@ -123,0 +125 @@ private:
+     vector<int> if_tetraloops;
+     vector<int> if_hexaloops;
+     vector<int> if_triloops;
+@@ -121,13 +122,14 @@ private:
+     State *bestC;
+ 
+     int *nucs;
 +    int *nuc37s;
-@@ -128 +130 @@ private:
--    void cal_PairProb(State& viterbi, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info);
+ 
+     void prepare(unsigned len);
+ 
+ 
+-    void cal_PairProb(State& viterbi, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info); 
 +    void cal_PairProb(State& viterbi, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info);
-@@ -130 +132 @@ private:
+ 
 -    void outside(LinearTurboFold* outer, int i_seq, int i_iter, vector<int> next_pair[], unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info);
 +    void outside(LinearTurboFold* outer, int i_seq, int i_iter, int *next_pair_rows[], int8_t *genericOuterMismatch, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info);
-@@ -149 +151 @@ inline float Fast_LogExpPlusOne(float x){
--
+ 
+     float beam_prune(unordered_map<int, State>& beamstep);
+     float beam_prune(int i_seq, LinearTurboFold* outer, std::unordered_map<int, State> &beamstep, int j, unordered_map<int, ExtValue>* &ext_info);
+@@ -146,7 +148,7 @@ private:
+ // log space: borrowed from CONTRAfold
+ 
+ inline float Fast_LogExpPlusOne(float x){
+-  
 +
-@@ -160 +162 @@ inline float Fast_LogExpPlusOne(float x){
--
+     // Bounds for tolerance of 7.05e-06: (0, 11.8625)
+     // Approximating interval: (0, 0.661537) --> ((T(-0.0065591595)*x+T(0.1276442762))*x+T(0.4996554598))*x+T(0.6931542306);
+     // Approximating interval: (0.661537, 1.63202) --> ((T(-0.0155157557)*x+T(0.1446775699))*x+T(0.4882939746))*x+T(0.6958092989);
+@@ -157,7 +159,7 @@ inline float Fast_LogExpPlusOne(float x){
+     // Approximating interval: (5.78907, 7.81627) --> ((T(-0.0001962780)*x+T(0.0046084408))*x+T(0.9634431978))*x+T(0.0983148903);
+     // Approximating interval: (7.81627, 11.8625) --> ((T(-0.0000113994)*x+T(0.0003734731))*x+T(0.9959107193))*x+T(0.0149855051);
+     // 8 polynomials needed.
+-    
 +
-@@ -191 +193 @@ inline float Fast_LogExpPlusOne(float x){
--
+     assert(float(0.0000000000) <= x && x <= float(11.8624794162) && "Argument out-of-range.");
+     if (x < float(3.3792499610))
+     {
+@@ -188,7 +190,7 @@ inline float Fast_LogExpPlusOne(float x){
+     // Approximating interval: (3.06792, 5.15409) --> ((T(-0.0027005983)*x+T(0.0419040665))*x+T(0.7762991688))*x+T(0.4152395732);
+     // Approximating interval: (5.15409, 9.21129) --> ((T(-0.0001617326)*x+T(0.0040111354))*x+T(0.9666890441))*x+T(0.0929363811);
+     // 4 polynomials needed.
+-    
 +
-@@ -222 +224 @@ inline float Fast_Exp(float x)
--
+     assert(float(0.0000000000) <= x && x <= float(9.2112909219), "Argument out-of-range.");
+     if (x < float(3.0679202382))
+     {
+@@ -219,7 +221,7 @@ inline float Fast_Exp(float x)
+     // Approximating interval: (-1.48054, -0.672505) --> ((T(0.0573782771)*x+T(0.3580258429))*x+T(0.9121133217))*x+T(0.9793091728);
+     // Approximating interval: (-0.672505, -3.9145e-11) --> ((T(0.1199175927)*x+T(0.4815668234))*x+T(0.9975991939))*x+T(0.9999505077);
+     // 6 polynomials needed.
+-    
 +
+     if (x < float(-2.4915033807))
+     {
+         if (x < float(-5.8622823336))
 diff --git a/src/LinearPartition/src/Utils/utility_v.h b/src/LinearPartition/src/Utils/utility_v.h
 index 4528e76..ae5fe30 100644
 --- a/src/LinearPartition/src/Utils/utility_v.h
 +++ b/src/LinearPartition/src/Utils/utility_v.h
-@@ -15,0 +16,10 @@
+@@ -13,6 +13,16 @@
+ #define NUM_TO_PAIR(x,y) (x==0? (y==3?5:0) : (x==1? (y==2?1:0) : (x==2 ? (y==1?2:(y==3?3:0)) : (x==3 ? (y==2?4:(y==0?6:0)) : 0))))
+ #define NUC_TO_PAIR(x,y) (x==1? (y==4?5:0) : (x==2? (y==3?1:0) : (x==3 ? (y==2?2:(y==4?3:0)) : (x==4 ? (y==3?4:(y==1?6:0)) : 0))))
+ 
 +static const int lpNuc37ByNuc[5] = {1, 2, 3, 4, 0};
 +static const int lpPairType[5][5] = {
 +    {0, 0, 0, 5, 0},
@@ -1099,9 +1408,21 @@ index 4528e76..ae5fe30 100644
 +};
 +
 +
-@@ -30,0 +41 @@ inline int MAX2(int a, int b) {if (a >= b)return a;else return b;}
+ // bool _allowed_pairs[NOTON][NOTON];
+ 
+ #include <string.h>
+@@ -28,6 +38,7 @@
+ inline int MIN2(int a, int b) {if (a <= b)return a;else return b;}
+ inline int MAX2(int a, int b) {if (a >= b)return a;else return b;}
+ 
 +
-@@ -108,0 +120,27 @@ inline int v_score_hairpin(int i, int j, int nuci, int nuci1, int nucj_1, int nu
+ /* void v_initialize() */
+ /* { */
+ /*     _allowed_pairs[GET_ACGU_NUM('A')][GET_ACGU_NUM('U')] = true; */
+@@ -106,6 +117,33 @@ inline int v_score_hairpin(int i, int j, int nuci, int nuci1, int nucj_1, int nu
+     return energy;
+ }
+ 
 +inline int v_score_hairpin_precomputed(int i, int j, int type, int si1, int sj1, int tetra_hex_tri_index = -1) {
 +    int size = j-i-1;
 +    int energy;
@@ -1129,7 +1450,13 @@ index 4528e76..ae5fe30 100644
 +    return energy;
 +}
 +
-@@ -178,0 +217,85 @@ inline int v_score_single(int i, int j, int p, int q,
+ inline int v_score_single(int i, int j, int p, int q,
+                         int nuci, int nuci1, int nucj_1, int nucj,
+                         int nucp_1, int nucp, int nucq, int nucq1){
+@@ -176,6 +214,91 @@ inline int v_score_single(int i, int j, int p, int q,
+   return energy;
+ }
+ 
 +inline int v_score_single_precomputed_n(int n1, int n2,
 +                        int si1, int sj1, int sp1, int sq1,
 +                        int type, int type_2){
@@ -1215,17 +1542,35 @@ index 4528e76..ae5fe30 100644
 +    return v_score_single_precomputed_n(n1, n2, si1, sj1, sp1, sq1, type, type_2);
 +}
 +
-@@ -212,0 +336,4 @@ inline int v_score_M1(int i, int j, int k, int nuci_1, int nuci, int nuck, int n
+ // multi_loop
+ inline int E_MLstem(int type, int si1, int sj1) {
+     int energy = 0;
+@@ -210,6 +333,10 @@ inline int v_score_M1(int i, int j, int k, int nuci_1, int nuci, int nuck, int n
+ 
+ }
+ 
 +inline int v_score_M1_precomputed(int type, int sp1, int sq1) {
 +    return E_MLstem(type, sp1, sq1);
 +}
 +
-@@ -224,0 +352,4 @@ inline int v_score_multi(int i, int j, int nuci, int nuci1, int nucj_1, int nucj
+ inline int v_score_multi_unpaired(int i, int j) {
+     return 0;
+ }
+@@ -222,6 +349,10 @@ inline int v_score_multi(int i, int j, int nuci, int nuci1, int nucj_1, int nucj
+     return E_MLstem(tt, sj1, si1) + ML_closing37;
+ }
+ 
 +inline int v_score_multi_precomputed(int type, int si1, int sj1) {
 +    return E_MLstem(type, sj1, si1) + ML_closing37;
 +}
 +
-@@ -246,0 +378,18 @@ inline int v_score_external_paired(int i, int j, int nuci_1, int nuci, int nucj,
+ // exterior_loop
+ inline int v_score_external_paired(int i, int j, int nuci_1, int nuci, int nucj, int nucj1, int len) {
+     int type = NUM_TO_PAIR(nuci, nucj);
+@@ -244,6 +375,24 @@ inline int v_score_external_paired(int i, int j, int nuci_1, int nuci, int nucj,
+   return energy;
+ }
+ 
 +inline int v_score_external_paired_precomputed(int type, int si1, int sj1) {
 +    int energy = 0;
 +
@@ -1244,42 +1589,74 @@ index 4528e76..ae5fe30 100644
 +  return energy;
 +}
 +
+ inline int v_score_external_unpaired(int i, int j) {
+     return 0;
+ }
 diff --git a/src/LinearPartition/src/bpp.h b/src/LinearPartition/src/bpp.h
 index 26be8a9..47b55b8 100644
 --- a/src/LinearPartition/src/bpp.h
 +++ b/src/LinearPartition/src/bpp.h
-@@ -9 +9 @@
--#include <stdio.h>
+@@ -6,7 +6,7 @@
+  created by: 04/2019
+ */
+ 
+-#include <stdio.h> 
 +#include <stdio.h>
-@@ -21,5 +21,5 @@ void BeamCKYParser::output_to_file(string file_name, const char * type) {
--        // printf("Outputing base pairing probability matrix to %s...\n", file_name.c_str());
--        FILE *fptr = fopen(file_name.c_str(), type);
--        if (fptr == NULL) {
--            printf("Could not open file!\n");
--            return;
+ #include <sys/time.h>
+ #include "LinearPartition.h"
+ #include "Utils/utility.h"
+@@ -18,11 +18,11 @@ using namespace std;
+ void BeamCKYParser::output_to_file(string file_name, const char * type) {
+ 
+     if(!file_name.empty()) {
+-        // printf("Outputing base pairing probability matrix to %s...\n", file_name.c_str()); 
+-        FILE *fptr = fopen(file_name.c_str(), type); 
+-        if (fptr == NULL) { 
+-            printf("Could not open file!\n"); 
+-            return; 
 +        // printf("Outputing base pairing probability matrix to %s...\n", file_name.c_str());
 +        FILE *fptr = fopen(file_name.c_str(), type);
 +        if (fptr == NULL) {
 +            printf("Could not open file!\n");
 +            return;
-@@ -39,2 +39,2 @@ void BeamCKYParser::output_to_file(string file_name, const char * type) {
--        fclose(fptr);
--        // printf("Done!\n");
+         }
+ 
+         int turn = no_sharp_turn?3:0;
+@@ -36,8 +36,8 @@ void BeamCKYParser::output_to_file(string file_name, const char * type) {
+             }
+         }
+         fprintf(fptr, "\n");
+-        fclose(fptr); 
+-        // printf("Done!\n"); 
 +        fclose(fptr);
 +        // printf("Done!\n");
-@@ -51,2 +51,2 @@ void BeamCKYParser::cal_PairProb(State& viterbi, unordered_map<int, State>* &pfs
+     }
+ 
+     return;
+@@ -48,8 +48,8 @@ void BeamCKYParser::cal_PairProb(State& viterbi, unordered_map<int, State>* &pfs
+     for(int j=0; j<seq_length; j++){
+         for(auto &item : pfscore[j]){
+             int i = item.first;
 -            State state = item.second;
--
+-            
 +            const State &state = item.second;
 +
-@@ -71,5 +71 @@ void BeamCKYParser::cal_PairProb(State& viterbi, unordered_map<int, State>* &pfs
+             float temp_prob_inside = state.alpha + state.beta - viterbi.alpha - ext_info[j+1][i+1].score;
+             if (temp_prob_inside > float(-9.91152)) {
+                 float prob = Fast_Exp(temp_prob_inside);
+@@ -68,19 +68,68 @@ void BeamCKYParser::cal_PairProb(State& viterbi, unordered_map<int, State>* &pfs
+     return;
+ }
+ 
 -void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vector<int> next_pair[], unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info){
--
+-      
 -    struct timeval parse_starttime, parse_endtime;
 -
 -    gettimeofday(&parse_starttime, NULL);
 +void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, int *next_pair_rows[], int8_t *genericOuterMismatch, unordered_map<int, State>* &pfscore, unordered_map<int, ExtValue>* &ext_info){
-@@ -78,0 +75,53 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+ 
+     bestC[seq_length-1].beta = 0.0;
+ 
 +    const unsigned pfscoreLookupGeneration = lpBuildDensePfscoreLookup(pfscore, seq_length);
 +    State **pfscoreLookupPtrs = lpDenseAlphaPtrs.data();
 +    unsigned *pfscoreLookupGenerations = lpDenseAlphaGenerations.data();
@@ -1333,21 +1710,37 @@ index 26be8a9..47b55b8 100644
 +    State **multiLookupPtrs = lpDenseOutsideMultiPtrs.data();
 +    unsigned *multiLookupGenerations = lpDenseOutsideMultiGenerations.data();
 +
-@@ -83 +132 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+     // from right to left
+     value_type newscore;
+     for(int j = seq_length-1; j >= 0; --j) {
+         int nucj = nucs[j];
 -        int nucj1 = (j+1) < seq_length ? nucs[j+1] : -1;
 +        int nucj1_37 = (j+1) < seq_length ? nuc37s[j+1] : -1;
-@@ -96 +145 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+ 
+         unordered_map<int, State>& beamstepH = bestH[j];
+         unordered_map<int, State>& beamstepMulti = bestMulti[j];
+@@ -93,23 +142,44 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+         {
+             // C = C + U
+             if (j < seq_length-1) {
 -                Fast_LogPlusEquals(beamstepC.beta, (bestC[j+1].beta));
 +                lpLogPlusEquals(beamstepC.beta, (bestC[j+1].beta));
-@@ -101 +150 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
--
+             }
+         }
+ 
+         if (j == 0) continue;
+-    
 +
-@@ -103,0 +153,4 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+         // beam of M
+         {
 +            const unsigned nextMGeneration = (j < seq_length-1) ? lpDenseKeyLookupA.build(bestM[j+1], seq_length) : 0;
 +            State **nextMPtrs = lpDenseKeyLookupA.ptrs.data();
 +            unsigned *nextMGenerations = lpDenseKeyLookupA.generations.data();
 +            const unsigned nextMLen = lpDenseKeyLookupA.seqLength;
-@@ -108 +161,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+             for(auto& item : beamstepM) {
+                 int i = item.first;
+                 State& state = item.second;
+                 if (j < seq_length-1) {
 -                    Fast_LogPlusEquals(state.beta, bestM[j+1][i].beta);
 +                    State *mNextState = lpFindDenseKeyRaw(nextMPtrs, nextMGenerations, i, nextMLen, nextMGeneration);
 +                    if (mNextState != NULL) {
@@ -1358,7 +1751,10 @@ index 26be8a9..47b55b8 100644
 +                            lpLogPlusEquals(state.beta, mNextIt->second.beta);
 +                        }
 +                    }
-@@ -112,0 +174,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                 }
+             }
+         }
+ 
 +        const unsigned currentMGeneration = lpDenseKeyLookupA.build(beamstepM, seq_length);
 +        State **currentMPtrs = lpDenseKeyLookupA.ptrs.data();
 +        unsigned *currentMGenerations = lpDenseKeyLookupA.generations.data();
@@ -1368,10 +1764,16 @@ index 26be8a9..47b55b8 100644
 +        unsigned *currentM2Generations = lpDenseKeyLookupB.generations.data();
 +        const unsigned currentM2Len = lpDenseKeyLookupB.seqLength;
 +
-@@ -123 +193 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+         // beam of M2
+         {
+             for(auto& item : beamstepM2) {
+@@ -120,73 +190,122 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                 {
+                     for (int p = i-1; p >= std::max(i - SINGLE_MAX_LEN, 0); --p) {
+                         int nucp = nucs[p];
 -                        int q = next_pair[nucp][j];
 +                        int q = next_pair_rows[nucp][j];
-@@ -125 +195,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                         if (q != -1 && ((i - p - 1) <= SINGLE_MAX_LEN)) {
 -                            Fast_LogPlusEquals(state.beta, bestMulti[q][p].beta);
 +                            State *multiState = lpFindDenseMatrixRaw(multiLookupPtrs, multiLookupGenerations, q, p, seq_length, multiLookupGeneration);
 +                            if (multiState != NULL) {
@@ -1382,7 +1784,11 @@ index 26be8a9..47b55b8 100644
 +                                    lpLogPlusEquals(state.beta, multiIt->second.beta);
 +                                }
 +                            }
-@@ -131 +209,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                         }
+                     }
+                 }
+ 
+                 // 2. M = M2
 -                Fast_LogPlusEquals(state.beta, beamstepM[i].beta);
 +                State *mState = lpFindDenseKeyRaw(currentMPtrs, currentMGenerations, i, currentMLen, currentMGeneration);
 +                if (mState != NULL) {
@@ -1393,21 +1799,27 @@ index 26be8a9..47b55b8 100644
 +                        lpLogPlusEquals(state.beta, mIt->second.beta);
 +                    }
 +                }
-@@ -136 +222 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
--        {
+             }
+         }
+ 
+         // beam of P
+-        {  
 +        {
-@@ -141,2 +227 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+             for(auto& item : beamstepP) {
+                 int i = item.first;
+                 State& state = item.second;
+                 int nuci = nucs[i];
 -                int nuci_1 = (i-1>-1) ? nucs[i-1] : -1;
 -
 +                int nuci_1_37 = (i-1>-1) ? nuc37s[i-1] : -1;
-@@ -144 +229,4 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                 if (i >0 && j<seq_length-1) {
 -                    for (int p = i - 1; p >= std::max(i - SINGLE_MAX_LEN, 0); --p) {
 +                    const int innerPairType = lpPairType[nucj][nuci];
 +                    const int innerGenericMismatch = mismatchI37[innerPairType][nucj1_37][nuci_1_37];
 +                    const int pMin = std::max(i - SINGLE_MAX_LEN, 0);
 +                    for (int p = i - 1, leftLoop = 0; p >= pMin; --p, ++leftLoop) {
-@@ -146,21 +234,22 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
--                        int nucp1 = nucs[p + 1];
+                         int nucp = nucs[p];
+-                        int nucp1 = nucs[p + 1]; 
 -                        int q = next_pair[nucp][j];
 -                        while (q != -1 && ((i - p) + (q - j) - 2 <= SINGLE_MAX_LEN)) {
 -                            int nucq = nucs[q];
@@ -1450,7 +1862,7 @@ index 26be8a9..47b55b8 100644
 +                            const int q = qEntry.q;
 +                            if (!usePfscoreByPFirstAfterJ && (i - p) + (q - j) - 2 > SINGLE_MAX_LEN) {
 +                                break;
-@@ -168 +257,8 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                             }
 -                            q = next_pair[nucp][q];
 +                            State *pfState = qEntry.state;
 +                            const int rightLoop = q - j - 1;
@@ -1460,11 +1872,15 @@ index 26be8a9..47b55b8 100644
 +                                                                    nuci_1_37, nucj1_37,
 +                                                                    innerPairType, innerGenericMismatch);
 +                            lpLogPlusEquals(state.beta, pfState->beta + lpScoreOverKT(score_single));
-@@ -172,0 +269,3 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                         }
+                     }
+                 }
+ 
 +                int m1Score = 0;
 +                bool m1ScoreReady = false;
 +
-@@ -175,2 +274,11 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                 // 2. M = P
+                 if(i > 0 && j < seq_length-1){
 -                        int score_M1 = - v_score_M1(i, j, j, nuci_1, nuci, nucj, nucj1, seq_length);
 -                        Fast_LogPlusEquals(state.beta, (beamstepM[i].beta + score_M1/kT));
 +                        m1Score = -v_score_M1_precomputed(lpPairType[nuci][nucj], nuci_1_37, nucj1_37);
@@ -1478,14 +1894,21 @@ index 26be8a9..47b55b8 100644
 +                                lpLogPlusEquals(state.beta, (mIt->second.beta + lpScoreOverKT(m1Score)));
 +                            }
 +                        }
-@@ -182,2 +290,4 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                 }
+ 
+                 // 3. M2 = M + P
+                 int k = i - 1;
+                 if ( k > 0 && !bestM[k].empty()) {
 -                    int M1_score = - v_score_M1(i, j, j, nuci_1, nuci, nucj, nucj1, seq_length);
 -                    float m1_alpha = M1_score/kT;
 +                    if (!m1ScoreReady) {
 +                        m1Score = -v_score_M1_precomputed(lpPairType[nuci][nucj], nuci_1_37, nucj1_37);
 +                    }
 +                    float m1_alpha = lpScoreOverKT(m1Score);
-@@ -188,2 +298,11 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                     float m1_plus_P_alpha = state.alpha + m1_alpha;
+                     for (auto &m : bestM[k]) {
+                         int newi = m.first;
+                         State& m_state = m.second;
 -                        Fast_LogPlusEquals(state.beta, (beamstepM2[newi].beta + m_state.alpha + m1_alpha));
 -                        Fast_LogPlusEquals(m_state.beta, (beamstepM2[newi].beta + m1_plus_P_alpha));
 +                        State *m2State = lpFindDenseKeyRaw(currentM2Ptrs, currentM2Generations, newi, currentM2Len, currentM2Generation);
@@ -1499,9 +1922,15 @@ index 26be8a9..47b55b8 100644
 +                                lpLogPlusEquals(m_state.beta, (m2It->second.beta + m1_plus_P_alpha));
 +                            }
 +                        }
-@@ -197 +315,0 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                     }
+                 }
+ 
+@@ -194,18 +313,17 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                 {
+                     int k = i - 1;
+                     if (k >= 0) {
 -                        int nuck = nuci_1;
-@@ -199,5 +317,5 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                         int nuck1 = nuci;
 -                        int score_external_paired = - v_score_external_paired(k+1, j, nuck, nuck1,
 -                                                                 nucj, nucj1, seq_length);
 -                        float external_paired_alpha_plus_beamstepC_beta = beamstepC.beta + score_external_paired/kT;
@@ -1512,18 +1941,28 @@ index 26be8a9..47b55b8 100644
 +                        float external_paired_alpha_plus_beamstepC_beta = beamstepC.beta + lpScoreOverKT(score_external_paired);
 +                        lpLogPlusEquals(bestC[k].beta, state.alpha + external_paired_alpha_plus_beamstepC_beta);
 +                        lpLogPlusEquals(state.beta, bestC[k].alpha + external_paired_alpha_plus_beamstepC_beta);
-@@ -206,3 +324,3 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                     } else {
+                         // value_type newscore;
 -                        int score_external_paired = - v_score_external_paired(0, j, -1, nucs[0],
 -                                                                 nucj, nucj1, seq_length);
 -                        Fast_LogPlusEquals(state.beta, (beamstepC.beta + score_external_paired/kT));
 +                        int score_external_paired = -v_score_external_paired_precomputed(lpPairType[nucs[0]][nucj],
 +                                                                 -1, nucj1_37);
 +                        lpLogPlusEquals(state.beta, (beamstepC.beta + lpScoreOverKT(score_external_paired)));
-@@ -223,2 +341 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                     }
+                 }
+ 
+@@ -220,29 +338,39 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                 State& state = item.second;
+ 
+                 int nuci = nucs[i];
 -                int nuci1 = nucs[i+1];
 -                int jnext = next_pair[nuci][j];
 +                int jnext = next_pair_rows[nuci][j];
-@@ -229 +346,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+ 
+                 // 1. extend (i, j) to (i, jnext)
+                 {
+                     if (jnext != -1) {
 -                        Fast_LogPlusEquals(state.beta, (bestMulti[jnext][i].beta));
 +                        State *multiNextState = lpFindDenseMatrixRaw(multiLookupPtrs, multiLookupGenerations, jnext, i, seq_length, multiLookupGeneration);
 +                        if (multiNextState != NULL) {
@@ -1534,7 +1973,11 @@ index 26be8a9..47b55b8 100644
 +                                lpLogPlusEquals(state.beta, multiNextIt->second.beta);
 +                            }
 +                        }
-@@ -235,3 +360,9 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                     }
+                 }
+ 
+                 // 2. generate P (i, j)
+                 {
 -                    int score_multi = - v_score_multi(i, j, nuci, nuci1, nucs[j-1], nucj, seq_length);
 -                    if (beamstepP.find(i) == beamstepP.end()) continue;
 -                    Fast_LogPlusEquals(state.beta, (beamstepP[i].beta + score_multi/kT));
@@ -1547,7 +1990,14 @@ index 26be8a9..47b55b8 100644
 +                        if (pIt == beamstepP.end()) continue;
 +                        lpLogPlusEquals(state.beta, (pIt->second.beta + lpScoreOverKT(score_multi)));
 +                    }
-@@ -243,3 +373,0 @@ void BeamCKYParser::outside(LinearTurboFold* outer, int i_seq, int i_iter, vecto
+                 }
+             }
+         }
+     }  // end of for-loo j
+ 
 -    gettimeofday(&parse_endtime, NULL);
 -    double parse_elapsed_time = parse_endtime.tv_sec - parse_starttime.tv_sec + (parse_endtime.tv_usec-parse_starttime.tv_usec)/1000000.0;
 -
+     return;
+ }
+ 
