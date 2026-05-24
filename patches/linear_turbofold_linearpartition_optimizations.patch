@@ -1,5 +1,5 @@
 diff --git a/src/LinearPartition/src/LinearPartition.cpp b/src/LinearPartition/src/LinearPartition.cpp
-index 4002764..592e691 100644
+index 4002764..3350829 100644
 --- a/src/LinearPartition/src/LinearPartition.cpp
 +++ b/src/LinearPartition/src/LinearPartition.cpp
 @@ -1,7 +1,7 @@
@@ -194,7 +194,7 @@ index 4002764..592e691 100644
 +}
 +
 +static inline void lpLogPlusAlpha(std::unordered_map<int, State> &beamstep, int key, float value) {
-+    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.try_emplace(key, value);
++    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.emplace(key, value);
 +    if (!inserted.second) {
 +        lpLogPlusEquals(inserted.first->second.alpha, value);
 +    }
@@ -236,7 +236,7 @@ index 4002764..592e691 100644
 +        return;
 +    }
 +
-+    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.try_emplace(key, value);
++    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.emplace(key, value);
 +    if (!inserted.second) {
 +        lpLogPlusEquals(inserted.first->second.alpha, value);
 +    }
@@ -299,7 +299,7 @@ index 4002764..592e691 100644
 +        }
 +
 +        std::unordered_map<int, State> &beamstep = pfscore[q];
-+        std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.try_emplace(key, value);
++        std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.emplace(key, value);
 +        if (!inserted.second) {
 +            lpLogPlusEquals(inserted.first->second.alpha, value);
 +        }
@@ -460,7 +460,7 @@ index 4002764..592e691 100644
 +                return;
 +            }
 +
-+            std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.try_emplace(key, value);
++            std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstep.emplace(key, value);
 +            if (!inserted.second) {
 +                lpLogPlusEquals(inserted.first->second.alpha, value);
 +            }
@@ -827,7 +827,7 @@ index 4002764..592e691 100644
 +                                lpLogPlusEqualsFinite(multiDensePtrs[idx]->alpha, state.alpha);
 +                            } else {
 +                                std::unordered_map<int, State> &targetBeamstep = bestMulti[jnext];
-+                                std::pair<std::unordered_map<int, State>::iterator, bool> inserted = targetBeamstep.try_emplace(i, state.alpha);
++                                std::pair<std::unordered_map<int, State>::iterator, bool> inserted = targetBeamstep.emplace(i, state.alpha);
 +                                if (!inserted.second) {
 +                                    lpLogPlusEquals(inserted.first->second.alpha, state.alpha);
 +                                }
@@ -937,7 +937,7 @@ index 4002764..592e691 100644
 +                                    lpLogPlusEqualsFinite(denseAlphaPtrs[idx]->alpha, updateAlpha);
 +                                } else {
 +                                    std::unordered_map<int, State> &targetBeamstep = pfscore[q];
-+                                    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = targetBeamstep.try_emplace(p, updateAlpha);
++                                    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = targetBeamstep.emplace(p, updateAlpha);
 +                                    if (!inserted.second) {
 +                                        lpLogPlusEquals(inserted.first->second.alpha, updateAlpha);
 +                                    }
@@ -988,7 +988,7 @@ index 4002764..592e691 100644
 +                            if (LP_LIKELY(denseKeyGensA[idx] == beamstepMIndexGeneration)) {
 +                                lpLogPlusEqualsFinite(denseKeyPtrsA[idx]->alpha, mAlpha);
 +                            } else {
-+                                std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstepM.try_emplace(i, mAlpha);
++                                std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstepM.emplace(i, mAlpha);
 +                                if (!inserted.second) {
 +                                    lpLogPlusEquals(inserted.first->second.alpha, mAlpha);
 +                                }
@@ -1023,7 +1023,7 @@ index 4002764..592e691 100644
 +                            if (LP_LIKELY(denseKeyGensB[idx] == beamstepM2IndexGeneration)) {
 +                                lpLogPlusEqualsFinite(denseKeyPtrsB[idx]->alpha, m2Alpha);
 +                            } else {
-+                                std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstepM2.try_emplace(newi, m2Alpha);
++                                std::pair<std::unordered_map<int, State>::iterator, bool> inserted = beamstepM2.emplace(newi, m2Alpha);
 +                                if (!inserted.second) {
 +                                    lpLogPlusEquals(inserted.first->second.alpha, m2Alpha);
 +                                }
@@ -1104,7 +1104,7 @@ index 4002764..592e691 100644
 +                                    lpLogPlusEqualsFinite(multiDensePtrs[idx]->alpha, state.alpha);
 +                                } else {
 +                                    std::unordered_map<int, State> &targetBeamstep = bestMulti[q];
-+                                    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = targetBeamstep.try_emplace(p, state.alpha);
++                                    std::pair<std::unordered_map<int, State>::iterator, bool> inserted = targetBeamstep.emplace(p, state.alpha);
 +                                    if (!inserted.second) {
 +                                        lpLogPlusEquals(inserted.first->second.alpha, state.alpha);
 +                                    }
@@ -1138,7 +1138,7 @@ index 4002764..592e691 100644
                  State& state = item.second;
                  if (j < seq_length-1) {
 -                    Fast_LogPlusEquals(bestM[j+1][i].alpha, state.alpha); 
-+                    bestM[j+1].try_emplace(i, state.alpha);
++                    bestM[j+1].emplace(i, state.alpha);
                  }
              }
 +            if (detailTiming) {
