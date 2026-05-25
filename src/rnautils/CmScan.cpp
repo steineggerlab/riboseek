@@ -9146,6 +9146,7 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
     const float filterCov = parseEnvFloatLocal("MMSEQS_LOLCMSEARCH_FILTER_COV", 0.0f);
     const float filterQsc = parseEnvFloatLocal("MMSEQS_LOLCMSEARCH_FILTER_QSC", -20.0f);
     const int filterDiff = std::max(0, parseEnvIntLocal("MMSEQS_LOLCMSEARCH_FILTER_DIFF", 100000));
+    const int subcommandVerbosity = parseEnvIntLocal("MMSEQS_LOLCMSEARCH_STEP_VERBOSITY", 3);
     const int rescorePad = std::max(0, parseEnvIntLocal("MMSEQS_CMSCAN_RESCORE_PAD", 5));
 
     const bool userTmpDir = !par.lolcmsearchTmpDir.empty();
@@ -9302,7 +9303,7 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
             args.push_back("--threads");
             args.push_back(SSTR(std::max(1, par.threads)));
             args.push_back("-v");
-            args.push_back("0");
+            args.push_back(SSTR(subcommandVerbosity));
             std::string err;
             if (!runExternalCommand(args, std::vector<std::pair<std::string, std::string>>(), err)) {
                 cleanup();
@@ -9346,7 +9347,7 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
             args.push_back("--threads");
             args.push_back(SSTR(std::max(1, par.threads)));
             args.push_back("-v");
-            args.push_back("0");
+            args.push_back(SSTR(subcommandVerbosity));
             std::string err;
             if (!runExternalCommand(args, std::vector<std::pair<std::string, std::string>>(), err)) {
                 cleanup();
@@ -9388,7 +9389,7 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
             args.push_back("--threads");
             args.push_back(SSTR(std::max(1, par.threads)));
             args.push_back("-v");
-            args.push_back("0");
+            args.push_back(SSTR(subcommandVerbosity));
             std::vector<std::pair<std::string, std::string>> env;
             env.push_back(std::make_pair("MMSEQS_LOLALIGN_ACCEPT_ALL", "1"));
             env.push_back(std::make_pair("MMSEQS_LOLALIGN_DEDUP_ROWS", "0"));

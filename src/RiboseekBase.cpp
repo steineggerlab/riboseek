@@ -74,6 +74,7 @@ std::vector<Command> riboseekCommands = {
             "  MMSEQS_LOLCMSEARCH_RESUME=0|1\n"
             "  MMSEQS_LOLCMSEARCH_RESUME_UNMARKED=0|1\n"
             "  MMSEQS_LOLCMSEARCH_FORCE=1\n"
+            "  MMSEQS_LOLCMSEARCH_STEP_VERBOSITY=N (default: 3)\n"
             "  MMSEQS_LOLALIGN_MEMORY_GUARD=0|1\n"
             "  MMSEQS_LOLALIGN_MEMORY_BUDGET_MB=N\n"
             "  MMSEQS_LOLALIGN_MEMORY_FRACTION=F (default: 0.8 * MemAvailable)\n"
