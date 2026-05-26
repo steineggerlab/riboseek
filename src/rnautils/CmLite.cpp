@@ -10,6 +10,13 @@
 #include "SubstitutionMatrix.h"
 #include "commons/DinucleotideMapping.h"
 #include "commons/RNAFoldBridge.h"
+#ifdef HAVE_RNAFOLD_PREDICT
+extern "C" {
+#include <ViennaRNA/fold_compound.h>
+#include <ViennaRNA/model.h>
+#include <ViennaRNA/partfunc/local.h>
+}
+#endif
 #ifdef HAVE_INFERNAL_BRIDGE
 #include "infernal/InfernalBridge.h"
 #endif
@@ -31,6 +38,8 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -54,10 +63,18 @@ struct StructVec {
     StructVec(float uu, float ll, float rr) : u(uu), l(ll), r(rr) {}
 };
 
+struct SparsePairMatrix {
+    int len = 0;
+    std::vector<int> rowOffsets;
+    std::vector<int> cols;
+    std::vector<float> probs;
+};
+
 struct FoldResult {
     std::vector<StructVec> structVec;
     std::vector<int> partners;
     std::vector<float> pairMatrix;
+    std::shared_ptr<const SparsePairMatrix> sparsePairMatrix;
     std::string backendUsed;
 };
 
@@ -75,6 +92,8 @@ struct WindowInfo {
     std::vector<StructVec> structVec;
     std::vector<int> partners;
     std::vector<float> pairMatrix;
+    std::shared_ptr<const std::vector<float>> pairMatrixRef;
+    std::shared_ptr<const SparsePairMatrix> sparsePairMatrix;
     int fullLo = 0;
     int fullHi = -1;
     bool reverseStrand = false;
@@ -82,10 +101,138 @@ struct WindowInfo {
     int localSeedEnd = 0;
 };
 
+static std::shared_ptr<const SparsePairMatrix> makeSparsePairMatrix(int len,
+                                                                     const std::vector<RnaPairProbability> &pairs) {
+    if (len <= 0) {
+        return std::shared_ptr<const SparsePairMatrix>();
+    }
+    std::shared_ptr<SparsePairMatrix> matrix(new SparsePairMatrix());
+    matrix->len = len;
+    matrix->rowOffsets.assign(static_cast<size_t>(len + 1), 0);
+    for (size_t k = 0; k < pairs.size(); ++k) {
+        const RnaPairProbability &pair = pairs[k];
+        if (pair.i < 0 || pair.j < 0 || pair.i >= len || pair.j >= len || pair.i == pair.j || pair.p <= 0.0f) {
+            continue;
+        }
+        matrix->rowOffsets[static_cast<size_t>(pair.i + 1)]++;
+        matrix->rowOffsets[static_cast<size_t>(pair.j + 1)]++;
+    }
+    for (int i = 1; i <= len; ++i) {
+        matrix->rowOffsets[static_cast<size_t>(i)] += matrix->rowOffsets[static_cast<size_t>(i - 1)];
+    }
+    const int total = matrix->rowOffsets[static_cast<size_t>(len)];
+    matrix->cols.assign(static_cast<size_t>(total), 0);
+    matrix->probs.assign(static_cast<size_t>(total), 0.0f);
+    std::vector<int> cursor = matrix->rowOffsets;
+    for (size_t k = 0; k < pairs.size(); ++k) {
+        const RnaPairProbability &pair = pairs[k];
+        if (pair.i < 0 || pair.j < 0 || pair.i >= len || pair.j >= len || pair.i == pair.j || pair.p <= 0.0f) {
+            continue;
+        }
+        int pos = cursor[static_cast<size_t>(pair.i)]++;
+        matrix->cols[static_cast<size_t>(pos)] = pair.j;
+        matrix->probs[static_cast<size_t>(pos)] = pair.p;
+        pos = cursor[static_cast<size_t>(pair.j)]++;
+        matrix->cols[static_cast<size_t>(pos)] = pair.i;
+        matrix->probs[static_cast<size_t>(pos)] = pair.p;
+    }
+    for (int row = 0; row < len; ++row) {
+        const int begin = matrix->rowOffsets[static_cast<size_t>(row)];
+        const int end = matrix->rowOffsets[static_cast<size_t>(row + 1)];
+        if (end - begin <= 1) {
+            continue;
+        }
+        std::vector<std::pair<int, float> > tmp;
+        tmp.reserve(static_cast<size_t>(end - begin));
+        for (int pidx = begin; pidx < end; ++pidx) {
+            tmp.push_back(std::make_pair(matrix->cols[static_cast<size_t>(pidx)],
+                                         matrix->probs[static_cast<size_t>(pidx)]));
+        }
+        std::sort(tmp.begin(), tmp.end(),
+                  [](const std::pair<int, float> &a, const std::pair<int, float> &b) {
+                      return a.first < b.first;
+                  });
+        for (size_t idx = 0; idx < tmp.size(); ++idx) {
+            matrix->cols[static_cast<size_t>(begin) + idx] = tmp[idx].first;
+            matrix->probs[static_cast<size_t>(begin) + idx] = tmp[idx].second;
+        }
+    }
+    return matrix;
+}
+
+static float sparsePairMatrixAt(const SparsePairMatrix &matrix, int i, int j) {
+    if (i < 0 || j < 0 || i >= matrix.len || j >= matrix.len || matrix.rowOffsets.size() != static_cast<size_t>(matrix.len + 1)) {
+        return 0.0f;
+    }
+    const int begin = matrix.rowOffsets[static_cast<size_t>(i)];
+    const int end = matrix.rowOffsets[static_cast<size_t>(i + 1)];
+    const std::vector<int>::const_iterator first = matrix.cols.begin() + begin;
+    const std::vector<int>::const_iterator last = matrix.cols.begin() + end;
+    const std::vector<int>::const_iterator it = std::lower_bound(first, last, j);
+    if (it == last || *it != j) {
+        return 0.0f;
+    }
+    return matrix.probs[static_cast<size_t>(it - matrix.cols.begin())];
+}
+
+static std::vector<float> sparsePairMatrixToDense(const SparsePairMatrix &matrix) {
+    std::vector<float> dense(static_cast<size_t>(std::max(0, matrix.len * matrix.len)), 0.0f);
+    if (matrix.len <= 0 || matrix.rowOffsets.size() != static_cast<size_t>(matrix.len + 1)) {
+        return dense;
+    }
+    for (int row = 0; row < matrix.len; ++row) {
+        for (int idx = matrix.rowOffsets[static_cast<size_t>(row)]; idx < matrix.rowOffsets[static_cast<size_t>(row + 1)]; ++idx) {
+            dense[static_cast<size_t>(row * matrix.len + matrix.cols[static_cast<size_t>(idx)])] = matrix.probs[static_cast<size_t>(idx)];
+        }
+    }
+    return dense;
+}
+
 static void clearWindowStructure(WindowInfo &window) {
     std::vector<StructVec>().swap(window.structVec);
     std::vector<int>().swap(window.partners);
     std::vector<float>().swap(window.pairMatrix);
+    window.pairMatrixRef.reset();
+    window.sparsePairMatrix.reset();
+}
+
+static void clearWindowMaterialized(WindowInfo &window) {
+    clearWindowStructure(window);
+    std::string().swap(window.seq);
+}
+
+static bool windowBoundsValid(const WindowInfo &window) {
+    return window.fullHi >= window.fullLo && window.fullLo >= 0;
+}
+
+static const std::vector<float> *windowPairMatrixPtr(const WindowInfo &window) {
+    if (!window.pairMatrix.empty()) {
+        return &window.pairMatrix;
+    }
+    if (window.pairMatrixRef && !window.pairMatrixRef->empty()) {
+        return window.pairMatrixRef.get();
+    }
+    return NULL;
+}
+
+static bool windowHasPairMatrix(const WindowInfo &window) {
+    return windowPairMatrixPtr(window) != NULL
+        || (window.sparsePairMatrix && !window.sparsePairMatrix->probs.empty());
+}
+
+static float windowPairMatrixAt(const WindowInfo &window, int i, int j) {
+    const int targetLen = static_cast<int>(window.seq.size());
+    if (i < 0 || j < 0 || i >= targetLen || j >= targetLen) {
+        return 0.0f;
+    }
+    const std::vector<float> *pairMatrix = windowPairMatrixPtr(window);
+    if (pairMatrix != NULL && pairMatrix->size() == static_cast<size_t>(targetLen * targetLen)) {
+        return (*pairMatrix)[static_cast<size_t>(i * targetLen + j)];
+    }
+    if (window.sparsePairMatrix && window.sparsePairMatrix->len == targetLen) {
+        return sparsePairMatrixAt(*window.sparsePairMatrix, i, j);
+    }
+    return 0.0f;
 }
 
 struct ProjectedAlignment {
@@ -135,6 +282,11 @@ struct StructureSettings {
     int minLoop = 3;
     int linearfoldMinLength = 128;
     int linearfoldBeamSize = 100;
+    int rnaPlfoldWindow = 0;
+    int rnaPlfoldSpan = 0;
+    bool keepPairMatrix = true;
+    bool sparsePairMatrix = false;
+    bool dotBracketOnly = false;
 };
 
 struct StemGuide {
@@ -384,6 +536,48 @@ static std::vector<StructVec> pairMatrixToStructVec(const std::vector<float> &pa
     return out;
 }
 
+static std::vector<StructVec> sparsePairMatrixToStructVec(const SparsePairMatrix &pairMatrix,
+                                                          const std::vector<int> &partners,
+                                                          int len) {
+    std::vector<StructVec> out(static_cast<size_t>(len), StructVec(1.0f, 0.0f, 0.0f));
+    if (len <= 0 || pairMatrix.len != len || pairMatrix.rowOffsets.size() != static_cast<size_t>(len + 1)) {
+        return out;
+    }
+    for (int i = 0; i < len; ++i) {
+        float leftMass = 0.0f;
+        float rightMass = 0.0f;
+        for (int idx = pairMatrix.rowOffsets[static_cast<size_t>(i)]; idx < pairMatrix.rowOffsets[static_cast<size_t>(i + 1)]; ++idx) {
+            const int j = pairMatrix.cols[static_cast<size_t>(idx)];
+            const float prob = pairMatrix.probs[static_cast<size_t>(idx)];
+            if (prob <= 0.0f) {
+                continue;
+            }
+            if (j < i) {
+                leftMass += prob;
+            } else if (j > i) {
+                rightMass += prob;
+            }
+        }
+        float paired = leftMass + rightMass;
+        if (paired > 1.0f && paired > 0.0f) {
+            const float scale = 1.0f / paired;
+            leftMass *= scale;
+            rightMass *= scale;
+            paired = 1.0f;
+        }
+        out[static_cast<size_t>(i)] = StructVec(1.0f - paired, leftMass, rightMass);
+        if (partners.size() == static_cast<size_t>(len) && partners[static_cast<size_t>(i)] >= 0) {
+            if (partners[static_cast<size_t>(i)] < i) {
+                out[static_cast<size_t>(i)].l = std::max(out[static_cast<size_t>(i)].l, 0.5f);
+            } else {
+                out[static_cast<size_t>(i)].r = std::max(out[static_cast<size_t>(i)].r, 0.5f);
+            }
+            out[static_cast<size_t>(i)].u = std::min(out[static_cast<size_t>(i)].u, 0.5f);
+        }
+    }
+    return out;
+}
+
 static float basePreferenceFromProfile(const std::array<float, 4> &column,
                                        int base) {
     if (base < 0) {
@@ -446,8 +640,9 @@ static float scoreStemModuleAt(const StemPattern &pat,
         }
         canonical += isCanonicalPair(lb, rb) ? 1.0f : 0.0f;
 
-        if (!window.pairMatrix.empty()) {
-            pairStruct += window.pairMatrix[static_cast<size_t>(tl * targetLen + tr)];
+        const float pairProb = windowPairMatrixAt(window, tl, tr);
+        if (pairProb > 0.0f) {
+            pairStruct += pairProb;
         } else if (window.partners.size() == static_cast<size_t>(targetLen)
                    && window.partners[static_cast<size_t>(tl)] == tr) {
             pairStruct += 1.0f;
@@ -503,10 +698,10 @@ static std::vector<float> buildPairSupportMatrix(int qLen,
                     continue;
                 }
                 float support = 0.0f;
-                if (!cand.window.pairMatrix.empty()) {
-                    support = cand.window.pairMatrix[static_cast<size_t>(ti * targetLen + tj)];
-                } else if (cand.window.partners.size() == static_cast<size_t>(targetLen)
-                           && cand.window.partners[static_cast<size_t>(ti)] == tj) {
+                support = windowPairMatrixAt(cand.window, ti, tj);
+                if (support <= 0.0f
+                    && cand.window.partners.size() == static_cast<size_t>(targetLen)
+                    && cand.window.partners[static_cast<size_t>(ti)] == tj) {
                     support = 1.0f;
                 }
                 if (support <= 0.0f) {
@@ -615,6 +810,187 @@ static bool hasAnyPartners(const std::vector<int> &partners) {
     return false;
 }
 
+static bool pairCrossesAccepted(int i,
+                                int j,
+                                const std::vector<std::pair<int, int>> &accepted) {
+    for (size_t k = 0; k < accepted.size(); ++k) {
+        const int a = accepted[k].first;
+        const int b = accepted[k].second;
+        if ((i < a && a < j && j < b) || (a < i && i < b && b < j)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::vector<int> derivePartnersFromDensePairMatrix(const std::vector<float> &pairMatrix,
+                                                          int len,
+                                                          int minLoop,
+                                                          float minPairProb) {
+    std::vector<int> partners(static_cast<size_t>(std::max(0, len)), -1);
+    if (len <= 1 || pairMatrix.size() != static_cast<size_t>(len * len)) {
+        return partners;
+    }
+
+    std::vector<float> rowMax(static_cast<size_t>(len), 0.0f);
+    for (int i = 0; i < len; ++i) {
+        for (int j = i + minLoop + 1; j < len; ++j) {
+            const float p = pairMatrix[static_cast<size_t>(i * len + j)];
+            if (p <= 0.0f) {
+                continue;
+            }
+            rowMax[static_cast<size_t>(i)] = std::max(rowMax[static_cast<size_t>(i)], p);
+            rowMax[static_cast<size_t>(j)] = std::max(rowMax[static_cast<size_t>(j)], p);
+        }
+    }
+
+    struct PairCandidateLocal {
+        int i;
+        int j;
+        float p;
+    };
+    std::vector<PairCandidateLocal> candidates;
+    candidates.reserve(static_cast<size_t>(len));
+    const float eps = 1e-6f;
+    for (int i = 0; i < len; ++i) {
+        for (int j = i + minLoop + 1; j < len; ++j) {
+            const float p = pairMatrix[static_cast<size_t>(i * len + j)];
+            if (p < minPairProb || p <= 0.0f) {
+                continue;
+            }
+            if ((p + eps) < rowMax[static_cast<size_t>(i)] || (p + eps) < rowMax[static_cast<size_t>(j)]) {
+                continue;
+            }
+            PairCandidateLocal cand;
+            cand.i = i;
+            cand.j = j;
+            cand.p = p;
+            candidates.push_back(cand);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const PairCandidateLocal &a, const PairCandidateLocal &b) {
+                  if (a.p != b.p) {
+                      return a.p > b.p;
+                  }
+                  if (a.i != b.i) {
+                      return a.i < b.i;
+                  }
+                  return a.j < b.j;
+              });
+
+    std::vector<std::pair<int, int>> accepted;
+    accepted.reserve(static_cast<size_t>(len / 2));
+    for (size_t idx = 0; idx < candidates.size(); ++idx) {
+        const PairCandidateLocal &cand = candidates[idx];
+        if (partners[static_cast<size_t>(cand.i)] != -1 || partners[static_cast<size_t>(cand.j)] != -1) {
+            continue;
+        }
+        if (pairCrossesAccepted(cand.i, cand.j, accepted)) {
+            continue;
+        }
+        partners[static_cast<size_t>(cand.i)] = cand.j;
+        partners[static_cast<size_t>(cand.j)] = cand.i;
+        accepted.push_back(std::make_pair(cand.i, cand.j));
+    }
+    return partners;
+}
+
+#ifdef HAVE_RNAFOLD_PREDICT
+struct CmLitePlfoldAccumulator {
+    std::vector<StructVec> *structVec;
+    std::vector<float> *pairMatrix;
+    int len;
+};
+
+static void accumulateCmLitePlfoldPairs(FLT_OR_DBL *pr,
+                                        int prSize,
+                                        int i,
+                                        int /*max*/,
+                                        unsigned int type,
+                                        void *data) {
+    if ((type & VRNA_PROBS_WINDOW_BPP) == 0U) {
+        return;
+    }
+    CmLitePlfoldAccumulator *acc = static_cast<CmLitePlfoldAccumulator *>(data);
+    if (acc == NULL || acc->structVec == NULL || acc->pairMatrix == NULL || i <= 0 || i > acc->len) {
+        return;
+    }
+    std::vector<StructVec> &vec = *acc->structVec;
+    std::vector<float> &pairMatrix = *acc->pairMatrix;
+    const int len = acc->len;
+    for (int j = i + 1; j <= prSize && j <= len; ++j) {
+        const float p = static_cast<float>(pr[j]);
+        if (p <= 0.0f || std::isnan(p)) {
+            continue;
+        }
+        vec[static_cast<size_t>(i - 1)].r += p;
+        vec[static_cast<size_t>(j - 1)].l += p;
+        pairMatrix[static_cast<size_t>((i - 1) * len + (j - 1))] = p;
+        pairMatrix[static_cast<size_t>((j - 1) * len + (i - 1))] = p;
+    }
+}
+
+static bool rnaPlfoldPredictDense(const std::string &seq,
+                                  int minLoop,
+                                  int windowSize,
+                                  int maxBpSpan,
+                                  std::vector<StructVec> &structVec,
+                                  std::vector<int> &partners,
+                                  std::vector<float> &pairMatrix) {
+    structVec.clear();
+    partners.clear();
+    pairMatrix.clear();
+    if (seq.empty()) {
+        return false;
+    }
+    const int len = static_cast<int>(seq.size());
+    vrna_md_t md;
+    vrna_md_set_default(&md);
+    md.compute_bpp = 1;
+    md.window_size = (windowSize > 0) ? std::min(windowSize, len) : len;
+    md.max_bp_span = (maxBpSpan > 0) ? std::min(maxBpSpan, md.window_size) : md.window_size;
+
+    vrna_fold_compound_t *fc = vrna_fold_compound(seq.c_str(), &md, VRNA_OPTION_PF | VRNA_OPTION_WINDOW);
+    if (fc == NULL) {
+        return false;
+    }
+
+    structVec.assign(static_cast<size_t>(len), StructVec(0.0f, 0.0f, 0.0f));
+    pairMatrix.assign(static_cast<size_t>(len * len), 0.0f);
+    CmLitePlfoldAccumulator acc = { &structVec, &pairMatrix, len };
+    const int ok = vrna_probs_window(fc, 0, VRNA_PROBS_WINDOW_BPP, &accumulateCmLitePlfoldPairs, &acc);
+    vrna_fold_compound_free(fc);
+    if (!ok) {
+        structVec.clear();
+        pairMatrix.clear();
+        return false;
+    }
+
+    for (size_t idx = 0; idx < structVec.size(); ++idx) {
+        float l = std::max(0.0f, structVec[idx].l);
+        float r = std::max(0.0f, structVec[idx].r);
+        float paired = l + r;
+        if (paired > 1.0f && paired > 0.0f) {
+            const float scale = 1.0f / paired;
+            l *= scale;
+            r *= scale;
+            paired = 1.0f;
+        }
+        structVec[idx].l = l;
+        structVec[idx].r = r;
+        structVec[idx].u = 1.0f - paired;
+    }
+
+    const float minPairProb = clampf(parseEnvFloat("MMSEQS_LOLALIGN_RNAPLFOLD_MIN_PAIR_PROB", 0.0f), 0.0f, 1.0f);
+    partners = derivePartnersFromDensePairMatrix(pairMatrix, len, minLoop, minPairProb);
+    if (hasAnyPartners(partners)) {
+        structVec = pairMatrixToStructVec(pairMatrix, partners, len);
+    }
+    return true;
+}
+#endif
+
 static std::string chooseStructureBackend(const StructureSettings &settings,
                                           int seqLen,
                                           bool hasUnknownResidues) {
@@ -655,8 +1031,60 @@ static FoldResult foldSequenceStructure(const std::string &seq,
     const std::string backend = chooseStructureBackend(settings,
                                                        static_cast<int>(normalized.size()),
                                                        hasUnknown);
-    if (backend == "linearfold") {
+    if (backend == "rnaplfold" || backend == "plfold") {
+#ifdef HAVE_RNAFOLD_PREDICT
+        std::vector<StructVec> plfoldStruct;
+        std::vector<int> plfoldPartners;
+        std::vector<float> plfoldPairMatrix;
+        if (rnaPlfoldPredictDense(normalized,
+                                  settings.minLoop,
+                                  settings.rnaPlfoldWindow,
+                                  settings.rnaPlfoldSpan,
+                                  plfoldStruct,
+                                  plfoldPartners,
+                                  plfoldPairMatrix)
+            && plfoldStruct.size() == normalized.size()
+            && plfoldPartners.size() == normalized.size()
+            && plfoldPairMatrix.size() == normalized.size() * normalized.size()) {
+            out.backendUsed = "rnaplfold";
+            out.structVec.swap(plfoldStruct);
+            out.partners.swap(plfoldPartners);
+            if (settings.keepPairMatrix) {
+                out.pairMatrix.swap(plfoldPairMatrix);
+            }
+            return out;
+        }
+#endif
+    }
+    if (backend == "linearfold" || backend == "partition") {
         std::string dot;
+        const bool useSparsePairMatrix = settings.keepPairMatrix && settings.sparsePairMatrix && !settings.dotBracketOnly;
+        if (useSparsePairMatrix) {
+            std::vector<RnaPairProbability> sparsePairs;
+            if (rnaLinearPartitionPredictSparse(normalized,
+                                                settings.minLoop,
+                                                settings.linearfoldBeamSize,
+                                                dot,
+                                                sparsePairs)
+                && dot.size() == normalized.size()) {
+                out.backendUsed = "linearfold";
+                out.partners = dotBracketToPartners(dot);
+                std::shared_ptr<const SparsePairMatrix> sparsePairMatrix = makeSparsePairMatrix(static_cast<int>(normalized.size()), sparsePairs);
+                if (backend == "partition") {
+                    out.backendUsed = "partition";
+                    out.structVec.clear();
+                } else if (sparsePairMatrix) {
+                    out.structVec = sparsePairMatrixToStructVec(*sparsePairMatrix,
+                                                                out.partners,
+                                                                static_cast<int>(normalized.size()));
+                }
+                if (settings.keepPairMatrix) {
+                    out.sparsePairMatrix = sparsePairMatrix;
+                }
+                return out;
+            }
+        }
+
         std::vector<float> pairMatrix;
         if (rnaLinearPartitionPredict(normalized,
                                       settings.minLoop,
@@ -667,10 +1095,19 @@ static FoldResult foldSequenceStructure(const std::string &seq,
             && pairMatrix.size() == normalized.size() * normalized.size()) {
             out.backendUsed = "linearfold";
             out.partners = dotBracketToPartners(dot);
-            out.pairMatrix.swap(pairMatrix);
-            out.structVec = pairMatrixToStructVec(out.pairMatrix,
-                                                  out.partners,
-                                                  static_cast<int>(normalized.size()));
+            if (backend == "partition") {
+                out.backendUsed = "partition";
+                out.structVec.clear();
+            } else if (settings.dotBracketOnly) {
+                out.structVec = dotBracketToStructVec(dot);
+            } else {
+                out.structVec = pairMatrixToStructVec(pairMatrix,
+                                                      out.partners,
+                                                      static_cast<int>(normalized.size()));
+            }
+            if (settings.keepPairMatrix && !settings.dotBracketOnly) {
+                out.pairMatrix.swap(pairMatrix);
+            }
             return out;
         }
     }
@@ -685,6 +1122,7 @@ static FoldResult foldSequenceStructure(const std::string &seq,
     }
     return out;
 }
+
 
 static unsigned long long lolalignAvailableMemoryBytes() {
     std::ifstream in("/proc/meminfo");
@@ -733,13 +1171,23 @@ static unsigned long long scaleBytes(unsigned long long bytes, float scale) {
     return static_cast<unsigned long long>(scaled);
 }
 
-static bool lolalignDensePairLikely(const StructureSettings &settings, size_t len) {
+static bool lolalignDensePairRetained(const StructureSettings &settings) {
+    return settings.keepPairMatrix && !settings.sparsePairMatrix && !settings.dotBracketOnly;
+}
+
+static bool lolalignDensePairScratchLikely(const StructureSettings &settings, size_t len) {
     if (len == 0) {
         return false;
     }
     const std::string &backend = settings.backend;
     if (backend == "canonical" || backend == "rnafold") {
         return false;
+    }
+    if (backend == "rnaplfold" || backend == "plfold") {
+        return true;
+    }
+    if (backend == "linearfold" || backend == "partition") {
+        return !(settings.keepPairMatrix && settings.sparsePairMatrix && !settings.dotBracketOnly);
     }
     if (backend == "auto") {
         return static_cast<int>(len) >= settings.linearfoldMinLength;
@@ -755,7 +1203,7 @@ static unsigned long long lolalignLinearFoldBytesForLength(size_t len) {
 
 static unsigned long long lolalignRetainedFoldBytes(size_t len, const StructureSettings &settings) {
     unsigned long long bytes = lolalignLinearFoldBytesForLength(len);
-    if (lolalignDensePairLikely(settings, len)) {
+    if (lolalignDensePairRetained(settings)) {
         bytes = saturatingAddBytes(bytes, densePairMatrixBytesForLength(len));
     }
     return bytes;
@@ -765,7 +1213,7 @@ static unsigned long long lolalignScratchFoldBytes(size_t len,
                                                    const StructureSettings &settings,
                                                    float scratchMultiplier) {
     unsigned long long bytes = lolalignLinearFoldBytesForLength(len);
-    if (lolalignDensePairLikely(settings, len)) {
+    if (lolalignDensePairScratchLikely(settings, len)) {
         bytes = saturatingAddBytes(bytes, scaleBytes(densePairMatrixBytesForLength(len), scratchMultiplier));
     }
     return bytes;
@@ -1410,11 +1858,10 @@ static AlignmentResult rawAlignmentFromCandidate(const std::string &querySeq,
     return coarseSeedAlignmentFromCandidate(querySeq, cand);
 }
 
-static WindowInfo buildWindowFromRaw(const char *targetData,
-                                     unsigned int tLen,
-                                     const OrientedHit &hit,
-                                     int qLen,
-                                     float flankFrac) {
+static WindowInfo buildWindowMetadataFromRaw(unsigned int tLen,
+                                             const OrientedHit &hit,
+                                             int qLen,
+                                             float flankFrac) {
     WindowInfo w;
     w.reverseStrand = hit.reverseStrand;
     const int dbLo = std::min(hit.dbStart, hit.dbEnd);
@@ -1432,6 +1879,22 @@ static WindowInfo buildWindowFromRaw(const char *targetData,
         return w;
     }
 
+    if (!w.reverseStrand) {
+        w.localSeedStart = hit.dbStart - w.fullLo;
+        w.localSeedEnd = hit.dbEnd - w.fullLo;
+    } else {
+        w.localSeedStart = w.fullHi - hit.dbStart;
+        w.localSeedEnd = w.fullHi - hit.dbEnd;
+    }
+    return w;
+}
+
+static void fillWindowSequenceFromTarget(WindowInfo &w, const char *targetData) {
+    std::string().swap(w.seq);
+    if (!windowBoundsValid(w)) {
+        return;
+    }
+
     const int winLen = w.fullHi - w.fullLo + 1;
     w.seq.reserve(static_cast<size_t>(winLen));
     if (!w.reverseStrand) {
@@ -1442,16 +1905,43 @@ static WindowInfo buildWindowFromRaw(const char *targetData,
             }
             w.seq.push_back(c);
         }
-        w.localSeedStart = hit.dbStart - w.fullLo;
-        w.localSeedEnd = hit.dbEnd - w.fullLo;
     } else {
         for (int pos = w.fullHi; pos >= w.fullLo; --pos) {
             w.seq.push_back(complementBase(targetData[pos]));
         }
-        w.localSeedStart = w.fullHi - hit.dbStart;
-        w.localSeedEnd = w.fullHi - hit.dbEnd;
     }
+}
+
+static WindowInfo buildWindowFromRaw(const char *targetData,
+                                     unsigned int tLen,
+                                     const OrientedHit &hit,
+                                     int qLen,
+                                     float flankFrac) {
+    WindowInfo w = buildWindowMetadataFromRaw(tLen, hit, qLen, flankFrac);
+    fillWindowSequenceFromTarget(w, targetData);
     return w;
+}
+
+static bool materializeCandidateWindow(CandidateHit &cand,
+                                       DBReader<unsigned int> &tDbr,
+                                       unsigned int threadIdx,
+                                       Sequence &targetMapper,
+                                       bool decodeTargetDinuc,
+                                       bool targetGpuDb,
+                                       const SubstitutionMatrix *subMat) {
+    if (!cand.window.seq.empty()) {
+        return true;
+    }
+    if (!windowBoundsValid(cand.window)) {
+        return false;
+    }
+    const size_t tId = tDbr.getId(cand.raw.dbKey);
+    if (tId == UINT_MAX) {
+        return false;
+    }
+    const std::string targetSeq = decodeDbSequence(tDbr, tId, threadIdx, targetMapper, decodeTargetDinuc, targetGpuDb, subMat);
+    fillWindowSequenceFromTarget(cand.window, targetSeq.c_str());
+    return !cand.window.seq.empty();
 }
 
 static std::pair<int, int> chooseQuerySegment(const OrientedHit &hit,
@@ -2070,6 +2560,26 @@ static SegmentStitchResult buildExactGlocalSegment(const std::string &querySeq,
     return out;
 }
 
+static float targetPairProbabilityAt(const WindowInfo *targetWindow,
+                                     const std::vector<float> &targetPairMatrix,
+                                     int targetLen,
+                                     int i,
+                                     int j) {
+    if (targetWindow != NULL) {
+        return windowPairMatrixAt(*targetWindow, i, j);
+    }
+    if (!targetPairMatrix.empty() && targetPairMatrix.size() == static_cast<size_t>(targetLen * targetLen)
+        && i >= 0 && j >= 0 && i < targetLen && j < targetLen) {
+        return targetPairMatrix[static_cast<size_t>(i * targetLen + j)];
+    }
+    return 0.0f;
+}
+
+static bool targetHasPairMatrix(const WindowInfo *targetWindow,
+                                const std::vector<float> &targetPairMatrix) {
+    return targetWindow != NULL ? windowHasPairMatrix(*targetWindow) : !targetPairMatrix.empty();
+}
+
 static std::vector<PairAnchorCandidate> collectPairAnchorCandidates(const std::string &querySeq,
                                                                     const std::vector<std::array<float, 4>> &profile,
                                                                     const std::vector<StructVec> &queryStruct,
@@ -2078,6 +2588,7 @@ static std::vector<PairAnchorCandidate> collectPairAnchorCandidates(const std::s
                                                                     const std::vector<StructVec> &targetStruct,
                                                                     const std::vector<int> &targetPartners,
                                                                     const std::vector<float> &targetPairMatrix,
+                                                                    const WindowInfo *targetWindow,
                                                                     int qLo,
                                                                     int qHi,
                                                                     int tLo,
@@ -2171,8 +2682,8 @@ static std::vector<PairAnchorCandidate> collectPairAnchorCandidates(const std::s
             if (qr < static_cast<int>(profile.size())) {
                 score += pairSeqWeight * basePreferenceFromProfile(profile[static_cast<size_t>(qr)], rb);
             }
-            if (!targetPairMatrix.empty()) {
-                score += pairStructWeight * targetPairMatrix[static_cast<size_t>(tl * targetLen + tr)];
+            if (targetHasPairMatrix(targetWindow, targetPairMatrix)) {
+                score += pairStructWeight * targetPairProbabilityAt(targetWindow, targetPairMatrix, targetLen, tl, tr);
             } else {
                 score += pairStructWeight;
             }
@@ -2249,6 +2760,7 @@ static SegmentStitchResult buildPairAwareSegmentBest(const std::string &querySeq
                                                      const std::vector<StructVec> &targetStruct,
                                                      const std::vector<int> &targetPartners,
                                                      const std::vector<float> &targetPairMatrix,
+                                                     const WindowInfo *targetWindow,
                                                      int qLo,
                                                      int qHi,
                                                      int tLo,
@@ -2281,6 +2793,7 @@ static SegmentStitchResult buildPairAwareSegmentBest(const std::string &querySeq
                                                                                  targetStruct,
                                                                                  targetPartners,
                                                                                  targetPairMatrix,
+                                                                                 targetWindow,
                                                                                  qLo,
                                                                                  qHi,
                                                                                  tLo,
@@ -2300,6 +2813,7 @@ static SegmentStitchResult buildPairAwareSegmentBest(const std::string &querySeq
                                                              targetStruct,
                                                              targetPartners,
                                                              targetPairMatrix,
+                                                             targetWindow,
                                                              qLo,
                                                              anchor.ql - 1,
                                                              tLo,
@@ -2317,6 +2831,7 @@ static SegmentStitchResult buildPairAwareSegmentBest(const std::string &querySeq
                                                             targetStruct,
                                                             targetPartners,
                                                             targetPairMatrix,
+                                                            targetWindow,
                                                             anchor.ql + 1,
                                                             anchor.qr - 1,
                                                             anchor.tl + 1,
@@ -2334,6 +2849,7 @@ static SegmentStitchResult buildPairAwareSegmentBest(const std::string &querySeq
                                                               targetStruct,
                                                               targetPartners,
                                                               targetPairMatrix,
+                                                              targetWindow,
                                                               anchor.qr + 1,
                                                               qHi,
                                                               anchor.tr + 1,
@@ -2369,6 +2885,7 @@ static bool appendPairAwareSegment(const std::string &querySeq,
                                    const std::vector<StructVec> &targetStruct,
                                    const std::vector<int> &targetPartners,
                                    const std::vector<float> &targetPairMatrix,
+                                   const WindowInfo *targetWindow,
                                    int qLo,
                                    int qHi,
                                    int tLo,
@@ -2384,6 +2901,7 @@ static bool appendPairAwareSegment(const std::string &querySeq,
                                                            targetStruct,
                                                            targetPartners,
                                                            targetPairMatrix,
+                                                           targetWindow,
                                                            qLo,
                                                            qHi,
                                                            tLo,
@@ -2510,8 +3028,9 @@ static std::vector<StemMatch> findStemMatches(const std::vector<StemPattern> &pa
                 for (int k = 0; k < pat.armLen; ++k) {
                     const int tl = leftPos + k;
                     const int tr = rightOuter - k;
-                    if (!window.pairMatrix.empty()) {
-                        pairSupport += window.pairMatrix[static_cast<size_t>(tl * targetLen + tr)];
+                    const float pairProb = windowPairMatrixAt(window, tl, tr);
+                    if (pairProb > 0.0f) {
+                        pairSupport += pairProb;
                     } else if (window.partners.size() == static_cast<size_t>(targetLen)
                                && window.partners[static_cast<size_t>(tl)] == tr) {
                         pairSupport += 1.0f;
@@ -2841,8 +3360,9 @@ static float windowPairSupportAt(const WindowInfo &window,
     const int lo = std::min(a, b);
     const int hi = std::max(a, b);
     const int targetLen = static_cast<int>(window.seq.size());
-    if (!window.pairMatrix.empty()) {
-        return window.pairMatrix[static_cast<size_t>(lo * targetLen + hi)];
+    const float pairProb = windowPairMatrixAt(window, lo, hi);
+    if (pairProb > 0.0f) {
+        return pairProb;
     }
     if (window.partners.size() == static_cast<size_t>(targetLen) && window.partners[static_cast<size_t>(lo)] == hi) {
         return 1.0f;
@@ -2864,7 +3384,10 @@ static float logSumExp4(float a, float b, float c, float d) {
 static std::vector<float> buildLolScoreMatrix(const std::string &querySeq,
                                               const std::vector<std::array<float, 4>> &profile,
                                               const std::vector<StructVec> &queryStruct,
+                                              const std::vector<int> &partners,
+                                              const std::vector<float> &pairSupport,
                                               const StemGuide &stemGuide,
+                                              const WindowInfo &window,
                                               const std::string &targetSeq,
                                               const std::vector<StructVec> &targetStruct,
                                               int queryStart,
@@ -2884,6 +3407,11 @@ static std::vector<float> buildLolScoreMatrix(const std::string &querySeq,
     if (n <= 0 || m <= 0) {
         return score;
     }
+    const bool pairMatrixOnly = targetStruct.empty() && windowHasPairMatrix(window);
+    const float cellPairWeight = pairMatrixOnly
+        ? clampf(parseEnvFloat("MMSEQS_LOLALIGN_CELL_PAIR_WEIGHT", 0.60f), 0.0f, 4.0f)
+        : 0.0f;
+    const int pairAnchorRadius = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_CELL_PAIR_ANCHOR_RADIUS", 1));
 
     for (int i = 0; i < n; ++i) {
         const int qIdx = qLo + i;
@@ -2901,7 +3429,9 @@ static std::vector<float> buildLolScoreMatrix(const std::string &querySeq,
             float emit = (b >= 0 && qIdx < static_cast<int>(profile.size()))
                 ? profile[static_cast<size_t>(qIdx)][static_cast<size_t>(b)]
                 : -3.0f;
-            if (qIdx < static_cast<int>(queryStruct.size()) && j < static_cast<int>(targetStruct.size())) {
+            if (!pairMatrixOnly
+                && qIdx < static_cast<int>(queryStruct.size())
+                && j < static_cast<int>(targetStruct.size())) {
                 const float sim = structureSimilarity(queryStruct[static_cast<size_t>(qIdx)],
                                                       targetStruct[static_cast<size_t>(j)]);
                 emit += structScoreWeight * 4.0f * (sim - (1.0f / 3.0f));
@@ -2913,6 +3443,27 @@ static std::vector<float> buildLolScoreMatrix(const std::string &querySeq,
                 const float radius = static_cast<float>(std::max(1, stemRadius));
                 const float anchorScore = std::max(0.0f, 1.0f - dist / radius);
                 emit += stemScoreWeight * stemGuide.supportByQuery[static_cast<size_t>(qIdx)] * anchorScore;
+            }
+            if (cellPairWeight > 0.0f && qIdx < static_cast<int>(partners.size())) {
+                const int partner = partners[static_cast<size_t>(qIdx)];
+                if (partner >= 0
+                    && partner < fullQueryLen
+                    && partner < static_cast<int>(stemGuide.anchorPosByQuery.size())
+                    && stemGuide.anchorPosByQuery[static_cast<size_t>(partner)] >= 0.0f) {
+                    const int targetAnchor = static_cast<int>(std::lrint(stemGuide.anchorPosByQuery[static_cast<size_t>(partner)]));
+                    float targetPair = 0.0f;
+                    for (int da = -pairAnchorRadius; da <= pairAnchorRadius; ++da) {
+                        targetPair = std::max(targetPair, windowPairSupportAt(window, j, targetAnchor + da));
+                    }
+                    float queryPair = 0.0f;
+                    if (pairSupport.size() == static_cast<size_t>(fullQueryLen * fullQueryLen)) {
+                        queryPair = std::max(0.0f, pairSupport[static_cast<size_t>(qIdx * fullQueryLen + partner)]);
+                    } else {
+                        queryPair = 1.0f;
+                    }
+                    const float supportScale = std::max(0.10f, queryPair);
+                    emit += cellPairWeight * supportScale * (targetPair - 0.10f);
+                }
             }
             if (bonusMatrix != NULL && bonusMatrix->size() == static_cast<size_t>(n * m)) {
                 emit += (*bonusMatrix)[static_cast<size_t>(i) * static_cast<size_t>(m) + static_cast<size_t>(j)];
@@ -3397,7 +3948,10 @@ static AlignmentResult runLolAlignIteration(const std::string &querySeq,
         const std::vector<float> scoreMatrix = buildLolScoreMatrix(querySeq,
                                                                    profile,
                                                                    queryStruct,
+                                                                   partners,
+                                                                   pairSupport,
                                                                    guide,
+                                                                   window,
                                                                    window.seq,
                                                                    window.structVec,
                                                                    queryStart,
@@ -4262,6 +4816,7 @@ static AlignmentResult stitchCmLiteAlignment(const std::string &querySeq,
                                              const std::vector<StructVec> &targetStruct,
                                              const std::vector<int> &targetPartners,
                                              const std::vector<float> &targetPairMatrix,
+                                             const WindowInfo *targetWindow,
                                              int queryStart,
                                              int queryEnd,
                                              float structScoreWeight) {
@@ -4296,6 +4851,7 @@ static AlignmentResult stitchCmLiteAlignment(const std::string &querySeq,
                                         targetStruct,
                                         targetPartners,
                                         targetPairMatrix,
+                                        targetWindow,
                                         segQStart,
                                         segQEnd,
                                         segTStart,
@@ -4406,6 +4962,7 @@ static AlignmentResult stitchPairAwareLocalWindow(const std::string &querySeq,
                                                   const std::vector<StructVec> &targetStruct,
                                                   const std::vector<int> &targetPartners,
                                                   const std::vector<float> &targetPairMatrix,
+                                                  const WindowInfo *targetWindow,
                                                   int qLo,
                                                   int qHi,
                                                   int tLo,
@@ -4426,6 +4983,7 @@ static AlignmentResult stitchPairAwareLocalWindow(const std::string &querySeq,
                                                         targetStruct,
                                                         targetPartners,
                                                         targetPairMatrix,
+                                                        targetWindow,
                                                         qLo,
                                                         qHi,
                                                         tLo,
@@ -4654,6 +5212,7 @@ static AlignmentResult stitchLolSectionConstrainedCYK(const std::string &querySe
                                            window.structVec,
                                            window.partners,
                                            window.pairMatrix,
+                                           &window,
                                            block.qLo,
                                            block.qHi,
                                            block.tLo,
@@ -4756,6 +5315,7 @@ static int runCmliteImpl(int argc,
     const double msaEvalThr = par.cmliteMsaEvalThr;
     const bool uncappedModelHits = std::isfinite(msaEvalThr);
     const int maxModelHits = std::max(4, parseEnvInt("MMSEQS_CMLITE_MAX_MODEL_HITS", 64));
+    const int querySupportMaxLen = std::max(0, parseEnvInt("MMSEQS_CMLITE_QUERY_SUPPORT_MAX_LEN", 0));
     const float flankFrac = (par.cmRegionFlanking > 0.0f)
         ? par.cmRegionFlanking
         : parseEnvFloat("MMSEQS_CMLITE_FLANK_FRAC", 0.5f);
@@ -4786,6 +5346,9 @@ static int runCmliteImpl(int argc,
     structureSettings.minLoop = std::max(0, parseEnvInt("MMSEQS_CMLITE_MIN_LOOP", 3));
     structureSettings.linearfoldMinLength = std::max(0, parseEnvInt("MMSEQS_CMLITE_LINEARFOLD_MIN_LENGTH", 128));
     structureSettings.linearfoldBeamSize = std::max(1, parseEnvInt("MMSEQS_CMLITE_LINEARFOLD_BEAM", 100));
+    structureSettings.rnaPlfoldWindow = std::max(0, parseEnvInt("MMSEQS_CMLITE_RNAPLFOLD_WINDOW", par.emsearchRnaPlfoldWindow));
+    structureSettings.rnaPlfoldSpan = std::max(0, parseEnvInt("MMSEQS_CMLITE_RNAPLFOLD_SPAN", par.emsearchRnaPlfoldSpan));
+    structureSettings.sparsePairMatrix = parseEnvInt("MMSEQS_CMLITE_SPARSE_PAIR_MATRIX", 0) != 0;
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, 0.0f);
 
@@ -4800,11 +5363,17 @@ static int runCmliteImpl(int argc,
                                : ("top " + SSTR(maxModelHits) + " deduplicated hits (threshold is inf)"))
                        << ", stem weight: " << stemWeight
                        << ", stem radius: " << stemRadius
+                       << ", query support max length: " << querySupportMaxLen
                        << ", flank frac: " << flankFrac
                        << ", msa e-value threshold: " << msaEvalStream.str()
                        << ", structure backend: " << structureSettings.backend
                        << ", linearfold min length: " << structureSettings.linearfoldMinLength
                        << ", linearfold beam: " << structureSettings.linearfoldBeamSize
+                       << ", rnaplfold window: " << structureSettings.rnaPlfoldWindow
+                       << ", rnaplfold span: " << structureSettings.rnaPlfoldSpan
+                       << ", keep pair matrix: " << (structureSettings.keepPairMatrix ? "yes" : "no")
+                       << ", sparse pair matrix: " << (structureSettings.sparsePairMatrix ? "yes" : "no")
+                       << ", dot-bracket only: " << (structureSettings.dotBracketOnly ? "yes" : "no")
                        << "\n";
 
     DBReader<unsigned int> qDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
@@ -4854,6 +5423,9 @@ static int runCmliteImpl(int argc,
         const unsigned int qLen = qDbr.getSeqLen(qId);
         std::string querySeq = decodeDbSequence(qDbr, qId, threadIdx, queryMapper, decodeQueryDinuc, queryGpuDb, &subMat);
         FoldResult baseQueryFold = foldSequenceStructure(querySeq, structureSettings);
+        if (baseQueryFold.structVec.empty()) {
+            baseQueryFold.structVec.assign(querySeq.size(), StructVec());
+        }
 
         std::vector<RnaMatcher::result_t> rawHits;
         RnaMatcher::readAlignmentResults(rawHits, resReader.getData(rid, threadIdx), false);
@@ -4914,6 +5486,7 @@ static int runCmliteImpl(int argc,
                 candidates[i].window.structVec.swap(fold.structVec);
                 candidates[i].window.partners.swap(fold.partners);
                 candidates[i].window.pairMatrix.swap(fold.pairMatrix);
+                candidates[i].window.sparsePairMatrix = fold.sparsePairMatrix;
             }
         }
 
@@ -4945,21 +5518,28 @@ static int runCmliteImpl(int argc,
         std::vector<std::array<float, 4>> profile;
         std::vector<StructVec> queryStruct = baseQueryFold.structVec;
         buildProfile(querySeq, modelHits, candidates, baseQueryFold.structVec, alpha, profile, queryStruct);
-        const std::vector<float> pairSupport = buildPairSupportMatrix(static_cast<int>(qLen), modelHits, candidates);
-        const float minPairSupport = clampf(parseEnvFloat("MMSEQS_CMLITE_MIN_PAIR_SUPPORT", 0.18f), 0.0f, 1.0f);
-        std::vector<int> msaPartners = derivePartnersFromPairSupport(pairSupport,
-                                                                     static_cast<int>(qLen),
-                                                                     structureSettings.minLoop,
-                                                                     minPairSupport);
-        if (hasAnyPartners(msaPartners)) {
-            queryStruct = pairMatrixToStructVec(pairSupport, msaPartners, static_cast<int>(qLen));
-        } else {
-            msaPartners = baseQueryFold.partners;
+        std::vector<float> pairSupport;
+        std::vector<int> msaPartners = baseQueryFold.partners;
+        const bool buildQuerySupport = querySupportMaxLen <= 0 || static_cast<int>(qLen) <= querySupportMaxLen;
+        if (buildQuerySupport) {
+            pairSupport = buildPairSupportMatrix(static_cast<int>(qLen), modelHits, candidates);
+            const float minPairSupport = clampf(parseEnvFloat("MMSEQS_CMLITE_MIN_PAIR_SUPPORT", 0.18f), 0.0f, 1.0f);
+            std::vector<int> supportPartners = derivePartnersFromPairSupport(pairSupport,
+                                                                              static_cast<int>(qLen),
+                                                                              structureSettings.minLoop,
+                                                                              minPairSupport);
+            if (hasAnyPartners(supportPartners)) {
+                msaPartners.swap(supportPartners);
+                queryStruct = pairMatrixToStructVec(pairSupport, msaPartners, static_cast<int>(qLen));
+            }
         }
         const std::string consensusSeq = consensusSequenceFromProfile(querySeq, profile);
         std::vector<StemPattern> patterns = buildStemPatterns(consensusSeq, msaPartners, pairSupport, profile);
         if (patterns.empty()) {
-            patterns = buildStemPatterns(querySeq, baseQueryFold.partners, baseQueryFold.pairMatrix, profile);
+            const std::vector<float> basePairMatrix = baseQueryFold.pairMatrix.empty() && baseQueryFold.sparsePairMatrix
+                ? sparsePairMatrixToDense(*baseQueryFold.sparsePairMatrix)
+                : baseQueryFold.pairMatrix;
+            patterns = buildStemPatterns(querySeq, baseQueryFold.partners, basePairMatrix, profile);
         }
 
         std::unordered_map<unsigned int, std::vector<StemMatch>> refinedModuleMatchesByTarget;
@@ -5130,6 +5710,7 @@ static int runCmliteImpl(int argc,
                                                             cand.window.structVec,
                                                             cand.window.partners,
                                                             cand.window.pairMatrix,
+                                                            &cand.window,
                                                             qSegment.first,
                                                             qSegment.second,
                                                             alpha);
@@ -5199,6 +5780,7 @@ static int runCmliteImpl(int argc,
                                                                                    cand.window.structVec,
                                                                                    cand.window.partners,
                                                                                    cand.window.pairMatrix,
+                                                                                   &cand.window,
                                                                                    pairQLo,
                                                                                    pairQHi,
                                                                                    pairTLo,
@@ -5342,6 +5924,7 @@ static int runLolalignImpl(int argc,
     const double msaEvalThr = par.lolalignMsaEvalThr;
     const bool uncappedModelHits = std::isfinite(msaEvalThr);
     const int maxModelHits = std::max(4, parseEnvInt("MMSEQS_LOLALIGN_MAX_MODEL_HITS", 64));
+    const int querySupportMaxLen = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_QUERY_SUPPORT_MAX_LEN", 0));
     const float flankFrac = (par.cmRegionFlanking > 0.0f)
         ? par.cmRegionFlanking
         : parseEnvFloat("MMSEQS_LOLALIGN_FLANK_FRAC", 1.5f);
@@ -5350,12 +5933,25 @@ static int runLolalignImpl(int argc,
     const float minSeqIdGain = parseEnvFloat("MMSEQS_LOLALIGN_MIN_SEQID_GAIN", 0.0f);
 
     StructureSettings structureSettings;
-    structureSettings.backend = std::getenv("MMSEQS_LOLALIGN_STRUCTURE_BACKEND")
-        ? std::getenv("MMSEQS_LOLALIGN_STRUCTURE_BACKEND")
-        : "linearfold";
+    const char *lolalignBackendEnv = std::getenv("MMSEQS_LOLALIGN_STRUCTURE_BACKEND");
+    structureSettings.backend = lolalignBackendEnv != NULL
+        ? lolalignBackendEnv
+        : (par.emsearchRnaPlfold ? "rnaplfold" : "linearfold");
     structureSettings.minLoop = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_MIN_LOOP", 3));
     structureSettings.linearfoldMinLength = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_LINEARFOLD_MIN_LENGTH", 0));
     structureSettings.linearfoldBeamSize = std::max(1, parseEnvInt("MMSEQS_LOLALIGN_LINEARFOLD_BEAM", 100));
+    structureSettings.rnaPlfoldWindow = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_RNAPLFOLD_WINDOW", par.emsearchRnaPlfoldWindow));
+    structureSettings.rnaPlfoldSpan = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_RNAPLFOLD_SPAN", par.emsearchRnaPlfoldSpan));
+    const char *keepPairMatrixEnv = std::getenv("MMSEQS_LOLALIGN_KEEP_PAIR_MATRIX");
+    structureSettings.keepPairMatrix = keepPairMatrixEnv != NULL
+        ? std::atoi(keepPairMatrixEnv) != 0
+        : true;
+    structureSettings.sparsePairMatrix = parseEnvInt("MMSEQS_LOLALIGN_SPARSE_PAIR_MATRIX", 0) != 0;
+    structureSettings.dotBracketOnly = parseEnvInt("MMSEQS_LOLALIGN_DOTBRACKET_ONLY", 0) != 0;
+    if (structureSettings.dotBracketOnly) {
+        structureSettings.keepPairMatrix = false;
+        structureSettings.sparsePairMatrix = false;
+    }
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, 0.0f);
 
@@ -5367,12 +5963,17 @@ static int runLolalignImpl(int argc,
                        << (uncappedModelHits
                                ? "all deduplicated hits with E-value <= threshold"
                                : ("top " + SSTR(maxModelHits) + " deduplicated hits (threshold is inf)"))
+                       << ", query support max length: " << querySupportMaxLen
                        << ", flank frac: " << flankFrac
                        << ", msa e-value threshold: " << msaEvalStream.str()
                        << ", structure backend: " << structureSettings.backend
                        << ", candidate batch size: " << candidateBatchSize
                        << ", linearfold min length: " << structureSettings.linearfoldMinLength
                        << ", linearfold beam: " << structureSettings.linearfoldBeamSize
+                       << ", rnaplfold window: " << structureSettings.rnaPlfoldWindow
+                       << ", rnaplfold span: " << structureSettings.rnaPlfoldSpan
+                       << ", keep pair matrix: " << (structureSettings.keepPairMatrix ? "yes" : "no")
+                       << ", sparse pair matrix: " << (structureSettings.sparsePairMatrix ? "yes" : "no")
                        << "\n";
 
     DBReader<unsigned int> qDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
@@ -5421,6 +6022,9 @@ static int runLolalignImpl(int argc,
         const unsigned int qLen = qDbr.getSeqLen(qId);
         std::string querySeq = decodeDbSequence(qDbr, qId, threadIdx, queryMapper, decodeQueryDinuc, queryGpuDb, &subMat);
         FoldResult baseQueryFold = foldSequenceStructure(querySeq, structureSettings);
+        if (baseQueryFold.structVec.empty()) {
+            baseQueryFold.structVec.assign(querySeq.size(), StructVec());
+        }
 
         std::vector<RnaMatcher::result_t> rawHits;
         RnaMatcher::readAlignmentResults(rawHits, resReader.getData(rid, threadIdx), false);
@@ -5455,12 +6059,10 @@ static int runLolalignImpl(int argc,
             if (tId == UINT_MAX) {
                 continue;
             }
-            std::string targetSeq = decodeDbSequence(tDbr, tId, threadIdx, targetMapper, decodeTargetDinuc, targetGpuDb, &subMat);
-            cand.window = buildWindowFromRaw(targetSeq.c_str(),
-                                             static_cast<unsigned int>(targetSeq.size()),
-                                             cand.oriented,
-                                             static_cast<int>(qLen),
-                                             flankFrac);
+            cand.window = buildWindowMetadataFromRaw(static_cast<unsigned int>(tDbr.getSeqLen(tId)),
+                                                     cand.oriented,
+                                                     static_cast<int>(qLen),
+                                                     flankFrac);
         }
 
         std::sort(candidates.begin(), candidates.end(),
@@ -5469,11 +6071,19 @@ static int runLolalignImpl(int argc,
                   });
 
         size_t maxWindowLen = 0;
+        unsigned long long foldCacheDenseBytes = 0;
         for (size_t i = 0; i < candidates.size(); ++i) {
-            maxWindowLen = std::max(maxWindowLen, candidates[i].window.seq.size());
+            const size_t windowLen = windowBoundsValid(candidates[i].window)
+                ? static_cast<size_t>(candidates[i].window.fullHi - candidates[i].window.fullLo + 1)
+                : 0u;
+            maxWindowLen = std::max(maxWindowLen, windowLen);
+            foldCacheDenseBytes = saturatingAddBytes(foldCacheDenseBytes, densePairMatrixBytesForLength(windowLen));
         }
 
         const unsigned long long MiB = 1024ULL * 1024ULL;
+        const int denseCapMb = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_DENSE_PAIR_MATRIX_MAX_MB", 1024));
+        const int denseCapMinLen = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_DENSE_PAIR_MATRIX_MIN_LEN", 2048));
+        unsigned long long denseCapBytes = static_cast<unsigned long long>(denseCapMb) * MiB;
         const bool memoryGuardEnabled = parseEnvInt("MMSEQS_LOLALIGN_MEMORY_GUARD", 1) != 0;
         const unsigned long long explicitBudgetMb = parseEnvUnsignedLongLong("MMSEQS_LOLALIGN_MEMORY_BUDGET_MB", 0ULL);
         const float memoryBudgetFrac = clampf(parseEnvFloat("MMSEQS_LOLALIGN_MEMORY_FRACTION", 0.8f), 0.05f, 1.0f);
@@ -5481,17 +6091,45 @@ static int runLolalignImpl(int argc,
         const unsigned long long memoryBudgetBytes = explicitBudgetMb > 0ULL
             ? explicitBudgetMb * MiB
             : scaleBytes(detectedAvailableBytes, memoryBudgetFrac);
+        const float cacheBudgetFrac = clampf(parseEnvFloat("MMSEQS_LOLALIGN_MEMORY_CACHE_FRACTION", 0.50f), 0.0f, 0.90f);
+        const bool denseRetained = lolalignDensePairRetained(structureSettings);
+        if (memoryGuardEnabled && memoryBudgetBytes > 0ULL && denseRetained) {
+            const unsigned long long guardCacheBytes = std::max(1ULL, scaleBytes(memoryBudgetBytes, cacheBudgetFrac));
+            denseCapBytes = (denseCapBytes > 0ULL) ? std::min(denseCapBytes, guardCacheBytes) : guardCacheBytes;
+        }
+        const bool denseCapActive = denseCapBytes > 0ULL
+            && (maxWindowLen >= static_cast<size_t>(denseCapMinLen)
+                || (memoryGuardEnabled && memoryBudgetBytes > 0ULL))
+            && denseRetained;
         int effectiveBatchSize = candidateBatchSize;
+        if (denseCapActive) {
+            const unsigned long long perWindowBytes = std::max(1ULL, densePairMatrixBytesForLength(maxWindowLen));
+            const unsigned long long capped = std::max(1ULL, denseCapBytes / perWindowBytes);
+            effectiveBatchSize = std::max(1, std::min(candidateBatchSize, static_cast<int>(std::min<unsigned long long>(capped, static_cast<unsigned long long>(INT_MAX)))));
+        }
+
+        const bool foldCacheRequestedForMemory = parseEnvInt("MMSEQS_LOLALIGN_FOLD_CACHE", 1) != 0;
+        unsigned long long estimatedPeakBytes = 0ULL;
+        unsigned long long estimatedCacheBytes = 0ULL;
+        unsigned long long perWindowRetainedBytes = 0ULL;
+        unsigned long long perConcurrentFoldBytes = 0ULL;
         if (memoryGuardEnabled && memoryBudgetBytes > 0ULL) {
             const unsigned long long baseOverheadBytes = parseEnvUnsignedLongLong("MMSEQS_LOLALIGN_MEMORY_BASE_MB", 512ULL) * MiB;
             const float scratchMultiplier = std::max(1.0f, parseEnvFloat("MMSEQS_LOLALIGN_MEMORY_SCRATCH_MULTIPLIER", 6.0f));
             const int workerThreads = std::max(1, par.threads);
-            unsigned long long fixedBytes = saturatingAddBytes(baseOverheadBytes,
-                lolalignRetainedFoldBytes(querySeq.size(), structureSettings));
-            fixedBytes = saturatingAddBytes(fixedBytes, densePairMatrixBytesForLength(querySeq.size()));
-            const unsigned long long perWindowRetainedBytes = lolalignRetainedFoldBytes(maxWindowLen, structureSettings);
-            const unsigned long long perConcurrentFoldBytes = lolalignScratchFoldBytes(maxWindowLen, structureSettings, scratchMultiplier);
+            const bool buildQuerySupportForMemory = querySupportMaxLen <= 0 || static_cast<int>(qLen) <= querySupportMaxLen;
+            unsigned long long queryBytes = lolalignRetainedFoldBytes(querySeq.size(), structureSettings);
+            if (buildQuerySupportForMemory) {
+                queryBytes = saturatingAddBytes(queryBytes, densePairMatrixBytesForLength(querySeq.size()));
+            }
+            perWindowRetainedBytes = lolalignRetainedFoldBytes(maxWindowLen, structureSettings);
+            perConcurrentFoldBytes = lolalignScratchFoldBytes(maxWindowLen, structureSettings, scratchMultiplier);
+            estimatedCacheBytes = (foldCacheRequestedForMemory && denseRetained)
+                ? std::min(foldCacheDenseBytes, denseCapActive ? denseCapBytes : foldCacheDenseBytes)
+                : 0ULL;
 
+            const unsigned long long fixedBytes = saturatingAddBytes(baseOverheadBytes,
+                saturatingAddBytes(queryBytes, estimatedCacheBytes));
             const auto estimateBatchPeak = [&](int batchSize) -> unsigned long long {
                 const unsigned long long batchBytes = saturatingMulBytes(perWindowRetainedBytes,
                     static_cast<unsigned long long>(std::max(1, batchSize)));
@@ -5505,7 +6143,8 @@ static int runLolalignImpl(int argc,
             int best = 1;
             while (lo <= hi) {
                 const int mid = lo + (hi - lo) / 2;
-                if (estimateBatchPeak(mid) <= memoryBudgetBytes) {
+                const unsigned long long peak = estimateBatchPeak(mid);
+                if (peak <= memoryBudgetBytes) {
                     best = mid;
                     lo = mid + 1;
                 } else {
@@ -5513,12 +6152,16 @@ static int runLolalignImpl(int argc,
                 }
             }
             effectiveBatchSize = std::max(1, std::min(effectiveBatchSize, best));
+            estimatedPeakBytes = estimateBatchPeak(effectiveBatchSize);
             if (effectiveBatchSize < candidateBatchSize || parseEnvInt("MMSEQS_LOLALIGN_MEMORY_VERBOSE", 0) != 0) {
                 Debug(Debug::INFO) << "  lolalign memory estimate: query=" << qLen
                                    << ", max target window=" << maxWindowLen
                                    << ", threads=" << workerThreads
                                    << ", budget MB=" << (memoryBudgetBytes / MiB)
-                                   << ", estimated peak MB=" << (estimateBatchPeak(effectiveBatchSize) / MiB)
+                                   << ", estimated peak MB=" << (estimatedPeakBytes / MiB)
+                                   << ", per-window retained MB=" << (perWindowRetainedBytes / MiB)
+                                   << ", per-concurrent-fold MB=" << (perConcurrentFoldBytes / MiB)
+                                   << ", cache MB=" << (estimatedCacheBytes / MiB)
                                    << ", batch=" << effectiveBatchSize
                                    << "\n";
             }
@@ -5530,14 +6173,16 @@ static int runLolalignImpl(int argc,
             if (!uncappedModelHits && static_cast<int>(modelHits.size()) >= maxModelHits) {
                 break;
             }
-            if (candidates[i].window.seq.empty()) {
+            if (candidates[i].raw.eval > msaEvalThr || !windowBoundsValid(candidates[i].window)) {
+                continue;
+            }
+            if (!materializeCandidateWindow(candidates[i], tDbr, threadIdx, targetMapper,
+                                            decodeTargetDinuc, targetGpuDb, &subMat)) {
                 continue;
             }
             const AlignmentResult seedAln = rawAlignmentFromCandidate(querySeq, candidates[i]);
             if (!seedAln.valid) {
-                continue;
-            }
-            if (candidates[i].raw.eval > msaEvalThr) {
+                clearWindowMaterialized(candidates[i].window);
                 continue;
             }
             ModelHit mh;
@@ -5554,36 +6199,159 @@ static int runLolalignImpl(int argc,
             modelCandidate[modelHits[i].candidateIdx] = 1;
         }
 
+        bool useFoldCache = parseEnvInt("MMSEQS_LOLALIGN_FOLD_CACHE", 1) != 0;
+        const int foldCacheMaxUnique = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_FOLD_CACHE_MAX_UNIQUE", 0));
+        if (effectiveBatchSize != candidateBatchSize) {
+            Debug(Debug::INFO) << "  candidate batch size capped for lolalign memory: requested="
+                               << candidateBatchSize
+                               << ", effective=" << effectiveBatchSize
+                               << ", dense cap MB=" << (denseCapBytes / MiB)
+                               << ", max window length=" << maxWindowLen
+                               << ", min length=" << denseCapMinLen
+                               << "\n";
+        }
+        struct CachedFold {
+            std::vector<StructVec> structVec;
+            std::vector<int> partners;
+            std::shared_ptr<const std::vector<float>> pairMatrix;
+            std::shared_ptr<const SparsePairMatrix> sparsePairMatrix;
+        };
+        std::vector<int> foldCacheIdx(candidates.size(), -1);
+        std::vector<std::string> foldCacheSeqs;
+        std::vector<CachedFold> foldCache;
+        if (useFoldCache) {
+            std::unordered_map<std::string, int> foldIndexBySeq;
+            foldIndexBySeq.reserve(candidates.size());
+            foldCacheSeqs.reserve(candidates.size());
+            unsigned long long cachedDenseBytes = 0;
+            size_t uniqueWindowCount = 0;
+            size_t uncachedUniqueWindowCount = 0;
+            const size_t cacheEntryLimit = foldCacheMaxUnique > 0
+                ? static_cast<size_t>(foldCacheMaxUnique)
+                : static_cast<size_t>(std::numeric_limits<size_t>::max());
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                if (!windowBoundsValid(candidates[i].window)) {
+                    continue;
+                }
+                if (!materializeCandidateWindow(candidates[i], tDbr, threadIdx, targetMapper,
+                                                decodeTargetDinuc, targetGpuDb, &subMat)) {
+                    continue;
+                }
+                const std::string seqKey = candidates[i].window.seq;
+                std::unordered_map<std::string, int>::iterator it = foldIndexBySeq.find(seqKey);
+                if (it != foldIndexBySeq.end()) {
+                    foldCacheIdx[i] = it->second;
+                    clearWindowMaterialized(candidates[i].window);
+                    continue;
+                }
+
+                ++uniqueWindowCount;
+                int cacheIdx = -1;
+                const unsigned long long windowBytes = denseRetained
+                    ? densePairMatrixBytesForLength(seqKey.size())
+                    : 0ULL;
+                const bool fitsByteBudget = !denseCapActive || saturatingAddBytes(cachedDenseBytes, windowBytes) <= denseCapBytes;
+                const bool fitsEntryBudget = foldCacheSeqs.size() < cacheEntryLimit;
+                if (fitsByteBudget && fitsEntryBudget) {
+                    cacheIdx = static_cast<int>(foldCacheSeqs.size());
+                    foldCacheSeqs.push_back(seqKey);
+                    cachedDenseBytes = saturatingAddBytes(cachedDenseBytes, windowBytes);
+                } else {
+                    ++uncachedUniqueWindowCount;
+                }
+                foldIndexBySeq.insert(std::make_pair(seqKey, cacheIdx));
+                foldCacheIdx[i] = cacheIdx;
+                clearWindowMaterialized(candidates[i].window);
+            }
+
+            foldCache.resize(foldCacheSeqs.size());
+#pragma omp parallel for schedule(dynamic, 32) if(parallelCandidates)
+            for (size_t ci = 0; ci < foldCacheSeqs.size(); ++ci) {
+                FoldResult fold = foldSequenceStructure(foldCacheSeqs[ci], structureSettings);
+                foldCache[ci].structVec.swap(fold.structVec);
+                foldCache[ci].partners.swap(fold.partners);
+                if (!fold.pairMatrix.empty()) {
+                    foldCache[ci].pairMatrix = std::make_shared<std::vector<float>>(std::move(fold.pairMatrix));
+                }
+                foldCache[ci].sparsePairMatrix = fold.sparsePairMatrix;
+            }
+            Debug(Debug::INFO) << "  fold cache: cached windows=" << foldCacheSeqs.size()
+                               << ", uncached unique windows=" << uncachedUniqueWindowCount
+                               << ", unique windows=" << uniqueWindowCount
+                               << ", candidates=" << candidates.size()
+                               << ", dense cache MB=" << (cachedDenseBytes / (1024ULL * 1024ULL))
+                               << ", dense cap MB=" << (denseCapActive ? (denseCapBytes / MiB) : 0)
+                               << ", entry cap=" << foldCacheMaxUnique
+                               << "\n";
+        }
+
+        const auto assignCachedFold = [&](size_t idx) -> bool {
+            const int cacheIdx = (idx < foldCacheIdx.size()) ? foldCacheIdx[idx] : -1;
+            if (cacheIdx < 0 || static_cast<size_t>(cacheIdx) >= foldCache.size()) {
+                return false;
+            }
+            const CachedFold &fold = foldCache[static_cast<size_t>(cacheIdx)];
+            candidates[idx].window.structVec = fold.structVec;
+            candidates[idx].window.partners = fold.partners;
+            candidates[idx].window.pairMatrix.clear();
+            candidates[idx].window.pairMatrixRef = fold.pairMatrix;
+            candidates[idx].window.sparsePairMatrix = fold.sparsePairMatrix;
+            return true;
+        };
+
+        for (size_t h = 0; h < modelHits.size(); ++h) {
+            const size_t idx = modelHits[h].candidateIdx;
+            if (idx < candidates.size()) {
+                materializeCandidateWindow(candidates[idx], tDbr, threadIdx, targetMapper,
+                                           decodeTargetDinuc, targetGpuDb, &subMat);
+            }
+        }
+
 #pragma omp parallel for schedule(dynamic, 32) if(parallelCandidates)
         for (size_t i = 0; i < candidates.size(); ++i) {
             if (!modelCandidate[i] || candidates[i].window.seq.empty()) {
                 continue;
             }
-            FoldResult fold = foldSequenceStructure(candidates[i].window.seq, structureSettings);
-            candidates[i].window.structVec.swap(fold.structVec);
-            candidates[i].window.partners.swap(fold.partners);
-            candidates[i].window.pairMatrix.swap(fold.pairMatrix);
+            if (!useFoldCache || !assignCachedFold(i)) {
+                FoldResult fold = foldSequenceStructure(candidates[i].window.seq, structureSettings);
+                candidates[i].window.structVec.swap(fold.structVec);
+                candidates[i].window.partners.swap(fold.partners);
+                candidates[i].window.pairMatrix.swap(fold.pairMatrix);
+                candidates[i].window.sparsePairMatrix = fold.sparsePairMatrix;
+            }
         }
 
         std::vector<std::array<float, 4>> profile;
         std::vector<StructVec> queryStruct = baseQueryFold.structVec;
         buildProfile(querySeq, modelHits, candidates, baseQueryFold.structVec, 0.35f, profile, queryStruct);
-        const std::vector<float> pairSupport = buildPairSupportMatrix(static_cast<int>(qLen), modelHits, candidates);
-        const float minPairSupport = clampf(parseEnvFloat("MMSEQS_LOLALIGN_MIN_PAIR_SUPPORT", 0.18f), 0.0f, 1.0f);
-        std::vector<int> msaPartners = derivePartnersFromPairSupport(pairSupport,
-                                                                     static_cast<int>(qLen),
-                                                                     structureSettings.minLoop,
-                                                                     minPairSupport);
-        if (hasAnyPartners(msaPartners)) {
-            queryStruct = pairMatrixToStructVec(pairSupport, msaPartners, static_cast<int>(qLen));
-        } else {
-            msaPartners = baseQueryFold.partners;
+        std::vector<float> pairSupport;
+        std::vector<int> msaPartners = baseQueryFold.partners;
+        const bool buildQuerySupport = querySupportMaxLen <= 0 || static_cast<int>(qLen) <= querySupportMaxLen;
+        if (buildQuerySupport) {
+            pairSupport = buildPairSupportMatrix(static_cast<int>(qLen), modelHits, candidates);
+            const float minPairSupport = clampf(parseEnvFloat("MMSEQS_LOLALIGN_MIN_PAIR_SUPPORT", 0.18f), 0.0f, 1.0f);
+            std::vector<int> supportPartners = derivePartnersFromPairSupport(pairSupport,
+                                                                              static_cast<int>(qLen),
+                                                                              structureSettings.minLoop,
+                                                                              minPairSupport);
+            if (hasAnyPartners(supportPartners)) {
+                msaPartners.swap(supportPartners);
+                queryStruct = pairMatrixToStructVec(pairSupport, msaPartners, static_cast<int>(qLen));
+            }
         }
         std::string lolConsensusSeq = consensusSequenceFromProfile(querySeq, profile);
         std::vector<StemPattern> lolPatterns = buildStemPatterns(lolConsensusSeq, msaPartners, pairSupport, profile);
         if (lolPatterns.empty()) {
             lolPatterns = buildStemPatterns(querySeq, msaPartners, pairSupport, profile);
         }
+
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            clearWindowMaterialized(candidates[i].window);
+        }
+        Debug(Debug::INFO) << "  model/profile windows released before batch refinement: query length="
+                           << qLen
+                           << ", candidates=" << candidates.size()
+                           << "\n";
 
         size_t validRawAlignmentCount = 0;
         size_t acceptedRefinementCount = 0;
@@ -5601,16 +6369,35 @@ static int runLolalignImpl(int argc,
             const size_t batchEnd = std::min(candidates.size(), batchStart + static_cast<size_t>(effectiveBatchSize));
             const size_t batchLen = batchEnd - batchStart;
 
-#pragma omp parallel for schedule(dynamic, 32) if(parallelCandidates)
-            for (size_t bi = 0; bi < batchLen; ++bi) {
-                const size_t idx = batchStart + bi;
-                if (modelCandidate[idx] || candidates[idx].window.seq.empty()) {
-                    continue;
+#pragma omp parallel if(parallelCandidates)
+            {
+                unsigned int localThreadIdx = threadIdx;
+#ifdef OPENMP
+                localThreadIdx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                Sequence batchTargetMapper(tDbr.getMaxSeqLen(), targetSeqType, &subMat, 0, false, false);
+#pragma omp for schedule(dynamic, 32)
+                for (size_t bi = 0; bi < batchLen; ++bi) {
+                    const size_t idx = batchStart + bi;
+                    if (!windowBoundsValid(candidates[idx].window)) {
+                        continue;
+                    }
+                    if (!materializeCandidateWindow(candidates[idx], tDbr, localThreadIdx, batchTargetMapper,
+                                                    decodeTargetDinuc, targetGpuDb, &subMat)) {
+                        continue;
+                    }
+                    if (!candidates[idx].window.structVec.empty()
+                        && candidates[idx].window.structVec.size() == candidates[idx].window.seq.size()) {
+                        continue;
+                    }
+                    if (!useFoldCache || !assignCachedFold(idx)) {
+                        FoldResult fold = foldSequenceStructure(candidates[idx].window.seq, structureSettings);
+                        candidates[idx].window.structVec.swap(fold.structVec);
+                        candidates[idx].window.partners.swap(fold.partners);
+                        candidates[idx].window.pairMatrix.swap(fold.pairMatrix);
+                        candidates[idx].window.sparsePairMatrix = fold.sparsePairMatrix;
+                    }
                 }
-                FoldResult fold = foldSequenceStructure(candidates[idx].window.seq, structureSettings);
-                candidates[idx].window.structVec.swap(fold.structVec);
-                candidates[idx].window.partners.swap(fold.partners);
-                candidates[idx].window.pairMatrix.swap(fold.pairMatrix);
             }
 
             std::vector<RnaMatcher::result_t> refined(batchLen);
@@ -5701,15 +6488,11 @@ static int runLolalignImpl(int argc,
 
             for (size_t bi = 0; bi < batchLen; ++bi) {
                 const size_t idx = batchStart + bi;
-                if (!modelCandidate[idx]) {
-                    clearWindowStructure(candidates[idx].window);
-                }
+                clearWindowMaterialized(candidates[idx].window);
             }
         }
         for (size_t i = 0; i < candidates.size(); ++i) {
-            if (modelCandidate[i]) {
-                clearWindowStructure(candidates[i].window);
-            }
+            clearWindowMaterialized(candidates[i].window);
         }
         Debug(Debug::INFO) << "  query " << queryKey
                            << ": raw hits=" << rawHits.size()
