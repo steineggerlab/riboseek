@@ -101,22 +101,20 @@ struct WindowInfo {
     int localSeedEnd = 0;
 };
 
-template <typename PairVec>
-static std::shared_ptr<const SparsePairMatrix> makeSparsePairMatrix(int len,
-                                                                     const PairVec &pairs) {
-    if (len <= 0) {
+static std::shared_ptr<const SparsePairMatrix> makeSparsePairMatrixFromDense(int len,
+                                                                              const std::vector<float> &dense) {
+    if (len <= 0 || dense.size() != static_cast<size_t>(len) * static_cast<size_t>(len)) {
         return std::shared_ptr<const SparsePairMatrix>();
     }
     std::shared_ptr<SparsePairMatrix> matrix(new SparsePairMatrix());
     matrix->len = len;
     matrix->rowOffsets.assign(static_cast<size_t>(len + 1), 0);
-    for (size_t k = 0; k < pairs.size(); ++k) {
-        const auto &pair = pairs[k];
-        if (pair.i < 0 || pair.j < 0 || pair.i >= len || pair.j >= len || pair.i == pair.j || pair.p <= 0.0f) {
-            continue;
+    for (int i = 0; i < len; ++i) {
+        for (int j = 0; j < len; ++j) {
+            if (i != j && dense[static_cast<size_t>(i) * static_cast<size_t>(len) + static_cast<size_t>(j)] > 0.0f) {
+                matrix->rowOffsets[static_cast<size_t>(i + 1)]++;
+            }
         }
-        matrix->rowOffsets[static_cast<size_t>(pair.i + 1)]++;
-        matrix->rowOffsets[static_cast<size_t>(pair.j + 1)]++;
     }
     for (int i = 1; i <= len; ++i) {
         matrix->rowOffsets[static_cast<size_t>(i)] += matrix->rowOffsets[static_cast<size_t>(i - 1)];
@@ -125,37 +123,15 @@ static std::shared_ptr<const SparsePairMatrix> makeSparsePairMatrix(int len,
     matrix->cols.assign(static_cast<size_t>(total), 0);
     matrix->probs.assign(static_cast<size_t>(total), 0.0f);
     std::vector<int> cursor = matrix->rowOffsets;
-    for (size_t k = 0; k < pairs.size(); ++k) {
-        const auto &pair = pairs[k];
-        if (pair.i < 0 || pair.j < 0 || pair.i >= len || pair.j >= len || pair.i == pair.j || pair.p <= 0.0f) {
-            continue;
-        }
-        int pos = cursor[static_cast<size_t>(pair.i)]++;
-        matrix->cols[static_cast<size_t>(pos)] = pair.j;
-        matrix->probs[static_cast<size_t>(pos)] = pair.p;
-        pos = cursor[static_cast<size_t>(pair.j)]++;
-        matrix->cols[static_cast<size_t>(pos)] = pair.i;
-        matrix->probs[static_cast<size_t>(pos)] = pair.p;
-    }
-    for (int row = 0; row < len; ++row) {
-        const int begin = matrix->rowOffsets[static_cast<size_t>(row)];
-        const int end = matrix->rowOffsets[static_cast<size_t>(row + 1)];
-        if (end - begin <= 1) {
-            continue;
-        }
-        std::vector<std::pair<int, float> > tmp;
-        tmp.reserve(static_cast<size_t>(end - begin));
-        for (int pidx = begin; pidx < end; ++pidx) {
-            tmp.push_back(std::make_pair(matrix->cols[static_cast<size_t>(pidx)],
-                                         matrix->probs[static_cast<size_t>(pidx)]));
-        }
-        std::sort(tmp.begin(), tmp.end(),
-                  [](const std::pair<int, float> &a, const std::pair<int, float> &b) {
-                      return a.first < b.first;
-                  });
-        for (size_t idx = 0; idx < tmp.size(); ++idx) {
-            matrix->cols[static_cast<size_t>(begin) + idx] = tmp[idx].first;
-            matrix->probs[static_cast<size_t>(begin) + idx] = tmp[idx].second;
+    for (int i = 0; i < len; ++i) {
+        for (int j = 0; j < len; ++j) {
+            const float prob = dense[static_cast<size_t>(i) * static_cast<size_t>(len) + static_cast<size_t>(j)];
+            if (i == j || prob <= 0.0f) {
+                continue;
+            }
+            const int pos = cursor[static_cast<size_t>(i)]++;
+            matrix->cols[static_cast<size_t>(pos)] = j;
+            matrix->probs[static_cast<size_t>(pos)] = prob;
         }
     }
     return matrix;
@@ -1059,33 +1035,6 @@ static FoldResult foldSequenceStructure(const std::string &seq,
     }
     if (backend == "linearfold" || backend == "partition") {
         std::string dot;
-        const bool useSparsePairMatrix = settings.keepPairMatrix && settings.sparsePairMatrix && !settings.dotBracketOnly;
-        if (useSparsePairMatrix) {
-            std::vector<RnaPairProbability> sparsePairs;
-            if (rnaLinearPartitionPredictSparse(normalized,
-                                                settings.minLoop,
-                                                settings.linearfoldBeamSize,
-                                                dot,
-                                                sparsePairs)
-                && dot.size() == normalized.size()) {
-                out.backendUsed = "linearfold";
-                out.partners = dotBracketToPartners(dot);
-                std::shared_ptr<const SparsePairMatrix> sparsePairMatrix = makeSparsePairMatrix(static_cast<int>(normalized.size()), sparsePairs);
-                if (backend == "partition") {
-                    out.backendUsed = "partition";
-                    out.structVec.clear();
-                } else if (sparsePairMatrix) {
-                    out.structVec = sparsePairMatrixToStructVec(*sparsePairMatrix,
-                                                                out.partners,
-                                                                static_cast<int>(normalized.size()));
-                }
-                if (settings.keepPairMatrix) {
-                    out.sparsePairMatrix = sparsePairMatrix;
-                }
-                return out;
-            }
-        }
-
         std::vector<float> pairMatrix;
         if (rnaLinearPartitionPredict(normalized,
                                       settings.minLoop,
@@ -1107,7 +1056,11 @@ static FoldResult foldSequenceStructure(const std::string &seq,
                                                       static_cast<int>(normalized.size()));
             }
             if (settings.keepPairMatrix && !settings.dotBracketOnly) {
-                out.pairMatrix.swap(pairMatrix);
+                if (settings.sparsePairMatrix) {
+                    out.sparsePairMatrix = makeSparsePairMatrixFromDense(static_cast<int>(normalized.size()), pairMatrix);
+                } else {
+                    out.pairMatrix.swap(pairMatrix);
+                }
             }
             return out;
         }
