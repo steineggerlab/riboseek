@@ -101,8 +101,9 @@ struct WindowInfo {
     int localSeedEnd = 0;
 };
 
+template <typename PairVec>
 static std::shared_ptr<const SparsePairMatrix> makeSparsePairMatrix(int len,
-                                                                     const std::vector<RnaPairProbability> &pairs) {
+                                                                     const PairVec &pairs) {
     if (len <= 0) {
         return std::shared_ptr<const SparsePairMatrix>();
     }
@@ -110,7 +111,7 @@ static std::shared_ptr<const SparsePairMatrix> makeSparsePairMatrix(int len,
     matrix->len = len;
     matrix->rowOffsets.assign(static_cast<size_t>(len + 1), 0);
     for (size_t k = 0; k < pairs.size(); ++k) {
-        const RnaPairProbability &pair = pairs[k];
+        const auto &pair = pairs[k];
         if (pair.i < 0 || pair.j < 0 || pair.i >= len || pair.j >= len || pair.i == pair.j || pair.p <= 0.0f) {
             continue;
         }
@@ -125,7 +126,7 @@ static std::shared_ptr<const SparsePairMatrix> makeSparsePairMatrix(int len,
     matrix->probs.assign(static_cast<size_t>(total), 0.0f);
     std::vector<int> cursor = matrix->rowOffsets;
     for (size_t k = 0; k < pairs.size(); ++k) {
-        const RnaPairProbability &pair = pairs[k];
+        const auto &pair = pairs[k];
         if (pair.i < 0 || pair.j < 0 || pair.i >= len || pair.j >= len || pair.i == pair.j || pair.p <= 0.0f) {
             continue;
         }
