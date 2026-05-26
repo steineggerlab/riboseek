@@ -5346,8 +5346,8 @@ static int runCmliteImpl(int argc,
     structureSettings.minLoop = std::max(0, parseEnvInt("MMSEQS_CMLITE_MIN_LOOP", 3));
     structureSettings.linearfoldMinLength = std::max(0, parseEnvInt("MMSEQS_CMLITE_LINEARFOLD_MIN_LENGTH", 128));
     structureSettings.linearfoldBeamSize = std::max(1, parseEnvInt("MMSEQS_CMLITE_LINEARFOLD_BEAM", 100));
-    structureSettings.rnaPlfoldWindow = std::max(0, parseEnvInt("MMSEQS_CMLITE_RNAPLFOLD_WINDOW", par.emsearchRnaPlfoldWindow));
-    structureSettings.rnaPlfoldSpan = std::max(0, parseEnvInt("MMSEQS_CMLITE_RNAPLFOLD_SPAN", par.emsearchRnaPlfoldSpan));
+    structureSettings.rnaPlfoldWindow = std::max(0, parseEnvInt("MMSEQS_CMLITE_RNAPLFOLD_WINDOW", 0));
+    structureSettings.rnaPlfoldSpan = std::max(0, parseEnvInt("MMSEQS_CMLITE_RNAPLFOLD_SPAN", 0));
     structureSettings.sparsePairMatrix = parseEnvInt("MMSEQS_CMLITE_SPARSE_PAIR_MATRIX", 0) != 0;
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, 0.0f);
@@ -5936,12 +5936,12 @@ static int runLolalignImpl(int argc,
     const char *lolalignBackendEnv = std::getenv("MMSEQS_LOLALIGN_STRUCTURE_BACKEND");
     structureSettings.backend = lolalignBackendEnv != NULL
         ? lolalignBackendEnv
-        : (par.emsearchRnaPlfold ? "rnaplfold" : "linearfold");
+        : "linearfold";
     structureSettings.minLoop = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_MIN_LOOP", 3));
     structureSettings.linearfoldMinLength = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_LINEARFOLD_MIN_LENGTH", 0));
     structureSettings.linearfoldBeamSize = std::max(1, parseEnvInt("MMSEQS_LOLALIGN_LINEARFOLD_BEAM", 100));
-    structureSettings.rnaPlfoldWindow = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_RNAPLFOLD_WINDOW", par.emsearchRnaPlfoldWindow));
-    structureSettings.rnaPlfoldSpan = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_RNAPLFOLD_SPAN", par.emsearchRnaPlfoldSpan));
+    structureSettings.rnaPlfoldWindow = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_RNAPLFOLD_WINDOW", 0));
+    structureSettings.rnaPlfoldSpan = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_RNAPLFOLD_SPAN", 0));
     const char *keepPairMatrixEnv = std::getenv("MMSEQS_LOLALIGN_KEEP_PAIR_MATRIX");
     structureSettings.keepPairMatrix = keepPairMatrixEnv != NULL
         ? std::atoi(keepPairMatrixEnv) != 0
