@@ -5875,7 +5875,7 @@ static int runLolalignImpl(int argc,
     const bool useDinuc = par.emsearchDinucleotide || (parseEnvInt("MMSEQS_LOLALIGN_DINUC", 0) != 0);
     const bool acceptAllRefinements = parseEnvInt("MMSEQS_LOLALIGN_ACCEPT_ALL", 0) != 0;
     const bool disableRefinement = parseEnvInt("MMSEQS_LOLALIGN_DISABLE_REFINEMENT", 0) != 0;
-    const bool streamRefinement = parseEnvInt("MMSEQS_LOLALIGN_STREAM_REFINEMENT", 0) != 0;
+    const bool streamRefinement = parseEnvInt("MMSEQS_LOLALIGN_STREAM_REFINEMENT", 1) != 0;
     const bool useRowDedup = parseEnvInt("MMSEQS_LOLALIGN_DEDUP_ROWS", 0) != 0;
     const double msaEvalThr = par.lolalignMsaEvalThr;
     const bool uncappedModelHits = std::isfinite(msaEvalThr);
@@ -6259,36 +6259,155 @@ static int runLolalignImpl(int argc,
             return true;
         };
 
-        for (size_t h = 0; h < modelHits.size(); ++h) {
-            const size_t idx = modelHits[h].candidateIdx;
-            if (idx < candidates.size()) {
-                materializeCandidateWindow(candidates[idx], tDbr, threadIdx, targetMapper,
-                                           decodeTargetDinuc, targetGpuDb, &subMat);
-            }
-        }
-
-#pragma omp parallel for schedule(dynamic, 32) if(parallelCandidates)
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            if (!modelCandidate[i] || candidates[i].window.seq.empty()) {
-                continue;
-            }
-            if (!useFoldCache || !assignCachedFold(i)) {
-                FoldResult fold = foldSequenceStructure(candidates[i].window.seq, structureSettings);
-                candidates[i].window.structVec.swap(fold.structVec);
-                candidates[i].window.partners.swap(fold.partners);
-                candidates[i].window.pairMatrix.swap(fold.pairMatrix);
-                candidates[i].window.sparsePairMatrix = fold.sparsePairMatrix;
-            }
-        }
-
         std::vector<std::array<float, 4>> profile;
         std::vector<StructVec> queryStruct = baseQueryFold.structVec;
-        buildProfile(querySeq, modelHits, candidates, baseQueryFold.structVec, 0.35f, profile, queryStruct);
+        profile.assign(static_cast<size_t>(qLen), {0.0f, 0.0f, 0.0f, 0.0f});
+        std::vector<std::array<float, 4>> profileCounts(static_cast<size_t>(qLen), {0.25f, 0.25f, 0.25f, 0.25f});
+        std::vector<float> profileStructWeight(static_cast<size_t>(qLen), 1.0f);
+        for (int i = 0; i < static_cast<int>(qLen); ++i) {
+            const int b = encodeBase(querySeq[static_cast<size_t>(i)]);
+            if (b >= 0) {
+                profileCounts[static_cast<size_t>(i)][static_cast<size_t>(b)] += 3.0f;
+            }
+        }
+
         std::vector<float> pairSupport;
         std::vector<int> msaPartners = baseQueryFold.partners;
         const bool buildQuerySupport = querySupportMaxLen <= 0 || static_cast<int>(qLen) <= querySupportMaxLen;
         if (buildQuerySupport) {
-            pairSupport = buildPairSupportMatrix(static_cast<int>(qLen), modelHits, candidates);
+            pairSupport.assign(static_cast<size_t>(qLen * qLen), 0.0f);
+        }
+        float pairSupportTotalWeight = 0.0f;
+        size_t streamedModelFoldCount = 0;
+
+        int modelProfileChunkSize = std::max(1, parseEnvInt("MMSEQS_LOLALIGN_MODEL_PROFILE_CHUNK_SIZE", std::max(1, par.threads)));
+        if (memoryGuardEnabled && denseRetained && denseCapBytes > 0ULL) {
+            const unsigned long long perModelWindowBytes = std::max(1ULL, densePairMatrixBytesForLength(maxWindowLen));
+            const unsigned long long capped = std::max(1ULL, denseCapBytes / perModelWindowBytes);
+            modelProfileChunkSize = std::max(1, std::min(modelProfileChunkSize,
+                static_cast<int>(std::min<unsigned long long>(capped, static_cast<unsigned long long>(INT_MAX)))));
+        }
+
+        for (size_t chunkStart = 0; chunkStart < modelHits.size(); chunkStart += static_cast<size_t>(modelProfileChunkSize)) {
+            const size_t chunkEnd = std::min(modelHits.size(), chunkStart + static_cast<size_t>(modelProfileChunkSize));
+            const size_t chunkLen = chunkEnd - chunkStart;
+            std::vector<char> chunkReady(chunkLen, 0);
+
+#pragma omp parallel if(parallelCandidates && chunkLen > 1)
+            {
+                unsigned int localThreadIdx = threadIdx;
+#ifdef OPENMP
+                localThreadIdx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                Sequence chunkTargetMapper(tDbr.getMaxSeqLen(), targetSeqType, &subMat, 0, false, false);
+#pragma omp for schedule(dynamic, 1)
+                for (size_t ci = 0; ci < chunkLen; ++ci) {
+                    const size_t h = chunkStart + ci;
+                    const ModelHit &modelHit = modelHits[h];
+                    if (!modelHit.aln.valid || modelHit.candidateIdx >= candidates.size()) {
+                        continue;
+                    }
+                    CandidateHit &cand = candidates[modelHit.candidateIdx];
+                    if (!windowBoundsValid(cand.window)) {
+                        continue;
+                    }
+                    if (cand.window.seq.empty()
+                        && !materializeCandidateWindow(cand, tDbr, localThreadIdx, chunkTargetMapper,
+                                                       decodeTargetDinuc, targetGpuDb, &subMat)) {
+                        continue;
+                    }
+                    if (!useFoldCache || !assignCachedFold(modelHit.candidateIdx)) {
+                        FoldResult fold = foldSequenceStructure(cand.window.seq, structureSettings);
+                        cand.window.structVec.swap(fold.structVec);
+                        cand.window.partners.swap(fold.partners);
+                        cand.window.pairMatrix.swap(fold.pairMatrix);
+                        cand.window.sparsePairMatrix = fold.sparsePairMatrix;
+                    }
+                    chunkReady[ci] = 1;
+                }
+            }
+
+            for (size_t ci = 0; ci < chunkLen; ++ci) {
+                if (!chunkReady[ci]) {
+                    continue;
+                }
+                const size_t h = chunkStart + ci;
+                const ModelHit &modelHit = modelHits[h];
+                CandidateHit &cand = candidates[modelHit.candidateIdx];
+                ++streamedModelFoldCount;
+
+                ProjectedAlignment proj = projectAlignment(static_cast<int>(qLen), cand.window, modelHit.aln);
+                for (int i = 0; i < static_cast<int>(qLen); ++i) {
+                    const char c = proj.row[static_cast<size_t>(i)];
+                    const int b = encodeBase(c);
+                    if (b < 0) {
+                        continue;
+                    }
+                    const float sim = structureSimilarity(queryStruct[static_cast<size_t>(i)],
+                                                          proj.structByQuery[static_cast<size_t>(i)]);
+                    const float localWeight = modelHit.weight * (1.0f + 0.35f * sim);
+                    profileCounts[static_cast<size_t>(i)][static_cast<size_t>(b)] += localWeight;
+                    queryStruct[static_cast<size_t>(i)].u += localWeight * proj.structByQuery[static_cast<size_t>(i)].u;
+                    queryStruct[static_cast<size_t>(i)].l += localWeight * proj.structByQuery[static_cast<size_t>(i)].l;
+                    queryStruct[static_cast<size_t>(i)].r += localWeight * proj.structByQuery[static_cast<size_t>(i)].r;
+                    profileStructWeight[static_cast<size_t>(i)] += localWeight;
+                }
+
+                const int targetLen = static_cast<int>(cand.window.seq.size());
+                if (buildQuerySupport && targetLen > 0) {
+                    pairSupportTotalWeight += modelHit.weight;
+                    for (int i = 0; i < static_cast<int>(qLen); ++i) {
+                        const int ti = proj.targetPosByQuery[static_cast<size_t>(i)];
+                        if (ti < 0) {
+                            continue;
+                        }
+                        for (int j = i + 1; j < static_cast<int>(qLen); ++j) {
+                            const int tj = proj.targetPosByQuery[static_cast<size_t>(j)];
+                            if (tj < 0) {
+                                continue;
+                            }
+                            float support = windowPairMatrixAt(cand.window, ti, tj);
+                            if (support <= 0.0f
+                                && cand.window.partners.size() == static_cast<size_t>(targetLen)
+                                && cand.window.partners[static_cast<size_t>(ti)] == tj) {
+                                support = 1.0f;
+                            }
+                            if (support <= 0.0f) {
+                                continue;
+                            }
+                            const size_t ij = static_cast<size_t>(i * qLen + j);
+                            const size_t ji = static_cast<size_t>(j * qLen + i);
+                            pairSupport[ij] += modelHit.weight * support;
+                            pairSupport[ji] += modelHit.weight * support;
+                        }
+                    }
+                }
+                clearWindowMaterialized(cand.window);
+            }
+        }
+
+        for (int i = 0; i < static_cast<int>(qLen); ++i) {
+            queryStruct[static_cast<size_t>(i)].u /= profileStructWeight[static_cast<size_t>(i)];
+            queryStruct[static_cast<size_t>(i)].l /= profileStructWeight[static_cast<size_t>(i)];
+            queryStruct[static_cast<size_t>(i)].r /= profileStructWeight[static_cast<size_t>(i)];
+
+            const float sum = profileCounts[static_cast<size_t>(i)][0]
+                            + profileCounts[static_cast<size_t>(i)][1]
+                            + profileCounts[static_cast<size_t>(i)][2]
+                            + profileCounts[static_cast<size_t>(i)][3];
+            for (int b = 0; b < 4; ++b) {
+                const float prob = profileCounts[static_cast<size_t>(i)][static_cast<size_t>(b)] / sum;
+                const float score = 5.0f * std::log2(prob / 0.25f);
+                profile[static_cast<size_t>(i)][static_cast<size_t>(b)] = clampf(score, -10.0f, 10.0f);
+            }
+        }
+
+        if (buildQuerySupport) {
+            if (pairSupportTotalWeight > 0.0f) {
+                for (size_t i = 0; i < pairSupport.size(); ++i) {
+                    pairSupport[i] /= pairSupportTotalWeight;
+                }
+            }
             const float minPairSupport = clampf(parseEnvFloat("MMSEQS_LOLALIGN_MIN_PAIR_SUPPORT", 0.18f), 0.0f, 1.0f);
             std::vector<int> supportPartners = derivePartnersFromPairSupport(pairSupport,
                                                                               static_cast<int>(qLen),
@@ -6299,6 +6418,11 @@ static int runLolalignImpl(int argc,
                 queryStruct = pairMatrixToStructVec(pairSupport, msaPartners, static_cast<int>(qLen));
             }
         }
+        Debug(Debug::INFO) << "  streamed model/profile folds: " << streamedModelFoldCount
+                           << ", model hits=" << modelHits.size()
+                           << ", query support=" << (buildQuerySupport ? "yes" : "no")
+                           << ", chunk size=" << modelProfileChunkSize
+                           << "\n";
         std::string lolConsensusSeq = consensusSequenceFromProfile(querySeq, profile);
         std::vector<StemPattern> lolPatterns = buildStemPatterns(lolConsensusSeq, msaPartners, pairSupport, profile);
         if (lolPatterns.empty()) {
