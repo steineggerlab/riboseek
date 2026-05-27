@@ -5874,6 +5874,8 @@ static int runLolalignImpl(int argc,
     const int bandExtra = std::max(8, parseEnvInt("MMSEQS_LOLALIGN_BAND_EXTRA", 32));
     const bool useDinuc = par.emsearchDinucleotide || (parseEnvInt("MMSEQS_LOLALIGN_DINUC", 0) != 0);
     const bool acceptAllRefinements = parseEnvInt("MMSEQS_LOLALIGN_ACCEPT_ALL", 0) != 0;
+    const bool disableRefinement = parseEnvInt("MMSEQS_LOLALIGN_DISABLE_REFINEMENT", 0) != 0;
+    const bool streamRefinement = parseEnvInt("MMSEQS_LOLALIGN_STREAM_REFINEMENT", 0) != 0;
     const bool useRowDedup = parseEnvInt("MMSEQS_LOLALIGN_DEDUP_ROWS", 0) != 0;
     const double msaEvalThr = par.lolalignMsaEvalThr;
     const bool uncappedModelHits = std::isfinite(msaEvalThr);
@@ -5928,6 +5930,8 @@ static int runLolalignImpl(int argc,
                        << ", rnaplfold span: " << structureSettings.rnaPlfoldSpan
                        << ", keep pair matrix: " << (structureSettings.keepPairMatrix ? "yes" : "no")
                        << ", sparse pair matrix: " << (structureSettings.sparsePairMatrix ? "yes" : "no")
+                       << ", refinement: " << (disableRefinement ? "disabled" : "enabled")
+                       << ", streaming refinement: " << (streamRefinement ? "yes" : "no")
                        << "\n";
 
     DBReader<unsigned int> qDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
@@ -6062,7 +6066,8 @@ static int runLolalignImpl(int argc,
             effectiveBatchSize = std::max(1, std::min(candidateBatchSize, static_cast<int>(std::min<unsigned long long>(capped, static_cast<unsigned long long>(INT_MAX)))));
         }
 
-        const bool foldCacheRequestedForMemory = parseEnvInt("MMSEQS_LOLALIGN_FOLD_CACHE", 1) != 0;
+        const bool foldCacheRequestedForMemory = !streamRefinement
+            && parseEnvInt("MMSEQS_LOLALIGN_FOLD_CACHE", 1) != 0;
         unsigned long long estimatedPeakBytes = 0ULL;
         unsigned long long estimatedCacheBytes = 0ULL;
         unsigned long long perWindowRetainedBytes = 0ULL;
@@ -6153,7 +6158,8 @@ static int runLolalignImpl(int argc,
             modelCandidate[modelHits[i].candidateIdx] = 1;
         }
 
-        bool useFoldCache = parseEnvInt("MMSEQS_LOLALIGN_FOLD_CACHE", 1) != 0;
+        bool useFoldCache = !streamRefinement
+            && parseEnvInt("MMSEQS_LOLALIGN_FOLD_CACHE", 1) != 0;
         const int foldCacheMaxUnique = std::max(0, parseEnvInt("MMSEQS_LOLALIGN_FOLD_CACHE_MAX_UNIQUE", 0));
         if (effectiveBatchSize != candidateBatchSize) {
             Debug(Debug::INFO) << "  candidate batch size capped for lolalign memory: requested="
@@ -6319,9 +6325,10 @@ static int runLolalignImpl(int argc,
             seenRows.reserve(candidates.size() * 2);
         }
         char buffer[4096];
-        for (size_t batchStart = 0; batchStart < candidates.size(); batchStart += static_cast<size_t>(effectiveBatchSize)) {
-            const size_t batchEnd = std::min(candidates.size(), batchStart + static_cast<size_t>(effectiveBatchSize));
-            const size_t batchLen = batchEnd - batchStart;
+        if (streamRefinement) {
+            Debug(Debug::INFO) << "  streaming refinement enabled: folding and LoL refinement are combined per candidate; fold cache disabled\n";
+            std::vector<RnaMatcher::result_t> refined(candidates.size());
+            std::vector<std::string> rowSignatures(candidates.size());
 
 #pragma omp parallel if(parallelCandidates)
             {
@@ -6331,118 +6338,242 @@ static int runLolalignImpl(int argc,
 #endif
                 Sequence batchTargetMapper(tDbr.getMaxSeqLen(), targetSeqType, &subMat, 0, false, false);
 #pragma omp for schedule(dynamic, 32)
-                for (size_t bi = 0; bi < batchLen; ++bi) {
-                    const size_t idx = batchStart + bi;
-                    if (!windowBoundsValid(candidates[idx].window)) {
+                for (size_t idx = 0; idx < candidates.size(); ++idx) {
+                    CandidateHit &cand = candidates[idx];
+                    if (!windowBoundsValid(cand.window)
+                        || !materializeCandidateWindow(cand, tDbr, localThreadIdx, batchTargetMapper,
+                                                       decodeTargetDinuc, targetGpuDb, &subMat)) {
+                        refined[idx] = cand.raw;
                         continue;
                     }
-                    if (!materializeCandidateWindow(candidates[idx], tDbr, localThreadIdx, batchTargetMapper,
-                                                    decodeTargetDinuc, targetGpuDb, &subMat)) {
-                        continue;
-                    }
-                    if (!candidates[idx].window.structVec.empty()
-                        && candidates[idx].window.structVec.size() == candidates[idx].window.seq.size()) {
-                        continue;
-                    }
-                    if (!useFoldCache || !assignCachedFold(idx)) {
-                        FoldResult fold = foldSequenceStructure(candidates[idx].window.seq, structureSettings);
-                        candidates[idx].window.structVec.swap(fold.structVec);
-                        candidates[idx].window.partners.swap(fold.partners);
-                        candidates[idx].window.pairMatrix.swap(fold.pairMatrix);
-                        candidates[idx].window.sparsePairMatrix = fold.sparsePairMatrix;
-                    }
-                }
-            }
 
-            std::vector<RnaMatcher::result_t> refined(batchLen);
-            std::vector<std::string> rowSignatures(batchLen);
-
-#pragma omp parallel for schedule(dynamic, 32) if(parallelCandidates)
-            for (size_t bi = 0; bi < batchLen; ++bi) {
-                const size_t idx = batchStart + bi;
-                const CandidateHit &cand = candidates[idx];
-                if (cand.window.seq.empty()) {
-                    refined[bi] = cand.raw;
-                    continue;
-                }
-                const AlignmentResult rawAln = rawAlignmentFromCandidate(querySeq, cand);
-                if (rawAln.valid) {
-#pragma omp atomic
-                    ++validRawAlignmentCount;
-                }
-                const StemGuide rawGuide = makeNeutralGuide(static_cast<int>(qLen), msaPartners);
-                const AlignmentSummary rawSummary = summarizeAlignment(querySeq, queryStruct, rawGuide, cand.window, rawAln, cand.raw.dbLen);
-                const auto emitRawFallback = [&]() {
-#pragma omp atomic
-                    ++rawFallbackCount;
+                    const AlignmentResult rawAln = rawAlignmentFromCandidate(querySeq, cand);
                     if (rawAln.valid) {
-                        refined[bi] = emitResultFromAlignment(cand.raw, cand.window, rawAln, rawSummary, qLen, cand.raw.dbLen);
-                    } else {
-                        refined[bi] = cand.raw;
+#pragma omp atomic
+                        ++validRawAlignmentCount;
                     }
-                    if (useRowDedup && rawAln.valid) {
-                        ProjectedAlignment proj = projectAlignment(static_cast<int>(querySeq.size()), cand.window, rawAln);
-                        rowSignatures[bi] = proj.row;
+                    const StemGuide rawGuide = makeNeutralGuide(static_cast<int>(qLen), msaPartners);
+                    const AlignmentSummary rawSummary = summarizeAlignment(querySeq, queryStruct, rawGuide, cand.window, rawAln, cand.raw.dbLen);
+                    const auto emitRawFallback = [&]() {
+#pragma omp atomic
+                        ++rawFallbackCount;
+                        if (rawAln.valid) {
+                            refined[idx] = emitResultFromAlignment(cand.raw, cand.window, rawAln, rawSummary, qLen, cand.raw.dbLen);
+                        } else {
+                            refined[idx] = cand.raw;
+                        }
+                        if (useRowDedup && rawAln.valid) {
+                            ProjectedAlignment proj = projectAlignment(static_cast<int>(querySeq.size()), cand.window, rawAln);
+                            rowSignatures[idx] = proj.row;
+                        }
+                    };
+
+                    if (disableRefinement) {
+                        emitRawFallback();
+                        clearWindowMaterialized(cand.window);
+                        continue;
                     }
-                };
 
-                const int seedDiag = cand.window.localSeedStart - cand.oriented.qStart;
-                const int seedBandRadius = estimateSeedBandRadius(cand, bandExtra);
-                const AlignmentResult lolAln = runLolAlignIteration(querySeq,
-                                                                    profile,
-                                                                    queryStruct,
-                                                                    msaPartners,
-                                                                    pairSupport,
-                                                                    lolPatterns,
-                                                                    cand.window,
-                                                                    0,
-                                                                    static_cast<int>(qLen) - 1,
-                                                                    seedDiag,
-                                                                    seedBandRadius);
-                if (!lolAln.valid) {
-                    emitRawFallback();
-                    continue;
-                }
+                    if (cand.window.structVec.empty()
+                        || cand.window.structVec.size() != cand.window.seq.size()) {
+                        FoldResult fold = foldSequenceStructure(cand.window.seq, structureSettings);
+                        cand.window.structVec.swap(fold.structVec);
+                        cand.window.partners.swap(fold.partners);
+                        cand.window.pairMatrix.swap(fold.pairMatrix);
+                        cand.window.sparsePairMatrix = fold.sparsePairMatrix;
+                    }
 
-                const StemGuide lolGuide = buildLolGuideFromAlignment(static_cast<int>(qLen),
-                                                                      msaPartners,
-                                                                      pairSupport,
-                                                                      cand.window,
-                                                                      lolAln);
-                const AlignmentSummary lolSummary = summarizeAlignment(querySeq, queryStruct, lolGuide, cand.window, lolAln, cand.raw.dbLen);
-                const bool accept = acceptAllRefinements
-                    || (!rawAln.valid)
-                    || (lolSummary.qcov >= std::max(0.10f, rawSummary.qcov * 0.60f)
-                        && lolSummary.consistency + minConsistencyGain >= rawSummary.consistency
-                        && lolSummary.seqId + minSeqIdGain >= rawSummary.seqId);
-                if (!accept) {
-                    emitRawFallback();
-                    continue;
-                }
+                    const int seedDiag = cand.window.localSeedStart - cand.oriented.qStart;
+                    const int seedBandRadius = estimateSeedBandRadius(cand, bandExtra);
+                    const AlignmentResult lolAln = runLolAlignIteration(querySeq,
+                                                                        profile,
+                                                                        queryStruct,
+                                                                        msaPartners,
+                                                                        pairSupport,
+                                                                        lolPatterns,
+                                                                        cand.window,
+                                                                        0,
+                                                                        static_cast<int>(qLen) - 1,
+                                                                        seedDiag,
+                                                                        seedBandRadius);
+                    if (!lolAln.valid) {
+                        emitRawFallback();
+                        clearWindowMaterialized(cand.window);
+                        continue;
+                    }
+
+                    const StemGuide lolGuide = buildLolGuideFromAlignment(static_cast<int>(qLen),
+                                                                          msaPartners,
+                                                                          pairSupport,
+                                                                          cand.window,
+                                                                          lolAln);
+                    const AlignmentSummary lolSummary = summarizeAlignment(querySeq, queryStruct, lolGuide, cand.window, lolAln, cand.raw.dbLen);
+                    const bool accept = acceptAllRefinements
+                        || (!rawAln.valid)
+                        || (lolSummary.qcov >= std::max(0.10f, rawSummary.qcov * 0.60f)
+                            && lolSummary.consistency + minConsistencyGain >= rawSummary.consistency
+                            && lolSummary.seqId + minSeqIdGain >= rawSummary.seqId);
+                    if (!accept) {
+                        emitRawFallback();
+                        clearWindowMaterialized(cand.window);
+                        continue;
+                    }
 
 #pragma omp atomic
-                ++acceptedRefinementCount;
-                refined[bi] = emitResultFromAlignment(cand.raw, cand.window, lolAln, lolSummary, qLen, cand.raw.dbLen);
-                if (useRowDedup) {
-                    ProjectedAlignment proj = projectAlignment(static_cast<int>(querySeq.size()), cand.window, lolAln);
-                    rowSignatures[bi] = proj.row;
+                    ++acceptedRefinementCount;
+                    refined[idx] = emitResultFromAlignment(cand.raw, cand.window, lolAln, lolSummary, qLen, cand.raw.dbLen);
+                    if (useRowDedup) {
+                        ProjectedAlignment proj = projectAlignment(static_cast<int>(querySeq.size()), cand.window, lolAln);
+                        rowSignatures[idx] = proj.row;
+                    }
+                    clearWindowMaterialized(cand.window);
                 }
             }
 
-            for (size_t bi = 0; bi < batchLen; ++bi) {
-                if (useRowDedup && !rowSignatures[bi].empty()) {
-                    if (!seenRows.insert(rowSignatures[bi]).second) {
+            for (size_t idx = 0; idx < candidates.size(); ++idx) {
+                if (useRowDedup && !rowSignatures[idx].empty()) {
+                    if (!seenRows.insert(rowSignatures[idx]).second) {
                         continue;
                     }
                 }
-                const size_t written = RnaMatcher::resultToBuffer(buffer, refined[bi], par.addBacktrace, true, false);
+                const size_t written = RnaMatcher::resultToBuffer(buffer, refined[idx], par.addBacktrace, true, false);
                 out.append(buffer, written);
                 ++emittedRowCount;
             }
+        } else {
+            for (size_t batchStart = 0; batchStart < candidates.size(); batchStart += static_cast<size_t>(effectiveBatchSize)) {
+                const size_t batchEnd = std::min(candidates.size(), batchStart + static_cast<size_t>(effectiveBatchSize));
+                const size_t batchLen = batchEnd - batchStart;
 
-            for (size_t bi = 0; bi < batchLen; ++bi) {
-                const size_t idx = batchStart + bi;
-                clearWindowMaterialized(candidates[idx].window);
+#pragma omp parallel if(parallelCandidates)
+                {
+                    unsigned int localThreadIdx = threadIdx;
+#ifdef OPENMP
+                    localThreadIdx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                    Sequence batchTargetMapper(tDbr.getMaxSeqLen(), targetSeqType, &subMat, 0, false, false);
+#pragma omp for schedule(dynamic, 32)
+                    for (size_t bi = 0; bi < batchLen; ++bi) {
+                        const size_t idx = batchStart + bi;
+                        if (!windowBoundsValid(candidates[idx].window)) {
+                            continue;
+                        }
+                        if (!materializeCandidateWindow(candidates[idx], tDbr, localThreadIdx, batchTargetMapper,
+                                                        decodeTargetDinuc, targetGpuDb, &subMat)) {
+                            continue;
+                        }
+                        if (disableRefinement) {
+                            continue;
+                        }
+                        if (!candidates[idx].window.structVec.empty()
+                            && candidates[idx].window.structVec.size() == candidates[idx].window.seq.size()) {
+                            continue;
+                        }
+                        if (!useFoldCache || !assignCachedFold(idx)) {
+                            FoldResult fold = foldSequenceStructure(candidates[idx].window.seq, structureSettings);
+                            candidates[idx].window.structVec.swap(fold.structVec);
+                            candidates[idx].window.partners.swap(fold.partners);
+                            candidates[idx].window.pairMatrix.swap(fold.pairMatrix);
+                            candidates[idx].window.sparsePairMatrix = fold.sparsePairMatrix;
+                        }
+                    }
+                }
+
+                std::vector<RnaMatcher::result_t> refined(batchLen);
+                std::vector<std::string> rowSignatures(batchLen);
+
+#pragma omp parallel for schedule(dynamic, 32) if(parallelCandidates)
+                for (size_t bi = 0; bi < batchLen; ++bi) {
+                    const size_t idx = batchStart + bi;
+                    const CandidateHit &cand = candidates[idx];
+                    if (cand.window.seq.empty()) {
+                        refined[bi] = cand.raw;
+                        continue;
+                    }
+                    const AlignmentResult rawAln = rawAlignmentFromCandidate(querySeq, cand);
+                    if (rawAln.valid) {
+#pragma omp atomic
+                        ++validRawAlignmentCount;
+                    }
+                    const StemGuide rawGuide = makeNeutralGuide(static_cast<int>(qLen), msaPartners);
+                    const AlignmentSummary rawSummary = summarizeAlignment(querySeq, queryStruct, rawGuide, cand.window, rawAln, cand.raw.dbLen);
+                    const auto emitRawFallback = [&]() {
+#pragma omp atomic
+                        ++rawFallbackCount;
+                        if (rawAln.valid) {
+                            refined[bi] = emitResultFromAlignment(cand.raw, cand.window, rawAln, rawSummary, qLen, cand.raw.dbLen);
+                        } else {
+                            refined[bi] = cand.raw;
+                        }
+                        if (useRowDedup && rawAln.valid) {
+                            ProjectedAlignment proj = projectAlignment(static_cast<int>(querySeq.size()), cand.window, rawAln);
+                            rowSignatures[bi] = proj.row;
+                        }
+                    };
+
+                    if (disableRefinement) {
+                        emitRawFallback();
+                        continue;
+                    }
+
+                    const int seedDiag = cand.window.localSeedStart - cand.oriented.qStart;
+                    const int seedBandRadius = estimateSeedBandRadius(cand, bandExtra);
+                    const AlignmentResult lolAln = runLolAlignIteration(querySeq,
+                                                                        profile,
+                                                                        queryStruct,
+                                                                        msaPartners,
+                                                                        pairSupport,
+                                                                        lolPatterns,
+                                                                        cand.window,
+                                                                        0,
+                                                                        static_cast<int>(qLen) - 1,
+                                                                        seedDiag,
+                                                                        seedBandRadius);
+                    if (!lolAln.valid) {
+                        emitRawFallback();
+                        continue;
+                    }
+
+                    const StemGuide lolGuide = buildLolGuideFromAlignment(static_cast<int>(qLen),
+                                                                          msaPartners,
+                                                                          pairSupport,
+                                                                          cand.window,
+                                                                          lolAln);
+                    const AlignmentSummary lolSummary = summarizeAlignment(querySeq, queryStruct, lolGuide, cand.window, lolAln, cand.raw.dbLen);
+                    const bool accept = acceptAllRefinements
+                        || (!rawAln.valid)
+                        || (lolSummary.qcov >= std::max(0.10f, rawSummary.qcov * 0.60f)
+                            && lolSummary.consistency + minConsistencyGain >= rawSummary.consistency
+                            && lolSummary.seqId + minSeqIdGain >= rawSummary.seqId);
+                    if (!accept) {
+                        emitRawFallback();
+                        continue;
+                    }
+
+#pragma omp atomic
+                    ++acceptedRefinementCount;
+                    refined[bi] = emitResultFromAlignment(cand.raw, cand.window, lolAln, lolSummary, qLen, cand.raw.dbLen);
+                    if (useRowDedup) {
+                        ProjectedAlignment proj = projectAlignment(static_cast<int>(querySeq.size()), cand.window, lolAln);
+                        rowSignatures[bi] = proj.row;
+                    }
+                }
+
+                for (size_t bi = 0; bi < batchLen; ++bi) {
+                    if (useRowDedup && !rowSignatures[bi].empty()) {
+                        if (!seenRows.insert(rowSignatures[bi]).second) {
+                            continue;
+                        }
+                    }
+                    const size_t written = RnaMatcher::resultToBuffer(buffer, refined[bi], par.addBacktrace, true, false);
+                    out.append(buffer, written);
+                    ++emittedRowCount;
+                }
+
+                for (size_t bi = 0; bi < batchLen; ++bi) {
+                    const size_t idx = batchStart + bi;
+                    clearWindowMaterialized(candidates[idx].window);
+                }
             }
         }
         for (size_t i = 0; i < candidates.size(); ++i) {
