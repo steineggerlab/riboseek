@@ -96,6 +96,7 @@ struct WindowInfo {
     std::shared_ptr<const SparsePairMatrix> sparsePairMatrix;
     int fullLo = 0;
     int fullHi = -1;
+    int targetLen = 0;
     bool reverseStrand = false;
     int localSeedStart = 0;
     int localSeedEnd = 0;
@@ -1643,27 +1644,82 @@ static std::string consensusSequenceFromProfile(const std::string &querySeq,
     return consensus;
 }
 
+static bool normalizeAlignmentEnvelope(const WindowInfo &window,
+                                       unsigned int qLen,
+                                       AlignmentResult &aln) {
+    if (!aln.valid || aln.backtrace.empty() || aln.qStart < 0 || aln.dbStart < 0) {
+        return false;
+    }
+    const int queryLen = static_cast<int>(qLen);
+    const int targetLen = static_cast<int>(window.seq.size());
+    if (queryLen <= 0 || targetLen <= 0 || aln.qStart >= queryLen || aln.dbStart >= targetLen) {
+        return false;
+    }
+
+    int qPos = aln.qStart;
+    int dbPos = aln.dbStart;
+    int lastQ = -1;
+    int lastDb = -1;
+    int matches = 0;
+    for (size_t i = 0; i < aln.backtrace.size(); ++i) {
+        const char op = aln.backtrace[i];
+        if (op == 'M') {
+            if (qPos < 0 || qPos >= queryLen || dbPos < 0 || dbPos >= targetLen) {
+                return false;
+            }
+            lastQ = qPos;
+            lastDb = dbPos;
+            ++matches;
+            ++qPos;
+            ++dbPos;
+        } else if (op == 'I') {
+            if (qPos < 0 || qPos >= queryLen) {
+                return false;
+            }
+            lastQ = qPos;
+            ++qPos;
+        } else if (op == 'D') {
+            if (dbPos < 0 || dbPos >= targetLen) {
+                return false;
+            }
+            lastDb = dbPos;
+            ++dbPos;
+        } else {
+            return false;
+        }
+    }
+    if (lastQ < aln.qStart || lastDb < aln.dbStart || matches <= 0) {
+        return false;
+    }
+    aln.qEnd = lastQ;
+    aln.dbEnd = lastDb;
+    aln.matches = matches;
+    return true;
+}
+
 static RnaMatcher::result_t emitResultFromAlignment(const RnaMatcher::result_t &raw,
                                                     const WindowInfo &window,
                                                     const AlignmentResult &aln,
                                                     const AlignmentSummary &summary,
                                                     unsigned int qLen,
                                                     unsigned int dbLen) {
-    if (!aln.valid) {
+    AlignmentResult normalized = aln;
+    if (!normalizeAlignmentEnvelope(window, qLen, normalized)) {
         return raw;
     }
 
     int dbStartFull = 0;
     int dbEndFull = 0;
     if (!window.reverseStrand) {
-        dbStartFull = window.fullLo + aln.dbStart;
-        dbEndFull = window.fullLo + aln.dbEnd;
+        dbStartFull = window.fullLo + normalized.dbStart;
+        dbEndFull = window.fullLo + normalized.dbEnd;
     } else {
-        dbStartFull = window.fullHi - aln.dbStart;
-        dbEndFull = window.fullHi - aln.dbEnd;
+        dbStartFull = window.fullHi - normalized.dbStart;
+        dbEndFull = window.fullHi - normalized.dbEnd;
     }
 
-    const unsigned int alnLen = static_cast<unsigned int>(aln.backtrace.size());
+    const unsigned int alnLen = static_cast<unsigned int>(normalized.backtrace.size());
+    const unsigned int outDbLen = (window.targetLen > 0) ? static_cast<unsigned int>(window.targetLen) : dbLen;
     double eval = raw.eval;
     if (raw.score > 0) {
         double delta = static_cast<double>(aln.score) - static_cast<double>(raw.score);
@@ -1678,13 +1734,13 @@ static RnaMatcher::result_t emitResultFromAlignment(const RnaMatcher::result_t &
                                 summary.seqId,
                                 eval,
                                 alnLen,
-                                aln.qStart,
-                                aln.qEnd,
+                                normalized.qStart,
+                                normalized.qEnd,
                                 qLen,
                                 dbStartFull,
                                 dbEndFull,
-                                dbLen,
-                                aln.backtrace);
+                                outDbLen,
+                                normalized.backtrace);
 }
 
 static AlignmentResult coarseSeedAlignmentFromCandidate(const std::string &querySeq,
@@ -1817,6 +1873,7 @@ static WindowInfo buildWindowMetadataFromRaw(unsigned int tLen,
                                              int qLen,
                                              float flankFrac) {
     WindowInfo w;
+    w.targetLen = static_cast<int>(tLen);
     w.reverseStrand = hit.reverseStrand;
     const int dbLo = std::min(hit.dbStart, hit.dbEnd);
     const int dbHi = std::max(hit.dbStart, hit.dbEnd);

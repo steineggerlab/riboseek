@@ -4272,6 +4272,69 @@ static std::string buildWindowSequenceFromHit(const std::string &targetSeq,
     return window;
 }
 
+static bool normalizeRoughHitEnvelopeForExactCyk(const Matcher::result_t &input,
+                                                int queryLen,
+                                                int targetLen,
+                                                Matcher::result_t &output) {
+    output = input;
+    if (input.backtrace.empty() || queryLen <= 0 || targetLen <= 0
+        || input.qStartPos < 0 || input.dbStartPos < 0
+        || input.qStartPos >= queryLen || input.dbStartPos >= targetLen) {
+        return false;
+    }
+
+    const int qStep = (input.qEndPos >= input.qStartPos) ? 1 : -1;
+    const int dbStep = (input.dbEndPos >= input.dbStartPos) ? 1 : -1;
+    int qPos = input.qStartPos;
+    int dbPos = input.dbStartPos;
+    int lastQ = -1;
+    int lastDb = -1;
+    int matches = 0;
+
+    for (size_t k = 0; k < input.backtrace.size(); ++k) {
+        const char op = input.backtrace[k];
+        if (op == 'M') {
+            if (qPos < 0 || qPos >= queryLen || dbPos < 0 || dbPos >= targetLen) {
+                return false;
+            }
+            lastQ = qPos;
+            lastDb = dbPos;
+            ++matches;
+            qPos += qStep;
+            dbPos += dbStep;
+        } else if (op == 'I') {
+            if (qPos < 0 || qPos >= queryLen) {
+                return false;
+            }
+            lastQ = qPos;
+            qPos += qStep;
+        } else if (op == 'D') {
+            if (dbPos < 0 || dbPos >= targetLen) {
+                return false;
+            }
+            lastDb = dbPos;
+            dbPos += dbStep;
+        } else {
+            return false;
+        }
+    }
+
+    if (lastQ < 0 || lastDb < 0 || matches <= 0) {
+        return false;
+    }
+
+    output.qEndPos = lastQ;
+    output.qLen = static_cast<unsigned int>(queryLen);
+    output.dbEndPos = lastDb;
+    output.dbLen = static_cast<unsigned int>(targetLen);
+    output.alnLength = static_cast<unsigned int>(input.backtrace.size());
+    output.qcov = static_cast<float>(std::abs(output.qEndPos - output.qStartPos) + 1)
+                / static_cast<float>(std::max(1, queryLen));
+    output.dbcov = static_cast<float>(std::abs(output.dbEndPos - output.dbStartPos) + 1)
+                 / static_cast<float>(std::max(1, targetLen));
+    return true;
+}
+
 static std::vector<int> buildLolConsensusTargetMap(const Matcher::result_t &rough,
                                                    int fullLo,
                                                    int fullHi,
@@ -9475,8 +9538,8 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
             Sequence seqObjLocal(seqDbr.getMaxSeqLen(), seqDecodeType, &nucMat, 0, false, false);
 #pragma omp for schedule(dynamic, 1)
             for (long hi = 0; hi < static_cast<long>(roughHits.size()); ++hi) {
-                const Matcher::result_t &rough = roughHits[static_cast<size_t>(hi)];
-                const size_t tId = seqDbr.getId(rough.dbKey);
+                const Matcher::result_t &rawRough = roughHits[static_cast<size_t>(hi)];
+                const size_t tId = seqDbr.getId(rawRough.dbKey);
                 if (tId == UINT_MAX) {
                     continue;
                 }
@@ -9486,6 +9549,12 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
 #endif
                 FastaSeq fs = decodeOneSequence(seqDbr, tId, subMat, seqObjLocal,
                                                decodeSeqDinuc, seqGpuDb, thread_idx);
+                Matcher::result_t rough = rawRough;
+                const int roughQueryLen = std::max(1, static_cast<int>(rawRough.qLen));
+                const bool roughEnvelopeOk = normalizeRoughHitEnvelopeForExactCyk(rawRough,
+                                                                                 roughQueryLen,
+                                                                                 static_cast<int>(fs.seq.size()),
+                                                                                 rough);
                 int fullLo = 0;
                 int fullHi = -1;
                 bool reverseStrand = false;
@@ -9497,17 +9566,20 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
                 }
                 std::vector<int> stateMinI, stateMaxI, stateMinJ, stateMaxJ;
                 std::vector<int> slicedMinI, slicedMaxI, slicedMinJ, slicedMaxJ;
-                buildLolStateBands(model, rough, fullLo, fullHi, reverseStrand,
-                                   static_cast<int>(scanSeq.size()), bandPad,
-                                   stateMinI, stateMaxI, stateMinJ, stateMaxJ);
+                if (roughEnvelopeOk) {
+                    buildLolStateBands(model, rough, fullLo, fullHi, reverseStrand,
+                                       static_cast<int>(scanSeq.size()), bandPad,
+                                       stateMinI, stateMaxI, stateMinJ, stateMaxJ);
+                }
 
                 std::string exactSeq = scanSeq;
                 int subLo = 1;
                 int subHi = static_cast<int>(scanSeq.size());
-                const std::vector<int> targetByConsensus =
-                    buildLolConsensusTargetMap(rough, fullLo, fullHi, reverseStrand,
-                                               static_cast<int>(scanSeq.size()),
-                                               std::max(0, model.clen));
+                const std::vector<int> targetByConsensus = roughEnvelopeOk
+                    ? buildLolConsensusTargetMap(rough, fullLo, fullHi, reverseStrand,
+                                                 static_cast<int>(scanSeq.size()),
+                                                 std::max(0, model.clen))
+                    : std::vector<int>();
                 computeLolRescoreWindow(targetByConsensus,
                                         static_cast<int>(scanSeq.size()),
                                         std::max(bandPad, rescorePad),
@@ -9553,19 +9625,11 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
                     h.end1 = fwdEnd;
                 }
 
-                const int rawDbStart = std::max(0, h.start1 - 1);
-                const int rawDbEnd = std::max(0, h.end1 - 1);
                 const int qStartOut = (h.qStart >= 0) ? h.qStart : 0;
                 int qEndOut = (h.qEnd >= 0) ? h.qEnd : std::max(qStartOut, static_cast<int>(model.clen) - 1);
-                if (qEndOut < qStartOut) qEndOut = qStartOut;
+                int rawDbStart = std::max(0, h.start1 - 1);
+                int rawDbEnd = std::max(0, h.end1 - 1);
                 const unsigned int qLen = static_cast<unsigned int>(std::max(1, model.clen));
-                const unsigned int alnLen = (h.cigarAlnLen > 0)
-                    ? h.cigarAlnLen
-                    : static_cast<unsigned int>(std::max(1, std::abs(rawDbEnd - rawDbStart) + 1));
-                const unsigned int qSpan = static_cast<unsigned int>(qEndOut - qStartOut + 1);
-                const unsigned int dbSpanOut = static_cast<unsigned int>(std::max(1, std::abs(rawDbEnd - rawDbStart) + 1));
-                const float qcov = static_cast<float>(qSpan) / static_cast<float>(qLen);
-                const float dbcov = static_cast<float>(dbSpanOut) / static_cast<float>(std::max(1u, h.dbLen));
                 const int bitScore = static_cast<int>(std::lrint(h.cyk));
                 const bool hasBacktrace = (!h.cigar.empty() && h.cigar != "NA");
                 std::string emitCigar;
@@ -9577,7 +9641,61 @@ int lolcmsearch(int argc, const char **argv, const Command &command) {
                         else if (c == 'D') emitCigar.push_back('I');
                         else emitCigar.push_back(c);
                     }
+
+                    int qConsumed = 0;
+                    int dbConsumed = 0;
+                    int run = 0;
+                    for (size_t ci = 0; ci < emitCigar.size(); ++ci) {
+                        const char c = emitCigar[ci];
+                        if (c >= '0' && c <= '9') {
+                            run = run * 10 + (c - '0');
+                            continue;
+                        }
+                        const int cnt = (run > 0) ? run : 1;
+                        run = 0;
+                        if (c == 'M') {
+                            qConsumed += cnt;
+                            dbConsumed += cnt;
+                        } else if (c == 'I') {
+                            qConsumed += cnt;
+                        } else if (c == 'D') {
+                            dbConsumed += cnt;
+                        }
+                    }
+                    if (qConsumed > 0) {
+                        qEndOut = qStartOut + qConsumed - 1;
+                    }
+                    if (dbConsumed > 0) {
+                        const int dbStepOut = reverseStrand ? -1 : 1;
+                        rawDbEnd = rawDbStart + dbStepOut * (dbConsumed - 1);
+                        rawDbEnd = std::max(0, std::min(rawDbEnd, static_cast<int>(h.dbLen) - 1));
+                    }
                 }
+                if (qEndOut < qStartOut) qEndOut = qStartOut;
+                unsigned int alnLen = (h.cigarAlnLen > 0)
+                    ? h.cigarAlnLen
+                    : static_cast<unsigned int>(std::max(1, std::abs(rawDbEnd - rawDbStart) + 1));
+                if (hasBacktrace) {
+                    int alnColumns = 0;
+                    int run = 0;
+                    for (size_t ci = 0; ci < emitCigar.size(); ++ci) {
+                        const char c = emitCigar[ci];
+                        if (c >= '0' && c <= '9') {
+                            run = run * 10 + (c - '0');
+                            continue;
+                        }
+                        const int cnt = (run > 0) ? run : 1;
+                        run = 0;
+                        if (c == 'M' || c == 'I' || c == 'D') {
+                            alnColumns += cnt;
+                        }
+                    }
+                    alnLen = static_cast<unsigned int>(std::max(1, alnColumns));
+                }
+                const unsigned int qSpan = static_cast<unsigned int>(qEndOut - qStartOut + 1);
+                const unsigned int dbSpanOut = static_cast<unsigned int>(std::max(1, std::abs(rawDbEnd - rawDbStart) + 1));
+                const float qcov = static_cast<float>(qSpan) / static_cast<float>(qLen);
+                const float dbcov = static_cast<float>(dbSpanOut) / static_cast<float>(std::max(1u, h.dbLen));
                 float seqIdVal = h.precomputedSeqId;
                 if (seqIdVal < 0.0f) {
                     const unsigned int bitScorePos = static_cast<unsigned int>(std::max(0, bitScore));
