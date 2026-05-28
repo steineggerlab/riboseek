@@ -810,6 +810,13 @@ int createdb(int argc, const char **argv, const Command& command) {
     if(gpuCompatibleDB){
         dbType = DBReader<unsigned int>::setExtendedDbtype(dbType, Parameters::DBTYPE_EXTENDED_GPU);
     }
+#ifdef RIBOSEEK
+    if (Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_NUCLEOTIDES)) {
+        unsigned int extendedDbtype = DBReader<unsigned int>::getExtendedDbtype(dbType);
+        extendedDbtype |= Parameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
+        dbType = DBReader<unsigned int>::setExtendedDbtype(dbType, extendedDbtype);
+    }
+#endif
     DBWriter::writeDbtypeFile(seqWriter.getDataFileName(), dbType ,par.compressed);
     DBWriter::writeDbtypeFile(hdrWriter.getDataFileName(), Parameters::DBTYPE_GENERIC_DB, par.compressed);
 
