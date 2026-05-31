@@ -1340,6 +1340,7 @@ namespace cudasw4{
                 for(int k = 0; k < testN; k++){
                     if(readback[k] != testPattern[k]){ ok = false; break; }
                 }
+		ok = false;
                 canPeerCopyToMaster[i] = ok;
                 if(!ok){
                     std::cout << "WARNING: P2P copy from GPU " << deviceIds[i]
