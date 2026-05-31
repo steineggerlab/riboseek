@@ -425,13 +425,21 @@ int rnaalign(int argc, const char **argv, const Command &command) {
                     int realignAccepted = 0;
                     for (size_t result = 0; result < swResults.size() && realignAccepted < realignMaxSeqs; result++) {
                         size_t dbId = tdbr->getId(swResults[result].dbKey);
-                        char *dbSeqData = tdbr->getData(dbId, thread_idx);
+			char *dbSeqData = NULL;
+			if (isGpuDb) {
+			    dbSeqData = tdbr->getDataUncompressed(dbId);
+			} else {
+			    dbSeqData = tdbr->getData(dbId, thread_idx);
+			}
                         if (dbSeqData == NULL) {
                             Debug(Debug::ERROR) << "Sequence " << swResults[result].dbKey
                                                 << " is required in the prefiltering, but is not contained in the target sequence database!\n";
                             EXIT(EXIT_FAILURE);
                         }
                         dbSeq.mapSequence(dbId, swResults[result].dbKey, dbSeqData, tdbr->getSeqLen(dbId));
+			if (isGpuDb) {
+			    memcpy(dbSeq.numSequence, dbSeqData, tdbr->getSeqLen(dbId));
+			}
                         if (reverse) {
                             dinucEncodeReverse(&dbSeq);
                         }
