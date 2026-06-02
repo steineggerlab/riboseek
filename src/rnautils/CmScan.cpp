@@ -28,6 +28,8 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <mutex>
+#include <condition_variable>
 #include <map>
 #include <set>
 #include <sstream>
@@ -217,6 +219,12 @@ struct RawBuffer {
         return true;
     }
 
+    void release() {
+        std::free(ptr);
+        ptr = NULL;
+        cap = 0;
+    }
+
     T *data() { return ptr; }
     const T *data() const { return ptr; }
 };
@@ -234,6 +242,7 @@ struct ExactScanWorkspace {
     RawBuffer<int> bSplitBegByVD;
     RawBuffer<int> bSplitEndByVD;
     RawBuffer<float> bSplitTmp;
+    RawBuffer<float> negRow;
     std::vector<float> trScF;
     RawBuffer<double> insD; // deck-based inside: layout [d * M * (localN+1) + v * (localN+1) + li]
     std::vector<double> memoVitDense;
@@ -255,6 +264,105 @@ struct ExactScanWorkspace {
     std::vector<size_t> exactChartOffset;   // M+1 entries, exactChartOffset[M] = total cells
     std::vector<int> exactChartBandDmin;    // M entries
     std::vector<int> exactChartBandSize;    // M entries (= dmax-dmin+1, or 0 if empty)
+
+    void releaseFastDeckBuffers() {
+        vit.release();
+        stateBase.release();
+        bSplitBegByVD.release();
+        bSplitEndByVD.release();
+        bSplitTmp.release();
+        negRow.release();
+    }
+};
+
+static inline size_t rawBufferCapacityFor(size_t need) {
+    size_t cap = 1024;
+    while (cap < need) {
+        cap <<= 1;
+    }
+    return cap;
+}
+
+static inline size_t rawBufferBytesFor(size_t need, size_t elemSize) {
+    if (need == 0) {
+        return 0;
+    }
+    return rawBufferCapacityFor(need) * elemSize;
+}
+
+static size_t cmFastDeckBudgetBytes() {
+    static const size_t budget = []() -> size_t {
+        const char *env = std::getenv("MMSEQS_CMSCAN_EXACT_FASTDECK_BUDGET_MB");
+        if (env != NULL && *env != '\0') {
+            const long mb = std::atol(env);
+            if (mb <= 0) {
+                return std::numeric_limits<size_t>::max();
+            }
+            return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
+        }
+        return std::numeric_limits<size_t>::max();
+    }();
+    return budget;
+}
+
+class FastDeckMemoryGate {
+public:
+    explicit FastDeckMemoryGate(size_t bytes) : bytes_(bytes), active_(false) {
+        const size_t budget = cmFastDeckBudgetBytes();
+        if (budget == std::numeric_limits<size_t>::max() || bytes_ == 0) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(mutex());
+        condition().wait(lock, [&]() {
+            const size_t inUse = bytesInUse();
+            if (bytes_ > budget) {
+                return inUse == 0;
+            }
+            return inUse + bytes_ <= budget;
+        });
+        bytesInUse() += bytes_;
+        active_ = true;
+    }
+    ~FastDeckMemoryGate() {
+        if (!active_) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex());
+            size_t &inUse = bytesInUse();
+            inUse = (inUse >= bytes_) ? (inUse - bytes_) : 0;
+        }
+        condition().notify_all();
+    }
+    bool active() const { return active_; }
+    FastDeckMemoryGate(const FastDeckMemoryGate &) = delete;
+    FastDeckMemoryGate &operator=(const FastDeckMemoryGate &) = delete;
+private:
+    static std::mutex &mutex() {
+        static std::mutex m;
+        return m;
+    }
+    static std::condition_variable &condition() {
+        static std::condition_variable cv;
+        return cv;
+    }
+    static size_t &bytesInUse() {
+        static size_t value = 0;
+        return value;
+    }
+    size_t bytes_;
+    bool active_;
+};
+
+struct FastDeckBufferRelease {
+    FastDeckBufferRelease(ExactScanWorkspace &workspace, bool enabled) : ws(workspace), enabled(enabled) {}
+    ~FastDeckBufferRelease() {
+        if (enabled) {
+            ws.releaseFastDeckBuffers();
+        }
+    }
+    ExactScanWorkspace &ws;
+    bool enabled;
 };
 
 static inline std::string trim(const std::string &s) {
@@ -4182,29 +4290,94 @@ static void runInfernalExactScan(const InfernalExactModel &model,
     if (cmExactFastDeckEnabled() && N <= 1024) {
         const float NEG_INF_F = -std::numeric_limits<float>::infinity();
         const size_t iStride = static_cast<size_t>(N + 2);
-        const size_t stateStride = static_cast<size_t>(N + 1) * iStride;
-        const size_t cells = static_cast<size_t>(M) * stateStride;
-        if (!ws.vit.ensure(cells)) {
-            Debug(Debug::ERROR) << "cmscan: failed to allocate vit buffer\n";
-            return;
+
+        int maxSpan = N;
+        static int wcapMode = -1;
+        if (wcapMode == -1) {
+            const char *env = std::getenv("MMSEQS_CMSCAN_WCAP");
+            wcapMode = (env != NULL && std::string(env) == "0") ? 0 : 1;
         }
-        float *vitPtr = ws.vit.data();
+        if (wcapMode == 1 && model.w > 0) {
+            maxSpan = std::min(maxSpan, model.w);
+        }
+        if (maxHitLen > 0) {
+            maxSpan = std::min(maxSpan, maxHitLen);
+        }
+        const bool forceEnv = (forcedI > 0 && forcedD > 0 &&
+                               forcedD <= N && forcedI <= N - forcedD + 1);
+        if (forceEnv) {
+            maxSpan = forcedD;
+        }
+
         if (!ws.stateBase.ensure(static_cast<size_t>(M))) {
             Debug(Debug::ERROR) << "cmscan: failed to allocate stateBase buffer\n";
             return;
         }
+        std::vector<int> &fastBandDmin = ws.exactChartBandDmin;
+        std::vector<int> &fastBandSize = ws.exactChartBandSize;
+        fastBandDmin.assign(static_cast<size_t>(M), 0);
+        fastBandSize.assign(static_cast<size_t>(M), 0);
+        size_t *stateBase = ws.stateBase.data();
+        size_t cells = 0;
         for (int v = 0; v < M; ++v) {
-            ws.stateBase.data()[static_cast<size_t>(v)] = static_cast<size_t>(v) * stateStride;
+            const ExactStateExec &st = exec[static_cast<size_t>(v)];
+            int dlo = 0;
+            int dhi = maxSpan;
+            if (st.type == CM_ST_E) {
+                dlo = 0;
+                dhi = 0;
+            } else if (st.dmax >= st.dmin && st.dmin >= 0) {
+                dlo = std::max(0, st.dmin);
+                dhi = std::min(maxSpan, st.dmax);
+            }
+            stateBase[static_cast<size_t>(v)] = cells;
+            if (dhi >= dlo) {
+                fastBandDmin[static_cast<size_t>(v)] = dlo;
+                fastBandSize[static_cast<size_t>(v)] = dhi - dlo + 1;
+                cells += static_cast<size_t>(fastBandSize[static_cast<size_t>(v)]) * iStride;
+            }
         }
-        // Pre-fill all state slices with NEG_INF using contiguous memsets.
-        // This replaces scattered per-d fills in the main loop (94%+ of iterations
-        // are out-of-band and just wrote NEG_INF in small chunks — now they can be
-        // skipped entirely, and the contiguous write pattern is much more cache-friendly).
-        for (int v = 0; v < M; ++v) {
-            float *base = &vitPtr[ws.stateBase.data()[static_cast<size_t>(v)]];
-            std::fill(base, base + stateStride, NEG_INF_F);
+        const size_t vdStride = static_cast<size_t>(maxSpan + 1);
+        const size_t vdCells = static_cast<size_t>(M) * vdStride;
+        const size_t fastDeckBytes = rawBufferBytesFor(cells, sizeof(float))
+                                   + rawBufferBytesFor(static_cast<size_t>(M), sizeof(size_t))
+                                   + 2 * rawBufferBytesFor(vdCells, sizeof(int))
+                                   + rawBufferBytesFor(static_cast<size_t>(N + 1), sizeof(float))
+                                   + rawBufferBytesFor(iStride, sizeof(float));
+        FastDeckMemoryGate fastDeckGate(fastDeckBytes);
+        FastDeckBufferRelease fastDeckRelease(ws, fastDeckGate.active());
+        if (!ws.vit.ensure(cells)) {
+            Debug(Debug::ERROR) << "cmscan: failed to allocate vit buffer\n";
+            return;
         }
-        const size_t vdCells = static_cast<size_t>(M) * static_cast<size_t>(N + 1);
+        if (!ws.negRow.ensure(iStride)) {
+            Debug(Debug::ERROR) << "cmscan: failed to allocate negRow buffer\n";
+            return;
+        }
+        if (!ws.bSplitTmp.ensure(static_cast<size_t>(N + 1))) {
+            Debug(Debug::ERROR) << "cmscan: failed to allocate bSplitTmp buffer\n";
+            return;
+        }
+        float *vit = ws.vit.data();
+        std::fill(vit, vit + cells, NEG_INF_F);
+        std::fill(ws.negRow.data(), ws.negRow.data() + iStride, NEG_INF_F);
+        auto rowPtr = [&](int v, int d) -> float * {
+            if (v < 0 || v >= M) return nullptr;
+            const size_t vi = static_cast<size_t>(v);
+            if (d < fastBandDmin[vi] || d >= fastBandDmin[vi] + fastBandSize[vi]) {
+                return nullptr;
+            }
+            return vit + stateBase[vi] + static_cast<size_t>(d - fastBandDmin[vi]) * iStride;
+        };
+        auto rowPtrConst = [&](int v, int d) -> const float * {
+            float *row = rowPtr(v, d);
+            return (row != nullptr) ? row : ws.negRow.data();
+        };
+        auto cellVal = [&](int v, int d, int i) -> float {
+            const float *row = rowPtrConst(v, d);
+            return row[static_cast<size_t>(i)];
+        };
+
         if (!ws.bSplitBegByVD.ensure(vdCells)) {
             Debug(Debug::ERROR) << "cmscan: failed to allocate bSplitBeg buffer\n";
             return;
@@ -4213,27 +4386,19 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             Debug(Debug::ERROR) << "cmscan: failed to allocate bSplitEnd buffer\n";
             return;
         }
-        if (!ws.bSplitTmp.ensure(static_cast<size_t>(N + 1))) {
-            Debug(Debug::ERROR) << "cmscan: failed to allocate bSplitTmp buffer\n";
-            return;
-        }
         int *bSplitBegByVD = ws.bSplitBegByVD.data();
         int *bSplitEndByVD = ws.bSplitEndByVD.data();
-
-        // Only init B-state split ranges (typically very few B-states).
         for (size_t ii = 0; ii < vdCells; ++ii) {
             bSplitBegByVD[ii] = 0;
             bSplitEndByVD[ii] = -1;
         }
-        float *vit = ws.vit.data();
-        size_t *stateBase = ws.stateBase.data();
         const ExactStateExec *execData = exec.data();
         for (int v = 0; v < M; ++v) {
             const ExactStateExec &st = exec[static_cast<size_t>(v)];
             if (st.type != CM_ST_B) {
                 continue;
             }
-            for (int d = 0; d <= N; ++d) {
+            for (int d = 0; d <= maxSpan; ++d) {
                 int kBeg = 0;
                 int kEnd = d;
                 if (st.splitKMax >= st.splitKMin) {
@@ -4244,7 +4409,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                     kBeg = std::max(kBeg, d - st.splitRMax);
                     kEnd = std::min(kEnd, d - st.splitRMin);
                 }
-                const size_t vd = static_cast<size_t>(v) * static_cast<size_t>(N + 1) + static_cast<size_t>(d);
+                const size_t vd = static_cast<size_t>(v) * vdStride + static_cast<size_t>(d);
                 bSplitBegByVD[vd] = kBeg;
                 bSplitEndByVD[vd] = kEnd;
             }
@@ -4261,13 +4426,16 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             }
         }
 
-        for (int d = 0; d <= N; ++d) {
+        for (int d = 0; d <= maxSpan; ++d) {
             const int iMax = (d == 0) ? (N + 1) : (N - d + 1);
             for (size_t vsi = 0; vsi < activeStates.size(); ++vsi) {
                 const int v = activeStates[vsi];
                 const size_t vi = static_cast<size_t>(v);
                 const ExactStateExec &st = execData[vi];
-                const size_t vBase = stateBase[vi];
+                float *curRow = rowPtr(v, d);
+                if (curRow == nullptr) {
+                    continue;
+                }
                 const int dmin = isBState[vi] ? st.dmin : nbDmin[vi];
                 const int dmax = isBState[vi] ? st.dmax : nbDmax[vi];
                 if (dmax >= dmin && (d < dmin || d > dmax)) {
@@ -4280,20 +4448,18 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                     if (y < 0 || y >= M || z < 0 || z >= M) {
                         continue;
                     }
-                    const size_t vd = static_cast<size_t>(v) * static_cast<size_t>(N + 1) + static_cast<size_t>(d);
+                    const size_t vd = static_cast<size_t>(v) * vdStride + static_cast<size_t>(d);
                     const int kBeg = bSplitBegByVD[vd];
                     const int kEnd = bSplitEndByVD[vd];
-                    const float *const yBase = &vit[stateBase[static_cast<size_t>(y)]];
-                    const float *const zBase = &vit[stateBase[static_cast<size_t>(z)]];
-                    float *const bOut = &vit[vBase + static_cast<size_t>(d) * iStride + 1];
+                    float *const bOut = curRow + 1;
                     if (kBeg > kEnd) {
                         std::fill(bOut, bOut + iMax, NEG_INF_F);
                     } else {
                         for (int i = 1; i <= iMax; ++i) {
                             float bBest = NEG_INF_F;
                             for (int k = kBeg; k <= kEnd; ++k) {
-                                const float l = yBase[static_cast<size_t>(k) * iStride + static_cast<size_t>(i)];
-                                const float r = zBase[static_cast<size_t>(d - k) * iStride + static_cast<size_t>(i + k)];
+                                const float l = rowPtrConst(y, k)[static_cast<size_t>(i)];
+                                const float r = rowPtrConst(z, d - k)[static_cast<size_t>(i + k)];
                                 const float cand = l + r;
                                 bBest = std::fmaxf(bBest, cand);
                             }
@@ -4318,11 +4484,6 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 const int8_t *sc = ws.seqCode.data();
                 const float *trScFPtr = ws.trScF.data();
                 const StateId *trDstPtr = trDst.data();
-                const size_t *stateBasePtr = stateBase;
-                const size_t dstBase0 = (trCount >= 1) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 0])] : 0;
-                const size_t dstBase1 = (trCount >= 2) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 1])] : 0;
-                const size_t dstBase2 = (trCount >= 3) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 2])] : 0;
-                const size_t dstBase3 = (trCount >= 4) ? stateBasePtr[static_cast<size_t>(nbTrDst4[t4 + 3])] : 0;
                 const float trSc0 = (trCount >= 1) ? nbTrScF4[t4 + 0] : 0.f;
                 const float trSc1 = (trCount >= 2) ? nbTrScF4[t4 + 1] : 0.f;
                 const float trSc2 = (trCount >= 3) ? nbTrScF4[t4 + 2] : 0.f;
@@ -4342,12 +4503,12 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 } else {
                     efT[0] = efT[1] = efT[2] = efT[3] = efT[4] = 0.0f; // pair: handled inline
                 }
-                // Contiguous output and source pointers (new layout: d*iStride + i)
-                float *const outPtr = &vit[vBase + static_cast<size_t>(d) * iStride + 1];
-                const float *const src0 = (trCount >= 1) ? &vit[dstBase0 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
-                const float *const src1 = (trCount >= 2) ? &vit[dstBase1 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
-                const float *const src2 = (trCount >= 3) ? &vit[dstBase2 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
-                const float *const src3 = (trCount >= 4) ? &vit[dstBase3 + static_cast<size_t>(nd) * iStride + 1 + static_cast<size_t>(niShift)] : nullptr;
+                // Contiguous output and source pointers (new layout: ragged d-band rows by state)
+                float *const outPtr = curRow + 1;
+                const float *const src0 = (trCount >= 1) ? rowPtrConst(static_cast<int>(nbTrDst4[t4 + 0]), nd) + 1 + static_cast<size_t>(niShift) : nullptr;
+                const float *const src1 = (trCount >= 2) ? rowPtrConst(static_cast<int>(nbTrDst4[t4 + 1]), nd) + 1 + static_cast<size_t>(niShift) : nullptr;
+                const float *const src2 = (trCount >= 3) ? rowPtrConst(static_cast<int>(nbTrDst4[t4 + 2]), nd) + 1 + static_cast<size_t>(niShift) : nullptr;
+                const float *const src3 = (trCount >= 4) ? rowPtrConst(static_cast<int>(nbTrDst4[t4 + 3]), nd) + 1 + static_cast<size_t>(niShift) : nullptr;
                 // sc[i] offset: scL[ii] = sc[ii+1] = sc[i]; scR[ii] = sc[ii+d] = sc[i+d-1]
                 const int8_t *const scL = sc + 1;
                 const int8_t *const scR = sc + d;
@@ -4407,9 +4568,8 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                     const int trCountClamped = (trCount <= 16) ? trCount : 16;
                     for (int t = 0; t < trCountClamped; ++t) {
                         const size_t ti = trOff + static_cast<size_t>(t);
-                        trSrcPtrs[t] = &vit[stateBasePtr[static_cast<size_t>(trDstPtr[ti])] +
-                                            static_cast<size_t>(nd) * iStride +
-                                            static_cast<size_t>(niShift)];
+                        trSrcPtrs[t] = rowPtrConst(static_cast<int>(trDstPtr[ti]), nd)
+                                      + static_cast<size_t>(niShift);
                         trScVals[t] = trScFPtr[ti];
                     }
 
@@ -4577,7 +4737,6 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 const CmState &cs = model.states[static_cast<size_t>(v)];
                 if (cs.endSc == NEG_INF) continue;
                 const float endScF = static_cast<float>(cs.endSc);
-                const size_t vBase = stateBase[static_cast<size_t>(v)];
                 const size_t vi = static_cast<size_t>(v);
                 const float *ep = nbEmitPtr[vi];
                 const int emitSize = nbEmitSize[vi];
@@ -4587,10 +4746,12 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 else if (cs.type == CM_ST_ML || cs.type == CM_ST_MR) sd = 1;
                 else if (cs.type == CM_ST_S) sd = 0;
                 else continue;  // only MP/ML/MR/S are end-eligible heads
-                for (int d = sd; d <= N; ++d) {
+                for (int d = sd; d <= maxSpan; ++d) {
+                    float *row0 = rowPtr(v, d);
+                    if (row0 == nullptr) continue;
                     const float elContrib = elSelfF * static_cast<float>(d - sd) + endScF;
                     const int iMax = (d == 0) ? (N + 1) : (N - d + 1);
-                    float *row = &vit[vBase + static_cast<size_t>(d) * iStride + 1];
+                    float *row = row0 + 1;
                     for (int ii = 0; ii < iMax; ++ii) {
                         const int i = ii + 1;
                         float ef;
@@ -4617,28 +4778,9 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             }
         }
 
-        // Hoisted: maxSpan/minSpan/forceEnv must be computed BEFORE the
-        // local-begin pass below, so the FG=1 corner-only branch can
-        // address the same trace-seed cell that the selection block reads.
-        int maxSpan = N;
-        // Fix A diagnostic: W cap can be disabled via MMSEQS_CMSCAN_WCAP=0 to
-        // probe whether Infernal-length envelopes (d > W) become reachable.
-        static int wcapMode = -1;
-        if (wcapMode == -1) {
-            const char *env = std::getenv("MMSEQS_CMSCAN_WCAP");
-            wcapMode = (env != NULL && std::string(env) == "0") ? 0 : 1;
-        }
-        if (wcapMode == 1 && model.w > 0) {
-            maxSpan = std::min(maxSpan, model.w);
-        }
-        if (maxHitLen > 0) {
-            maxSpan = std::min(maxSpan, maxHitLen);
-        }
         // Infernal semantics evaluate all legal spans under state dmin/dmax/w constraints.
         int minSpan = 1;
-        // Fix B: optional CLEN-relative envelope floor. MMSEQS_CMSCAN_DMIN_CLEN_FRAC=0.9
-        // forces d >= 0.9*CLEN to match Infernal's tight envelope distribution and prevent
-        // the DP from clipping useful columns on divergent targets (e.g. 2YGH_1 KJ798010.1).
+        // Optional CLEN-relative envelope floor used by diagnostics/benchmarking.
         {
             static double dminFrac = -1.0;
             if (dminFrac < 0.0) {
@@ -4649,17 +4791,11 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             if (dminFrac > 0.0 && model.clen > 0) {
                 int floorD = static_cast<int>(dminFrac * model.clen);
                 if (floorD > minSpan) minSpan = floorD;
-                if (minSpan > maxSpan) minSpan = maxSpan; // never invert
+                if (minSpan > maxSpan) minSpan = maxSpan;
             }
         }
-        // Fix B: force prefilter envelope. When forcedI/forcedD are valid,
-        // collapse the (i, d) search to that single cell so trace matches
-        // the prefilter's HMM-Forward-equivalent envelope.
-        const bool forceEnv = (forcedI > 0 && forcedD > 0 &&
-                               forcedD <= N && forcedI <= N - forcedD + 1);
         if (forceEnv) {
             minSpan = forcedD;
-            maxSpan = forcedD;
         }
 
         // Hoisted: MMSEQS_CMSCAN_FORCE_GLOBAL env-cache. Read once here so the
@@ -4697,7 +4833,6 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         //
         // Glocal CMs leave beginSc=NEG_INF and skip the loop body either way.
         if (model.hasLocalCfg) {
-            const size_t rootBaseLB = stateBase[static_cast<size_t>(root)];
             if (forceGlobal == 1) {
                 // Corner-OVERWRITE: clear ROOT_S at the trace-seed corner
                 // before applying local-begin. Mirrors Infernal cm_localize
@@ -4714,20 +4849,19 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 const int cornerD = std::min(maxSpan, N);
                 const int cornerI = 1;
                 if (cornerD >= 1 && cornerI + cornerD - 1 <= N) {
-                    float &rootCell = vit[rootBaseLB
-                        + static_cast<size_t>(cornerD) * iStride
-                        + static_cast<size_t>(cornerI)];
-                    rootCell = NEG_INF_F;
-                    for (int y = 1; y < M; ++y) {
-                        const CmState &cs = model.states[static_cast<size_t>(y)];
-                        if (cs.beginSc == NEG_INF) continue;
-                        const float bsc = static_cast<float>(cs.beginSc);
-                        const float yVal = vit[stateBase[static_cast<size_t>(y)]
-                            + static_cast<size_t>(cornerD) * iStride
-                            + static_cast<size_t>(cornerI)];
-                        if (yVal == NEG_INF_F) continue;
-                        const float cand = yVal + bsc;
-                        if (rootCell < cand) rootCell = cand;
+                    float *rootCorner = rowPtr(root, cornerD);
+                    if (rootCorner != nullptr) {
+                        float &rootCell = rootCorner[static_cast<size_t>(cornerI)];
+                        rootCell = NEG_INF_F;
+                        for (int y = 1; y < M; ++y) {
+                            const CmState &cs = model.states[static_cast<size_t>(y)];
+                            if (cs.beginSc == NEG_INF) continue;
+                            const float bsc = static_cast<float>(cs.beginSc);
+                            const float yVal = cellVal(y, cornerD, cornerI);
+                            if (yVal == NEG_INF_F) continue;
+                            const float cand = yVal + bsc;
+                            if (rootCell < cand) rootCell = cand;
+                        }
                     }
                 }
             } else if (forceGlobal == 5) {
@@ -4740,20 +4874,19 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 // consistency with FG=1.
                 const int cornerD = std::min(maxSpan, N);
                 if (cornerD >= 1 && cornerD <= N) {
-                    float &rootCell = vit[rootBaseLB
-                        + static_cast<size_t>(cornerD) * iStride
-                        + 1];
-                    rootCell = NEG_INF_F;
-                    for (int y = 1; y < M; ++y) {
-                        const CmState &cs = model.states[static_cast<size_t>(y)];
-                        if (cs.beginSc == NEG_INF) continue;
-                        const float bsc = static_cast<float>(cs.beginSc);
-                        const float yVal = vit[stateBase[static_cast<size_t>(y)]
-                            + static_cast<size_t>(cornerD) * iStride
-                            + 1];
-                        if (yVal == NEG_INF_F) continue;
-                        const float cand = yVal + bsc;
-                        if (rootCell < cand) rootCell = cand;
+                    float *rootCorner = rowPtr(root, cornerD);
+                    if (rootCorner != nullptr) {
+                        float &rootCell = rootCorner[1];
+                        rootCell = NEG_INF_F;
+                        for (int y = 1; y < M; ++y) {
+                            const CmState &cs = model.states[static_cast<size_t>(y)];
+                            if (cs.beginSc == NEG_INF) continue;
+                            const float bsc = static_cast<float>(cs.beginSc);
+                            const float yVal = cellVal(y, cornerD, 1);
+                            if (yVal == NEG_INF_F) continue;
+                            const float cand = yVal + bsc;
+                            if (rootCell < cand) rootCell = cand;
+                        }
                     }
                 }
                 if (anchorI > 0 && anchorD > 0
@@ -4764,17 +4897,15 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                         const int iLo = std::max(1, midpoint - d + 1);
                         const int iHi = std::min(iMax, midpoint);
                         for (int i = iLo; i <= iHi; ++i) {
-                            float &rootCell = vit[rootBaseLB
-                                + static_cast<size_t>(d) * iStride
-                                + static_cast<size_t>(i)];
+                            float *rootCellRow = rowPtr(root, d);
+                            if (rootCellRow == nullptr) continue;
+                            float &rootCell = rootCellRow[static_cast<size_t>(i)];
                             rootCell = NEG_INF_F;
                             for (int y = 1; y < M; ++y) {
                                 const CmState &cs = model.states[static_cast<size_t>(y)];
                                 if (cs.beginSc == NEG_INF) continue;
                                 const float bsc = static_cast<float>(cs.beginSc);
-                                const float yVal = vit[stateBase[static_cast<size_t>(y)]
-                                    + static_cast<size_t>(d) * iStride
-                                    + static_cast<size_t>(i)];
+                                const float yVal = cellVal(y, d, i);
                                 if (yVal == NEG_INF_F) continue;
                                 const float cand = yVal + bsc;
                                 if (rootCell < cand) rootCell = cand;
@@ -4789,13 +4920,14 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                         continue;
                     }
                     const float bsc = static_cast<float>(cs.beginSc);
-                    const size_t yBase = stateBase[static_cast<size_t>(y)];
                     const simd_float vbsc = simdf32_set(bsc);
                     const int VS = VECSIZE_FLOAT;
-                    for (int d = 0; d <= N; ++d) {
+                    for (int d = 0; d <= maxSpan; ++d) {
                         const int iMax = (d == 0) ? (N + 1) : (N - d + 1);
-                        float *rootRow = &vit[rootBaseLB + static_cast<size_t>(d) * iStride + 1];
-                        const float *yRow = &vit[yBase + static_cast<size_t>(d) * iStride + 1];
+                        float *rootBaseRow = rowPtr(root, d);
+                        if (rootBaseRow == nullptr) continue;
+                        float *rootRow = rootBaseRow + 1;
+                        const float *yRow = rowPtrConst(y, d) + 1;
                         // SIMD: rootRow[i] = max(rootRow[i], yRow[i] + bsc)
                         int i = 0;
                         for (; i + VS - 1 < iMax; i += VS) {
@@ -4822,7 +4954,6 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         int bestIL = 1, bestIR = 1, bestIT = 1;
         int bestDL = N, bestDR = N, bestDT = N;
         double bestLCorr = 0.0, bestRCorr = 0.0, bestTCorr = 0.0;
-        const size_t rootBase = stateBase[static_cast<size_t>(root)];
         // Diagnostic: when MMSEQS_CMSCAN_DUMP_TID matches seqId, dump the score landscape.
         const char *dumpTid = std::getenv("MMSEQS_CMSCAN_DUMP_TID");
         const bool dumpThisTarget = (dumpTid != NULL && seqId == dumpTid);
@@ -4839,7 +4970,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             int iLo = 1, iHi = iMax;
             if (forceEnv) { iLo = forcedI; iHi = forcedI; }
             for (int i = iLo; i <= iHi; ++i) {
-                const float rawSc = vit[rootBase + static_cast<size_t>(d) * iStride + static_cast<size_t>(i)];
+                const float rawSc = cellVal(root, d, i);
                 if (rawSc == NEG_INF_F) {
                     continue;
                 }
@@ -4933,7 +5064,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 const int gD = std::min(maxSpan, N);
                 const int gI = 1;
                 if (gD >= minSpan && gI + gD - 1 <= N) {
-                    const float gSc = vit[rootBase + static_cast<size_t>(gD) * iStride + static_cast<size_t>(gI)];
+                    const float gSc = cellVal(root, gD, gI);
                     if (gSc != NEG_INF_F) {
                         const double corr = null3CorrByInterval(gI, gI + gD - 1);
                         bestSc = static_cast<float>(static_cast<double>(gSc) - corr);
@@ -4951,7 +5082,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                     double bestCorrGlob = 0.0;
                     const int iMax = N - gD + 1;
                     for (int gI = 1; gI <= iMax; ++gI) {
-                        const float raw = vit[rootBase + static_cast<size_t>(gD) * iStride + static_cast<size_t>(gI)];
+                        const float raw = cellVal(root, gD, gI);
                         if (raw == NEG_INF_F) continue;
                         const double corr = null3CorrByInterval(gI, gI + gD - 1);
                         const float sc = static_cast<float>(static_cast<double>(raw) - corr);
@@ -4990,7 +5121,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                         iHi = std::min(iMax, anchorI);
                     }
                     for (int i = iLo; i <= iHi; ++i) {
-                        const float raw = vit[rootBase + static_cast<size_t>(d) * iStride + static_cast<size_t>(i)];
+                        const float raw = cellVal(root, d, i);
                         if (raw == NEG_INF_F) continue;
                         const double corr = null3CorrByInterval(i, i + d - 1);
                         const float sc = static_cast<float>(static_cast<double>(raw) - corr);
@@ -5027,7 +5158,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 float fg1Sc = NEG_INF_F;
                 double fg1Corr = 0.0;
                 if (gD1 >= minSpan && gI1 + gD1 - 1 <= N) {
-                    const float raw = vit[rootBase + static_cast<size_t>(gD1) * iStride + static_cast<size_t>(gI1)];
+                    const float raw = cellVal(root, gD1, gI1);
                     if (raw != NEG_INF_F) {
                         fg1Corr = null3CorrByInterval(gI1, gI1 + gD1 - 1);
                         fg1Sc = static_cast<float>(static_cast<double>(raw) - fg1Corr);
@@ -5044,7 +5175,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                         const int iLo = std::max(1, midpoint - d + 1);
                         const int iHi = std::min(iMax, midpoint);
                         for (int i = iLo; i <= iHi; ++i) {
-                            const float raw = vit[rootBase + static_cast<size_t>(d) * iStride + static_cast<size_t>(i)];
+                            const float raw = cellVal(root, d, i);
                             if (raw == NEG_INF_F) continue;
                             const double corr = null3CorrByInterval(i, i + d - 1);
                             const float sc = static_cast<float>(static_cast<double>(raw) - corr);
@@ -5110,7 +5241,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                     const int i = jT - d + 1;
                     if (i < 1 || i > N) continue;
                     if (d > maxSpan) continue;
-                    const float a = vit[rootBase + static_cast<size_t>(d) * iStride + static_cast<size_t>(i)];
+                    const float a = cellVal(root, d, i);
                     fprintf(stderr, "DUMP_CELL tid=%s j=%d i=%d d=%d alpha=%.4f\n",
                             seqId.c_str(), jT, i, d, a);
                 }
@@ -5128,8 +5259,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                         const int i = jT - d + 1;
                         if (i < 1 || i > N) continue;
                         for (int v = 0; v < M; ++v) {
-                            const size_t vBase = stateBase[static_cast<size_t>(v)];
-                            const float a = vit[vBase + static_cast<size_t>(d) * iStride + static_cast<size_t>(i)];
+                            const float a = cellVal(v, d, i);
                             if (a == NEG_INF_F) continue;
                             const CmState &cs = model.states[static_cast<size_t>(v)];
                             fprintf(stderr, "DUMP_V tid=%s j=%d d=%d v=%d type=%d node=%d ndtype=%d firstOfNode=%d alpha=%.4f beginSc=%.4f endSc=%.4f\n",
@@ -5184,16 +5314,14 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 continue;
             }
             traceStates.push_back(c.v);
-            const double cur = vit[stateBase[static_cast<size_t>(c.v)] +
-                                   static_cast<size_t>(c.d) * iStride +
-                                   static_cast<size_t>(c.i)];
+            const double cur = cellVal(c.v, c.d, c.i);
             if (cur == NEG_INF_F) {
                 continue;
             }
             if (sv.type == CM_ST_B) {
                 const int y = sv.bLeft;
                 const int z = sv.bRight;
-                const size_t vd = static_cast<size_t>(c.v) * static_cast<size_t>(N + 1) + static_cast<size_t>(c.d);
+                const size_t vd = static_cast<size_t>(c.v) * vdStride + static_cast<size_t>(c.d);
                 const int kBeg = bSplitBegByVD[vd];
                 const int kEnd = bSplitEndByVD[vd];
                 // Argmax over the split range. l + r is computed in float to
@@ -5202,12 +5330,8 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                 int bestK = -1;
                 float bestApprox = NEG_INF_F;
                 for (int k = kBeg; k <= kEnd; ++k) {
-                    const float l = vit[stateBase[static_cast<size_t>(y)] +
-                                        static_cast<size_t>(k) * iStride +
-                                        static_cast<size_t>(c.i)];
-                    const float r = vit[stateBase[static_cast<size_t>(z)] +
-                                        static_cast<size_t>(c.d - k) * iStride +
-                                        static_cast<size_t>(c.i + k)];
+                    const float l = cellVal(y, k, c.i);
+                    const float r = cellVal(z, c.d - k, c.i + k);
                     if (l == NEG_INF_F || r == NEG_INF_F) {
                         continue;
                     }
@@ -5261,7 +5385,6 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             const int nd = c.d - consume;
             const double e = cmStateEmitScoreFast(sv, ws.seqCode, c.i, j);
             const float ef = static_cast<float>(e);
-            const size_t ndBase = static_cast<size_t>(nd) * iStride + static_cast<size_t>(ni);
             // Argmax over children. Candidate is computed in float as
             // `(ef + trF) + n` to mirror fill's left-associative SIMD/scalar
             // arithmetic exactly, so trace and fill agree on tie-breaks.
@@ -5286,7 +5409,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
             } else if (trCount <= 4) {
                 for (int t = 0; t < trCount; ++t) {
                     const int y = sv.trDst4[t];
-                    const float n = vit[stateBase[static_cast<size_t>(y)] + ndBase];
+                    const float n = cellVal(y, nd, ni);
                     if (dumpCand) {
                         fprintf(stderr, "DUMP_TRACE_CAND v=%d kind=tr t=%d y=%d trSc=%.6f n=%.6f cand=%.6f\n",
                                 c.v, t, y, sv.trScF4[t], n,
@@ -5306,7 +5429,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                     const size_t ti = sv.trOff + static_cast<size_t>(t);
                     const int y = trDst[ti];
                     const float trF = static_cast<float>(trSc[ti]);
-                    const float n = vit[stateBase[static_cast<size_t>(y)] + ndBase];
+                    const float n = cellVal(y, nd, ni);
                     if (dumpCand) {
                         fprintf(stderr, "DUMP_TRACE_CAND v=%d kind=tr t=%d y=%d trSc=%.6f n=%.6f cand=%.6f\n",
                                 c.v, t, y, trF, n,
@@ -5336,7 +5459,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                         continue;
                     }
                     const float bsc = static_cast<float>(cs.beginSc);
-                    const float n = vit[stateBase[static_cast<size_t>(y)] + ndBase];
+                    const float n = cellVal(y, nd, ni);
                     if (dumpCand) {
                         fprintf(stderr, "DUMP_TRACE_CAND v=%d kind=lb y=%d bsc=%.6f n=%.6f cand=%.6f\n",
                                 c.v, y, bsc, n,
@@ -5470,7 +5593,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
                     if (st.type == CM_ST_B) {
                         const int y = st.bLeft, z = st.bRight;
                         if (y < 0 || y >= M || z < 0 || z >= M) { continue; }
-                        const size_t vd = static_cast<size_t>(v) * static_cast<size_t>(N + 1) + static_cast<size_t>(d);
+                        const size_t vd = static_cast<size_t>(v) * vdStride + static_cast<size_t>(d);
                         const int kBeg = bSplitBegByVD[vd];
                         const int kEnd = bSplitEndByVD[vd];
                         double *dst = insSlice + static_cast<size_t>(v) * vStride;
@@ -5785,11 +5908,11 @@ static void runInfernalExactScan(const InfernalExactModel &model,
     }
     size_t chartCells = chartOffset[M];
 
-    // Safety budget. 1G cells = 4GB float + 4GB uint32 = 8GB per-thread worst case.
+    // Safety budget. 2G cells = 8GB float + 8GB uint32 = 16GB per-thread worst case.
     // Big rRNA CMs (M=6869-9017, like CP000968) vs comparable-length targets
     // land at ~8G cells = 65GB with wide QDB bands; we skip rather than OOM.
     // TODO: streaming/windowed CYK or HMM pre-filter to unblock these queries.
-    static constexpr size_t CM_EXACT_CHART_MAX_CELLS = 1000000000ULL;
+    static constexpr size_t CM_EXACT_CHART_MAX_CELLS = 2000000000ULL;
     if (chartCells > CM_EXACT_CHART_MAX_CELLS) {
         Debug(Debug::WARNING) << "cmscan: per-state ragged chart too large "
                               << "(" << chartCells << " > " << CM_EXACT_CHART_MAX_CELLS
