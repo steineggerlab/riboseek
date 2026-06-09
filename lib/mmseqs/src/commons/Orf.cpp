@@ -219,7 +219,7 @@ inline bool isInCodons(const char* sequence, simd_int codons, simd_int) {
 #ifndef AVX2
     if (N > 4) {
         simd_int test2 = simdi32_eq(c, codons2);
-        return (simdi8_movemask(test) != 0) && (simdi8_movemask(test2) != 0);
+        return (simdi8_movemask(test) != 0) || (simdi8_movemask(test2) != 0);
     }
 #endif
     return simdi8_movemask(test) != 0;
