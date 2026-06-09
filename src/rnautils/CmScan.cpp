@@ -3646,6 +3646,50 @@ static std::string modelTraceConsensusForCigar(const InfernalExactModel &model,
     return out;
 }
 
+static std::string reverseRleTraceOps(const std::string &rle) {
+    struct Run {
+        int n;
+        char op;
+    };
+    std::vector<Run> runs;
+    runs.reserve(rle.size() / 2 + 1);
+    size_t pos = 0;
+    while (pos < rle.size()) {
+        if (!std::isdigit(static_cast<unsigned char>(rle[pos]))) {
+            return rle;
+        }
+        int n = 0;
+        while (pos < rle.size() && std::isdigit(static_cast<unsigned char>(rle[pos]))) {
+            n = n * 10 + (rle[pos] - '0');
+            ++pos;
+        }
+        if (pos >= rle.size() || n <= 0) {
+            return rle;
+        }
+        runs.push_back(Run{n, rle[pos++]});
+    }
+
+    std::string out;
+    out.reserve(rle.size());
+    for (std::vector<Run>::const_reverse_iterator it = runs.rbegin(); it != runs.rend(); ++it) {
+        if (!out.empty() && out.back() == it->op) {
+            size_t digitEnd = out.size() - 1;
+            size_t digitStart = digitEnd;
+            while (digitStart > 0 && std::isdigit(static_cast<unsigned char>(out[digitStart - 1]))) {
+                --digitStart;
+            }
+            int prev = std::atoi(out.c_str() + digitStart);
+            out.erase(digitStart);
+            out += std::to_string(prev + it->n);
+            out.push_back(it->op);
+        } else {
+            out += std::to_string(it->n);
+            out.push_back(it->op);
+        }
+    }
+    return out;
+}
+
 static std::vector<int> decodeTraceStates(const std::string &enc) {
     std::vector<int> out;
     if (enc.empty() || enc == "NA") {
@@ -7191,6 +7235,14 @@ int cmscan(int argc, const char **argv, const Command &command) {
                     else emitCigar.push_back(c);
                 }
             }
+            if (dbStartOut > dbEndOut && qStartOut <= qEndOut) {
+                std::swap(qStartOut, qEndOut);
+                std::swap(dbStartOut, dbEndOut);
+                if (hasBacktrace) {
+                    emitCigar = reverseRleTraceOps(emitCigar);
+                }
+            }
+
             float seqIdVal = h.precomputedSeqId;
             if (seqIdVal < 0.0f) {
                 const unsigned int bitScorePos = static_cast<unsigned int>(std::max(0, bitScore));
