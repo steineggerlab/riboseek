@@ -76,8 +76,6 @@ BlockAligner::~BlockAligner() {
     delete[] tmpCompBias;
     delete[] queryRevNumSeq;
     delete[] queryCompBiasRev;
-    delete[] queryCompBiasRevArr;
-
 }
 
 void BlockAligner::initQuery(Sequence* query){
@@ -94,7 +92,7 @@ void BlockAligner::initQuery(Sequence* query){
         for (int i =0; i < queryLength; i++) { 
             queryCompBias[i] = (int16_t) (tmpCompBias[i]);
 		}
-        memset(this->queryCompBiasRev, 0, this->maxSequenceLength * sizeof(int8_t));
+        memset(this->queryCompBiasRev, 0, this->maxSequenceLength * sizeof(int16_t));
         std::reverse_copy(queryCompBias, queryCompBias + this->queryLength, queryCompBiasRev);
     }
 }
@@ -342,8 +340,8 @@ s_align BlockAligner::gappedLocalAlignForward(
     block_set_pos_bias(queryBias, queryCompBias + fqueryStartPos, fqueryAlnLen);
     block_set_pos_bias(targetBias, targetCompBias + ftargetStartPos, ftargetAlnLen);
 
-    block_align_aa_trace_xdrop_posbias(blockTrace, query, queryBias, target, targetBias, matrix, gaps, range, x_drop); // forward with no trace
-    res = block_res_aa_xdrop(blockTrace);
+    block_align_aa_trace_xdrop_posbias(blockTrace, query, queryBias, target, targetBias, matrix, gaps, range, x_drop);
+    res = block_res_aa_trace_xdrop(blockTrace);
     block_cigar_aa_trace_xdrop(blockTrace, res.query_idx, res.reference_idx, cigar);
 
     int qEnd = qIdx + res.query_idx;
@@ -554,7 +552,7 @@ BlockAligner::bandedalign(
 
     } else {
         local_aln_Backward.qStartPos1 = qIdx;
-        local_aln_Backward.dbEndPos1 = tIdx;
+        local_aln_Backward.dbStartPos1 = tIdx;
         local_aln_Backward.score1 = 0;
         local_aln_Backward.identicalAACnt = 0;
     }

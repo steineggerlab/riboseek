@@ -463,6 +463,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                 size_t targetLength = seqDbr->getSeqLen(targetId);
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
 
+                if (Util::canBeCovered(par.covThr, par.covMode, query.L, target.L) == false) {
+                    continue;
+                }
+
                 BlockAligner::UngappedAln_res ungappedAlignment = blockAligner.ungappedAlign(&target, diagonal); 
                 
                 bool hasEvalue = (ungappedAlignment.eval <= par.evalThr);
@@ -530,6 +534,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                                 
                                 // 1. ungapped alignment
                                 element.mapSequence(elementId, elementKey, elementSequence, elementLength);
+                                if (Util::canBeCovered(par.covThr, par.covMode, query.L, element.L) == false) {
+                                    allpass = false;
+                                    break;
+                                }
                                 BlockAligner::UngappedAln_res elementUngappedAlignment = blockAligner.ungappedAlign(&element, concatedDiagonal);
                                 
                                 // 2. check the criteria
@@ -641,6 +649,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                                     
                                     // 1. ungapped alignment
                                     element.mapSequence(elementId, elementKey, elementSequence, elementLength);
+                                    if (Util::canBeCovered(par.covThr, par.covMode, query.L, element.L) == false) {
+                                        allpass = false;
+                                        break;
+                                    }
                                     BlockAligner::UngappedAln_res elementUngappedAlignment = blockAligner.ungappedAlign(&element, concatedDiagonal);
                                     
                                     // 2. check the criteria
