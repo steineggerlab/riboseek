@@ -61,6 +61,8 @@ run_test() {
 # continue on if one test fails
 set +e
 run_test SEARCH "run_search.sh"
+run_test SEARCH_INDEX "run_search_index.sh"
+run_test SEARCH_GAPLESS_INDEX "run_search_gapless_index.sh"
 set -e
 
 printf "\n"
