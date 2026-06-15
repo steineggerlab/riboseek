@@ -12,7 +12,7 @@
 #include <climits>
 #include <cassert>
 
-static void setRnaSearchDefaults(Parameters *p) {
+void setRnaSearchDefaults(Parameters *p) {
     p->spacedKmer = true;
     p->alignmentMode = Parameters::ALIGNMENT_MODE_SCORE_COV;
     p->sensitivity = 7.5;
@@ -123,6 +123,7 @@ int riboseekSearch(int argc, const char **argv, const Command &command) {
     cmd.addVariable("SUBSTRACT_PAR", par.createParameterString(par.subtractdbs).c_str());
     cmd.addVariable("VERBOSITY_PAR", par.createParameterString(par.onlyverbosity).c_str());
 
+    cmd.addVariable("HAVE_INDEX", (indexStr == "") ? NULL : "TRUE");
     cmd.addVariable("SPLITSTRAND", "TRUE");
     cmd.addVariable("SPLITSEQUENCE_PAR", par.createParameterString(par.splitsequence).c_str());
     // Match fork's behavior: single-iter splits target (via blastdi.sh);

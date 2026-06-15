@@ -70,7 +70,7 @@ MERGE_INPUT=""
 # Sequence::mapSequence uses dinucleotide pair encoding (via auxRegistry).
 # Only do if the workflow doesn't use GPU
 # Also make soft-link to make the target DB dinucleotide-aware without altering the original target DB
-if [ -n "$SPLITSTRAND" ] && [ -z "$GPU" ]; then
+if [ -n "$SPLITSTRAND" ] && [ -z "$GPU" ] && [ -z "$HAVE_INDEX" ]; then
     if notExists "$TMP_PATH/target_db_dinuc.dbtype"; then
         ln -s "$(abspath "$2")" "$TMP_PATH/target_db_dinuc"
         ln -s "$(abspath "$2.index")" "$TMP_PATH/target_db_dinuc.index"
