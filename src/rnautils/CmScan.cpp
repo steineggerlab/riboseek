@@ -5911,7 +5911,7 @@ static void runInfernalExactScan(const InfernalExactModel &model,
         maxSpan = std::min(maxSpan, model.w);
     }
     // Cap d-space by the prefilter alignment length when available — a true
-    // CM hit has d within a small multiple of the rnasearch envelope length,
+    // CM hit has d within a small multiple of the RNA search envelope length,
     // and the memoized Viterbi only wastes memory on larger spans.
     if (maxHitLen > 0) {
         maxSpan = std::min(maxSpan, maxHitLen);
@@ -6788,7 +6788,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
         const bool wantInside = !(_skipInsideEnv != nullptr && _skipInsideEnv[0] == '1');
 
         // Slack for the CYK d-cap. We take the max of:
-        //   - 3x the rnasearch prefilter envelope length (local extension)
+        //   - 3x the RNA search prefilter envelope length (local extension)
         //   - 1.5x the CM consensus length (global: a true CM hit can stretch
         //     well beyond the prefilter envelope, especially for structured
         //     RNAs where iter-3 msa-profile mass is concentrated around the
@@ -7313,9 +7313,9 @@ int cmsearch(int argc, const char **argv, const Command &command) {
 // =====================================================================
 // cmprefilter — CM emit-only multi-hit prefilter
 //
-// Takes an existing rnasearch (k-mer/SW) prefilter result, adds CM-detected
+// Takes an existing RNA search (k-mer/SW) prefilter result, adds CM-detected
 // alternative hits per target. For each target sequence already passing the
-// rnasearch filter, slides a per-consensus-column emission profile along the
+// RNA search filter, slides a per-consensus-column emission profile along the
 // target and emits high-scoring positions as additional prefilter rows.
 //
 // Output format = same as input (m8 prefilter), so cmsearch can consume it
@@ -7557,7 +7557,7 @@ int cmprefilter(int argc, const char **argv, const Command &command) {
 
         std::string outBuf;
         outBuf.reserve(1024 * 1024);
-        // Always include all original rows (decision A — preserve rnasearch hits)
+        // Always include all original rows (decision A — preserve RNA search hits)
         for (const InRow &r : inRows) {
             outBuf.append(r.raw);
             outBuf.push_back('\n');
@@ -7619,7 +7619,7 @@ int cmprefilter(int argc, const char **argv, const Command &command) {
 
                 const float sc = scores[(size_t)p];
                 const int bitScore = std::max(1, (int)std::lrint(sc + 50.0f));
-                // m8 row format consistent with rnasearch output.
+                // m8 row format consistent with RNA search output.
                 char buf[256];
                 std::snprintf(buf, sizeof(buf),
                               "%u\t%d\t1.00\t1e-30\t0\t%d\t%d\t%d\t%d\t%d\t0\t%d\t0\t0\t%dM\n",

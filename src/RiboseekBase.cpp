@@ -28,12 +28,12 @@ std::vector<Command> riboseekCommands = {
                                       {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                       {"resultDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::resultDb },
                                       {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}},
-    {"rnasearch", rnasearch, &localPar.searchworkflow, COMMAND_MAIN,
+    {"search", riboseekSearch, &localPar.searchworkflow, COMMAND_MAIN,
             "RNA homology search with dinucleotide profiles",
             "# Search RNA query against RNA target database\n"
-            "riboseek rnasearch queryDB targetDB resultDB tmp\n\n"
+            "riboseek search queryDB targetDB resultDB tmp\n\n"
             "# Iterative profile search\n"
-            "riboseek rnasearch queryDB targetDB resultDB tmp --num-iterations 3\n",
+            "riboseek search queryDB targetDB resultDB tmp --num-iterations 3\n",
             "Martin Steinegger <martin.steinegger@snu.ac.kr>",
             "<i:queryDB> <i:targetDB> <o:resultDB> <tmpDir>",
             CITATION_MMSEQS2, {{"queryDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },

@@ -10,7 +10,7 @@ QUERYDB="${RESULTS}/query"
 TARGET="${EXAMPLEDIR}/DB.fasta"
 TARGETDB="${RESULTS}/target"
 "${RIBOSEEK}" createdb "${TARGET}" "${TARGETDB}"
-"${RIBOSEEK}" rnasearch "${QUERYDB}" "${TARGETDB}" "${RESULTS}/results" "${RESULTS}/tmp"
+"${RIBOSEEK}" search "${QUERYDB}" "${TARGETDB}" "${RESULTS}/results" "${RESULTS}/tmp"
 
 "${RIBOSEEK}" convertalis "${QUERYDB}" "${TARGETDB}" "${RESULTS}/results" "${RESULTS}/results.m8"
 

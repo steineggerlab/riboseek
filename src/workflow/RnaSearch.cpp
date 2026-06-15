@@ -30,7 +30,7 @@ static void setRnaSearchDefaults(Parameters *p) {
     }
 }
 
-int rnasearch(int argc, const char **argv, const Command &command) {
+int riboseekSearch(int argc, const char **argv, const Command &command) {
     LocalParameters &par = LocalParameters::getLocalInstance();
     setRnaSearchDefaults(&par);
     par.PARAM_COV_MODE.addCategory(MMseqsParameter::COMMAND_EXPERT);

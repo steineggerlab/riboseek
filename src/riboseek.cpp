@@ -1,4 +1,5 @@
 #include <cstddef>
+#include <cstring>
 #include "Command.h"
 #include "LocalParameters.h"
 #include "DinucleotideMapping.h"
@@ -15,7 +16,19 @@ bool hide_base_downloads = false;
 
 extern std::vector<Command> baseCommands;
 extern std::vector<Command> riboseekCommands;
+static void removeBaseCommand(const char *name) {
+    std::vector<Command> filtered;
+    filtered.reserve(baseCommands.size());
+    for (std::vector<Command>::const_iterator it = baseCommands.begin(); it != baseCommands.end(); ++it) {
+        if (std::strcmp(it->cmd, name) != 0) {
+            filtered.push_back(*it);
+        }
+    }
+    baseCommands.swap(filtered);
+}
+
 void init() {
+    removeBaseCommand("search");
     registerCommands(&baseCommands);
     registerCommands(&riboseekCommands);
     registerDinucleotideMapping();
