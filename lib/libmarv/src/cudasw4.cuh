@@ -1302,8 +1302,57 @@ namespace cudasw4{
             }
         }
 
+        // check if we can use GPU unified memory
+        bool canUseHostDbInPlace() const {
+            if(deviceIds.empty()){
+                return false;
+            }
+            for(int id : deviceIds){
+                int usesHostPageTables = 0;
+                cudaDeviceGetAttribute(&usesHostPageTables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, id);
+                if(usesHostPageTables != 1){
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // check if DB fits in host memory
+        bool hostDbFitsInMemory() const {
+            const auto& data = fullDB.getData();
+            const size_t dbBytes = data.numChars()
+                + data.numSequences() * (sizeof(SequenceLengthT) + sizeof(size_t));
+            const size_t reserve = memoryConfig.maxTempBytes + (size_t(1) << 30);
+            RevertDeviceId rdi{};
+            for(int id : deviceIds){
+                cudaSetDevice(id);
+                size_t freeMem = 0, totalMem = 0;
+                cudaMemGetInfo(&freeMem, &totalMem);
+                if(dbBytes + reserve > totalMem){
+                    return false;
+                }
+            }
+            return true;
+        }
+
         void makeReady(){
             nvtx::ScopedRange sr("makeReady", 0);
+            // don't duplicate memory on unified-memory GPUs, unless the database is too large
+            if(canUseHostDbInPlace() && hostDbFitsInMemory()){
+                const auto& data = fullDB.getData();
+                std::vector<std::shared_ptr<GpuDatabaseAllocationBase>> hostViews(
+                    deviceIds.size(),
+                    std::make_shared<GpuDatabaseAllocationView>(
+                        const_cast<char*>(data.chars()),
+                        const_cast<SequenceLengthT*>(data.lengths()),
+                        const_cast<size_t*>(data.offsets()),
+                        data.numChars(),
+                        data.numSequences()
+                    )
+                );
+                makeReadyWithExistingFullGpuDB(hostViews);
+                return;
+            }
             #ifdef CUDASW_DEBUG_CHECK_CORRECTNESS
             const auto& dbData = fullDB.getData();
             size_t numDBSequences = dbData.numSequences();
