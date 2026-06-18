@@ -1321,11 +1321,11 @@ template<typename T>
 void DBReader<T>::decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize, size_t *startEntry, size_t *numEntries){
     const size_t dataSize = getDataSize();
     const size_t dbEntries = getSize();
-    if (worldSize > dataSize) {
-        // Assume the domain numEntries is greater than the world numEntries.
-        Debug(Debug::ERROR) << "World Size: " << worldSize << " dbSize: " << dataSize << "\n";
-        EXIT(EXIT_FAILURE);
-    }
+    // if (worldSize > dataSize) {
+    //     // Assume the domain numEntries is greater than the world numEntries.
+    //     Debug(Debug::ERROR) << "World Size: " << worldSize << " dbSize: " << dataSize << "\n";
+    //     EXIT(EXIT_FAILURE);
+    // }
 
     if (worldSize == 1) {
         *startEntry = 0;
