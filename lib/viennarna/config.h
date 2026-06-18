@@ -11,6 +11,9 @@
 /* We always have math.h */
 #define HAVE_MATH_H 1
 
+/* We always have strdup */
+#define HAVE_STRDUP 1
+
 /* Check for erand48 (POSIX) */
 #if defined(__unix__) || defined(__APPLE__)
 #define HAVE_ERAND48 1
