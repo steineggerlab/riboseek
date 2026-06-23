@@ -7269,7 +7269,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
         }
         resultWriter.writeEnd(qm.key, 0);
     }
-    resultWriter.close();
+    resultWriter.close(true);
     resultReader.close();
 
     // Write companion header DB so integer target keys can be mapped back to FASTA headers.
