@@ -4,6 +4,7 @@
 #include "Command.h"
 
 extern int splitstrand(int argc, const char **argv, const Command& command);
+extern int rnafold(int argc, const char **argv, const Command& command);
 extern int rnaalign(int argc, const char **argv, const Command& command);
 extern int riboseekSearch(int argc, const char **argv, const Command& command);
 extern int generatecm(int argc, const char **argv, const Command& command);

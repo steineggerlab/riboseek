@@ -35,6 +35,7 @@ public:
     PARAMETER(PARAM_CMLITE_MSA_EVAL)
 
     std::vector<MMseqsParameter*> splitstrand;
+    std::vector<MMseqsParameter*> rnafold;
     std::vector<MMseqsParameter*> rnaalign;
     std::vector<MMseqsParameter*> cmbuild;
 };

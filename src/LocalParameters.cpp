@@ -54,6 +54,10 @@ LocalParameters::LocalParameters() : Parameters(),
     splitstrand.push_back(&PARAM_COMPRESSED);
     splitstrand.push_back(&PARAM_V);
 
+    rnafold.push_back(&PARAM_THREADS);
+    rnafold.push_back(&PARAM_COMPRESSED);
+    rnafold.push_back(&PARAM_V);
+
     cmbuild.push_back(&PARAM_CALIBRATE_CM);
     // hhfilter/rMSA-style row filter on the cmbuild input MSA (off by default)
     cmbuild.push_back(&PARAM_FILTER_MSA);

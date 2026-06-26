@@ -41,8 +41,12 @@ if (ENABLE_INFERNAL_BRIDGE)
     add_subdirectory(lib/infernal)
 endif ()
 
-# ViennaRNA minimal library (hand-rolled CMake wrapper, autotools-free)
-add_subdirectory(lib/viennarna)
+# Optional ViennaRNA reference library for development parity checks.
+# Production riboseek RNA folding uses src/rnautils/RnaFold.cpp.
+option(ENABLE_VIENNARNA_REFERENCE "Build vendored ViennaRNA reference target" OFF)
+if (ENABLE_VIENNARNA_REFERENCE)
+    add_subdirectory(lib/viennarna)
+endif()
 
 add_subdirectory(data)
 add_subdirectory(src)

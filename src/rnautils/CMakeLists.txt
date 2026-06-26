@@ -2,6 +2,7 @@ set(rnautils_source_files
     rnautils/CmScan.cpp
     rnautils/GenerateCm.cpp
     rnautils/splitstrand.cpp
+    rnautils/RnaFold.cpp
     rnautils/RnaAlign.cpp
     rnautils/RnaMatcher.cpp
     rnautils/RnaSmithWaterman.cpp

@@ -27,15 +27,6 @@ if (TARGET infernal-bridge)
     target_compile_definitions(riboseek-framework PUBLIC -DHAVE_INFERNAL_BRIDGE=1)
 endif()
 
-# ViennaRNA
-if (TARGET viennarna)
-    get_target_property(VRNA_INCLUDES viennarna INTERFACE_INCLUDE_DIRECTORIES)
-    if (VRNA_INCLUDES)
-        target_include_directories(riboseek-framework PUBLIC ${VRNA_INCLUDES})
-    endif()
-    target_link_libraries(riboseek-framework viennarna)
-    target_compile_definitions(riboseek-framework PUBLIC -DHAVE_RNAFOLD_PREDICT=1)
-endif()
 
 if (NOT RIBOSEEK_FRAMEWORK_ONLY)
     add_executable(riboseek riboseek.cpp)
