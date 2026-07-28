@@ -101,20 +101,6 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuild.push_back(&PARAM_COMPRESSED);
     cmbuild.push_back(&PARAM_V);
 
-    // fused build+scan
-    cmbuildscan = cmscan;
-    cmbuildscan.push_back(&PARAM_FILTER_MSA);
-    cmbuildscan.push_back(&PARAM_FILTER_MAX_SEQ_ID);
-    cmbuildscan.push_back(&PARAM_FILTER_QID);
-    cmbuildscan.push_back(&PARAM_FILTER_QSC);
-    cmbuildscan.push_back(&PARAM_FILTER_COV);
-    cmbuildscan.push_back(&PARAM_FILTER_NDIFF);
-    cmbuildscan.push_back(&PARAM_FILTER_MIN_ENABLE);
-    cmbuildscan.push_back(&PARAM_CMLITE_MSA_EVAL);
-    cmbuildscan.push_back(&PARAM_CMBUILD_ERE);
-    cmbuildscan.push_back(&PARAM_CMBUILD_SYMFRAC);
-    cmbuildscan.push_back(&PARAM_CMBUILD_NOSS);
-
     // result2profile needs --strand so the RNA-corrected E-value gets the
     // both-strands doubling (matches MMseqs2 RNA fork behavior)
     result2profile.push_back(&PARAM_STRAND);

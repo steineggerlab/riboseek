@@ -6,6 +6,7 @@
 #include "Matcher.h"
 #include "Util.h"
 #include "NucleotideMatrix.h"
+#include "CmBuildScan.h"
 #include "Util.h"
 #include "Sequence.h"
 

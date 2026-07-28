@@ -47,7 +47,7 @@ public:
     std::vector<MMseqsParameter*> splitstrand;
     std::vector<MMseqsParameter*> rnaalign;
     std::vector<MMseqsParameter*> cmbuild;
-    std::vector<MMseqsParameter*> cmscan;   // cmscan/cmsearch: base align + CM scan/align mode knobs
+    std::vector<MMseqsParameter*> cmscan;
 };
 
 #endif
