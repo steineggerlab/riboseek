@@ -152,18 +152,17 @@ int rnaalign(int argc, const char **argv, const Command &command) {
         querySeqType = qdbr->getDbtype();
     }
 
-    // Check if tdbr is a GPU db
-    bool isGpuDb = (DBReader<unsigned int>::getExtendedDbtype(targetSeqType) & Parameters::DBTYPE_EXTENDED_GPU);
-
     // RNA always uses dinucleotide pair encoding.
-    // Force DINUCLEOTIDE flag on both query and target so dinucMapSequence activates.
-    // Keep the base types as-is (AMINO_ACIDS for sequences, HMM_PROFILE for profiles).
-    // If targetSeqType is GPU db, don't set the DINUCLEOTIDE flag
-    if (!isGpuDb) {
-        uint16_t tExt = DBReader<unsigned int>::getExtendedDbtype(targetSeqType);
+    uint16_t tExt = DBReader<unsigned int>::getExtendedDbtype(targetSeqType);
+    bool isGpuDb = (tExt & Parameters::DBTYPE_EXTENDED_GPU);
+    if (isGpuDb) {
+        // gpu databases are already encoded correctly, clear flag
+        tExt &= ~LocalParameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
+    } else {
+        // encode di-nucleotides on the fly
         tExt |= LocalParameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
-        targetSeqType = DBReader<unsigned int>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, tExt);
     }
+    targetSeqType = DBReader<unsigned int>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, tExt);
     {
         uint16_t qExt = DBReader<unsigned int>::getExtendedDbtype(querySeqType);
         qExt |= LocalParameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
@@ -305,22 +304,13 @@ int rnaalign(int argc, const char **argv, const Command &command) {
                     data = Util::skipLine(data);
 
                     size_t dbId = tdbr->getId(dbKey);
-		    char *dbSeqData = NULL;
-                    if (isGpuDb) {
-                        // Run getDataUncompressed
-                        dbSeqData = tdbr->getDataUncompressed(dbId);
-                    } else {
-                        dbSeqData = tdbr->getData(dbId, thread_idx);
-                    }
+                    char *dbSeqData = tdbr->getData(dbId, thread_idx);
                     if (dbSeqData == NULL) {
                         Debug(Debug::ERROR) << "Sequence " << dbKey
                                             << " is required in the prefiltering, but is not contained in the target sequence database!\n";
                         EXIT(EXIT_FAILURE);
                     }
                     dbSeq.mapSequence(dbId, dbKey, dbSeqData, tdbr->getSeqLen(dbId));
-		    if (isGpuDb) {
-			memcpy(dbSeq.numSequence, dbSeqData, tdbr->getSeqLen(dbId));
-		    }
                     if (reverse) {
                         dinucEncodeReverse(&dbSeq);
                     }
@@ -425,21 +415,13 @@ int rnaalign(int argc, const char **argv, const Command &command) {
                     int realignAccepted = 0;
                     for (size_t result = 0; result < swResults.size() && realignAccepted < realignMaxSeqs; result++) {
                         size_t dbId = tdbr->getId(swResults[result].dbKey);
-			char *dbSeqData = NULL;
-			if (isGpuDb) {
-			    dbSeqData = tdbr->getDataUncompressed(dbId);
-			} else {
-			    dbSeqData = tdbr->getData(dbId, thread_idx);
-			}
+                        char *dbSeqData = tdbr->getData(dbId, thread_idx);
                         if (dbSeqData == NULL) {
                             Debug(Debug::ERROR) << "Sequence " << swResults[result].dbKey
                                                 << " is required in the prefiltering, but is not contained in the target sequence database!\n";
                             EXIT(EXIT_FAILURE);
                         }
                         dbSeq.mapSequence(dbId, swResults[result].dbKey, dbSeqData, tdbr->getSeqLen(dbId));
-			if (isGpuDb) {
-			    memcpy(dbSeq.numSequence, dbSeqData, tdbr->getSeqLen(dbId));
-			}
                         if (reverse) {
                             dinucEncodeReverse(&dbSeq);
                         }

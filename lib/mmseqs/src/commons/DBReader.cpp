@@ -559,14 +559,21 @@ template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
     char *data = getDataUncompressed(id);
     size_t seqLen = getSeqLen(id);
 
-    static const char CODE_TO_CHAR[21] = {
+    static const char CODE_TO_CHAR[32] = {
             'A', /*  0 */ 'C', /*  1 */ 'D', /*  2 */
             'E', /*  3 */ 'F', /*  4 */ 'G', /*  5 */
             'H', /*  6 */ 'I', /*  7 */ 'K', /*  8 */
             'L', /*  9 */ 'M', /* 10 */ 'N', /* 11 */
             'P', /* 12 */ 'Q', /* 13 */ 'R', /* 14 */
             'S', /* 15 */ 'T', /* 16 */ 'V', /* 17 */
-            'W', /* 18 */ 'Y', /* 19 */ 'X'  /* 20 */
+            'W', /* 18 */ 'Y', /* 19 */
+#ifdef RIBOSEEK
+            'B', /* 20 */ 'J', /* 21 */ 'O', /* 22 */ 'U', /* 23 */ 'X', /* 24 */
+            'X', 'X', 'X', 'X', 'X', 'X', 'X' /* 25-31 pad */
+#else
+            'X', /* 20 */
+            'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X' /* 21-31 pad */
+#endif
     };
 
     for(size_t i = 0; i < seqLen; i++){

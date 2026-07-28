@@ -1480,6 +1480,8 @@ RnaSmithWaterman::cigar * RnaSmithWaterman::banded_sw(const unsigned char *db_se
     h_c = (int32_t*)malloc(s1 * sizeof(int32_t));
     direction = (int8_t*)malloc(s2 * sizeof(int8_t));
 
+	// Bound to terminates once the band spans db_length x query_length
+	const int32_t fullBand = (db_length > query_length ? db_length : query_length);
 	do {
 		width = band_width * 2 + 3, width_d = band_width * 2 + 1;
 		while (width >= s1) {
@@ -1574,9 +1576,16 @@ RnaSmithWaterman::cigar * RnaSmithWaterman::banded_sw(const unsigned char *db_se
 		}
         //TODO make band_width dependet on how far the score was off
 		band_width *= 2;
-	} while (LIKELY(max < score));
+	} while (LIKELY(max < score) && (band_width / 2) < fullBand);
 	band_width /= 2;
 
+	// Max is the true optimum; if it is below the target score the alignment is inconsistent.
+	if (UNLIKELY(max < score)) {
+		Debug(Debug::ERROR) << "banded_sw: optimum " << max << " is below target score "
+			<< score << " (query_length=" << query_length << ", db_length=" << db_length
+			<< "). Alignment score and positions are inconsistent. This should not happen.\n";
+		EXIT(EXIT_FAILURE);
+	}
 
 	// trace back
 	i = query_length - 1;
