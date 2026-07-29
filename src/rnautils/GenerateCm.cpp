@@ -16,6 +16,9 @@
 
 #include <set>
 #include <unordered_map>
+#ifdef RIBOSEEK_CMBUILD_DUMP_STOCKHOLM
+#include <fstream>
+#endif
 
 #ifdef OPENMP
 #include <omp.h>
@@ -630,6 +633,20 @@ bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
                 convertTsToUs(row);
                 aseqs.push_back(std::move(row));
             }
+#ifdef RIBOSEEK_CMBUILD_DUMP_STOCKHOLM
+            // Serializes seed MSA + SS_cons fed to Infernal cmbuild
+            std::ofstream sto(std::string(RIBOSEEK_CMBUILD_DUMP_STOCKHOLM) + "/" + modelName + ".sto");
+            if (sto) {
+                sto << "# STOCKHOLM 1.0\n#=GF ID " << modelName << "\n";
+                for (size_t i = 0; i < sqnames.size(); ++i)
+                    sto << sqnames[i] << " " << aseqs[i] << "\n";
+                if (!aseqs.empty() && !aseqs[0].empty())
+                    sto << "#=GC RF " << std::string(aseqs[0].size(), 'x') << "\n";
+                if (!ssCons.empty())
+                    sto << "#=GC SS_cons " << ssCons << "\n";
+                sto << "//\n";
+            }
+#endif
             bool success = cmbuildFromAlignment(modelName, sqnames, aseqs, ssCons, cmText, buildErr,
                                                 par.cmbuildEre, par.cmbuildSymfrac, par.cmbuildNoss != 0,
                                                 forScan, useInside, useLocal, ret_cm);
