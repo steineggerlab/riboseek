@@ -1,47 +1,45 @@
-#include "LocalCommandDeclarations.h"
-#include "CommandDeclarations.h"
+#include "LocalParameters.h"
 #include "Debug.h"
 #include "DBReader.h"
 #include "DBWriter.h"
+#include "CmBuildScan.h"
+#include "LocalParameters.h"
 #include "FileUtil.h"
-#include "MMseqsMPI.h"
-#include "Parameters.h"
-#include "RNAFoldBridge.h"
+#include "RnaFoldingBridge.h"
 #include "Matcher.h"
 #include "Orf.h"
-#include "LocalParameters.h"
 #include "MsaFilter.h"
 #include "MultipleAlignment.h"
 #include "SubstitutionMatrix.h"
 #include "Util.h"
 #include "DinucleotideMapping.h"
-#ifdef HAVE_INFERNAL_BRIDGE
-#include "infernal/InfernalBridge.h"
+
+#include <set>
+#include <unordered_map>
+#ifdef RIBOSEEK_CMBUILD_DUMP_STOCKHOLM
+#include <fstream>
 #endif
 
 #ifdef OPENMP
 #include <omp.h>
 #endif
 
-#include <algorithm>
-#include <cctype>
-#include <cstdio>
-#include <cstdlib>
-#include <set>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <unordered_map>
-#include <sys/stat.h>
-#include <unistd.h>
+extern bool cmbuildFromAlignment(
+    const std::string &name,
+    const std::vector<std::string> &sqnames,
+    const std::vector<std::string> &aseqs,
+    const std::string &ssCons,
+    std::string &cmText, std::string &err,
+    double ereOverride, double symfracOpt, bool noss,
+    bool forScan, bool useInside, bool useLocal,
+    CM_t **ret_cm
+);
+extern void cmInfernalGlobalInit();
 
-// Native generatecm command:
-// maps DB -> DB covariance-model generation to MMseqs profile construction.
+extern int result2profile(int argc, const char **argv, const Command& command);
 int generatecm(int argc, const char **argv, const Command &command) {
     return result2profile(argc, argv, command);
 }
-
-namespace {
 
 struct AlnSeq {
     std::string id;
@@ -134,32 +132,6 @@ static inline unsigned char encodeAlignedNuc(char c) {
         default:  return MultipleAlignment::NAA;  // N or anything else → ANY
     }
 }
-
-static std::string buildStockholmText(const std::string &id,
-                                      const std::vector<AlnSeq> &seqs,
-                                      const std::string &ssCons) {
-    std::ostringstream out;
-    out << "# STOCKHOLM 1.0\n";
-    out << "#=GF ID " << (id.empty() ? "mmseqs_model" : id) << "\n";
-    for (size_t i = 0; i < seqs.size(); ++i) {
-        std::string rnaAln = seqs[i].aln;
-        convertTsToUs(rnaAln);
-        out << seqs[i].id << " " << rnaAln << "\n";
-    }
-    // Force every alignment column to be a CM match column via --hand: RF line
-    // of all 'x' makes consensus column c map 1:1 to query position c-1, so
-    // cmsearch traces are directly query-coord and result_t records stay
-    // compatible with result2dnamsa / convertalis.
-    if (!seqs.empty() && !seqs[0].aln.empty()) {
-        out << "#=GC RF " << std::string(seqs[0].aln.size(), 'x') << "\n";
-    }
-    if (!ssCons.empty()) {
-        out << "#=GC SS_cons " << ssCons << "\n";
-    }
-    out << "//\n";
-    return out.str();
-}
-
 
 static std::string trimCopy(const std::string &s) {
     size_t b = 0;
@@ -461,189 +433,31 @@ static bool mergeCmbuildInputs(const std::string &queryDb,
     return true;
 }
 
-} // namespace
-
-int cmbuild(int argc, const char **argv, const Command &command) {
-    LocalParameters &par = LocalParameters::getLocalInstance();
-    // Defaults for the optional MSA row filter (off; rMSA-style cov+id+Ndiff
-    // when the user opts in via --filter-msa 1). qsc disabled because our
-    // substitution matrix is dinucleotide so qsc scores would be in the wrong
-    // space; cov + filterMaxSeqId + Ndiff are pure byte comparisons and unaffected.
-    par.filterMsa = 0;
-    par.qsc = -50.0f;
-    par.covMSAThr = 0.5f;
-    par.filterMaxSeqId = 0.99f;
-    par.Ndiff = 128;
-
-    std::string rawTargetDbArg;
-    std::string rawResultDbArg;
-    std::vector<std::string> parseArgStorage;
-    std::vector<const char *> parseArgv;
-    if (argc > 2) {
-        rawTargetDbArg = argv[1];
-        rawResultDbArg = argv[2];
-        if (rawTargetDbArg.find(',') != std::string::npos
-            || rawResultDbArg.find(',') != std::string::npos) {
-            parseArgStorage.reserve(static_cast<size_t>(argc));
-            parseArgv.reserve(static_cast<size_t>(argc));
-            for (int i = 0; i < argc; ++i) {
-                parseArgStorage.push_back(argv[i]);
-            }
-            const std::vector<std::string> targetParts = splitCommaList(rawTargetDbArg);
-            const std::vector<std::string> resultParts = splitCommaList(rawResultDbArg);
-            if (!targetParts.empty()) {
-                parseArgStorage[1] = targetParts[0];
-            }
-            if (!resultParts.empty()) {
-                parseArgStorage[2] = resultParts[0];
-            }
-            for (size_t i = 0; i < parseArgStorage.size(); ++i) {
-                parseArgv.push_back(parseArgStorage[i].c_str());
-            }
-        }
-    }
-    par.parseParameters(argc,
-                        parseArgv.empty() ? argv : parseArgv.data(),
-                        command,
-                        true,
-                        0,
-                        0);
-
-#ifndef HAVE_INFERNAL_BRIDGE
-    Debug(Debug::ERROR) << "cmbuild requires Infernal bridge support\n";
-    return EXIT_FAILURE;
-#else
-
-    const std::vector<std::string> targetDbList = splitCommaList(rawTargetDbArg.empty() ? par.db2 : rawTargetDbArg);
-    const std::vector<std::string> resultDbList = splitCommaList(rawResultDbArg.empty() ? par.db3 : rawResultDbArg);
-    if (targetDbList.size() != resultDbList.size()) {
-        Debug(Debug::ERROR) << "cmbuild: targetDB/resultDB list sizes differ ("
-                            << targetDbList.size() << " vs " << resultDbList.size() << ")\n";
-        return EXIT_FAILURE;
-    }
-    const bool useMergedInputs = (targetDbList.size() > 1 || resultDbList.size() > 1);
-    if (useMergedInputs) {
-        const std::string mergedTargetDb = par.db4 + "_target_merged";
-        const std::string mergedResultDb = par.db4 + "_result_merged";
-        removeDbFiles(mergedTargetDb);
-        removeDbFiles(mergedResultDb);
-        std::string mergeErr;
-        Debug(Debug::INFO) << "cmbuild: merging " << targetDbList.size()
-                           << " target/result DB pairs next to output CM DB\n";
-        if (!mergeCmbuildInputs(par.db1, targetDbList, resultDbList,
-                                mergedTargetDb, mergedResultDb,
-                                par.threads, mergeErr)) {
-            Debug(Debug::ERROR) << "cmbuild: failed to merge multi-DB input: " << mergeErr << "\n";
-            return EXIT_FAILURE;
-        }
-        par.db2 = mergedTargetDb;
-        par.db2Index = mergedTargetDb + ".index";
-        par.db3 = mergedResultDb;
-        par.db3Index = mergedResultDb + ".index";
-        Debug(Debug::INFO) << "cmbuild: merged target DB: " << par.db2 << "\n";
-        Debug(Debug::INFO) << "cmbuild: merged result DB: " << par.db3 << "\n";
-    }
-
-    // Fork Infernal workers BEFORE loading DBs. Each worker stays ~small
-    // (few MB) instead of CoW-ing a post-mmap fat parent, which serializes
-    // forks under the kernel mm lock.
-    InfernalBridge::WorkerPool *workerPool = InfernalBridge::startWorkerPool(par.threads);
-    if (workerPool == NULL) {
-        Debug(Debug::ERROR) << "cmbuild: failed to start Infernal worker pool\n";
-        return EXIT_FAILURE;
-    }
-
-    DBReader<unsigned int> qDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
-                                DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
-    qDbr.open(DBReader<unsigned int>::NOSORT);
-
-    const bool sameDatabase = (par.db1 == par.db2);
-    DBReader<unsigned int> *tDbr = &qDbr;
-    if (!sameDatabase) {
-        tDbr = new DBReader<unsigned int>(par.db2.c_str(), par.db2Index.c_str(), par.threads,
-                                          DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
-        tDbr->open(DBReader<unsigned int>::NOSORT);
-    }
-
-    DBReader<unsigned int> resultReader(par.db3.c_str(), par.db3Index.c_str(), par.threads,
-                                        DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
-    resultReader.open(DBReader<unsigned int>::LINEAR_ACCCESS);
-
-    DBWriter cmWriter(par.db4.c_str(), par.db4Index.c_str(), par.threads,
-                      par.compressed, Parameters::DBTYPE_GENERIC_DB);
-    cmWriter.open();
-
-    Debug(Debug::INFO) << "Query database size: " << qDbr.getSize() << " type: " << qDbr.getDbTypeName() << "\n";
-    Debug(Debug::INFO) << "Target database size: " << tDbr->getSize() << " type: " << tDbr->getDbTypeName() << "\n";
-    {
-        std::ostringstream msaEvalStream;
-        msaEvalStream << std::scientific << par.cmliteMsaEvalThr;
-        Debug(Debug::INFO) << "cmbuild seed E-value threshold: " << msaEvalStream.str() << "\n";
-    }
-
-    Debug::Progress progress(resultReader.getSize());
-
-    // Stockholm rows are filtered: drop any target with non-gap coverage
-    // below this threshold. Infernal's cm_parsetree_Doctor() can fail when
-    // many short fragments dominate the column statistics.
-    const float minColCoverage = 0.30f;
-    // Stricter filter for the alifold input: noisy rows degrade the
-    // covariation signal, so feed only well-covered rows to alifold
-    // (default 0.70, override with RIBOSEEK_ALIFOLD_MINCOV).
-    float alifoldMinCov = 0.70f;
-    if (const char *envCov = std::getenv("RIBOSEEK_ALIFOLD_MINCOV")) {
-        float v = std::atof(envCov);
-        if (v > 0.0f && v <= 1.0f) alifoldMinCov = v;
-    }
-
-    // Optional rMSA/hhfilter-style row filter on the cmbuild input MSA. Knobs
-    // map 1:1 to MMseqs MsaFilter: --cov-msa, --filter-max-seqid, --diff (Ndiff),
-    // --qid, --qsc, --filter-min-enable. Default is off.
-    const bool doMsaFilter = (par.filterMsa != 0);
-    SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, 0.0f);
-    const unsigned int targetExt = DBReader<unsigned int>::getExtendedDbtype(tDbr->getDbtype());
-    const bool targetGpuDb = (targetExt & Parameters::DBTYPE_EXTENDED_GPU) != 0;
-    const bool decodeTargetDinuc = ((targetExt & Parameters::DBTYPE_EXTENDED_DINUCLEOTIDE) != 0) || targetGpuDb;
-    const int targetSeqType = effectiveDecodeSeqType(tDbr->getDbtype(), decodeTargetDinuc);
-    std::vector<std::string> qid_str_vec = Util::split(par.qid, ",");
-    std::vector<int> qid_vec;
-    qid_vec.reserve(qid_str_vec.size());
-    for (size_t i = 0; i < qid_str_vec.size(); ++i) {
-        float qidf = static_cast<float>(std::atof(qid_str_vec[i].c_str()));
-        qid_vec.push_back(static_cast<int>(qidf * 100));
-    }
-    if (qid_vec.empty()) qid_vec.push_back(0);
-    std::sort(qid_vec.begin(), qid_vec.end());
-
-#pragma omp parallel
-    {
-        unsigned int thread_idx = 0;
-#ifdef OPENMP
-        thread_idx = (unsigned int) omp_get_thread_num();
-#endif
-        std::vector<Matcher::result_t> alnResults;
-        alnResults.reserve(300);
-        std::set<unsigned int> seenKeys;
-
-        // Per-thread MsaFilter scratch. Allocated once, reused across queries.
-        // maxSeqLen and maxSetSize grow inside MsaFilter as needed (increaseSetSize),
-        // so seeding with conservative values is fine.
-        MsaFilter msaFilter(8192, 1024, &subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid());
-        Sequence targetMapper(tDbr->getMaxSeqLen(), targetSeqType, &subMat, 0, false, false);
-        std::vector<unsigned char> encBuf;
-        std::vector<const char *> rowPtrs;
-
-#pragma omp for schedule(dynamic, 1)
-        for (size_t id = 0; id < resultReader.getSize(); id++) {
-            progress.updateProgress();
-            alnResults.clear();
-            seenKeys.clear();
-
+bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
+                      unsigned int thread_idx, std::string &cmText, std::string &err,
+                      bool forScan, bool useInside, bool useLocal,
+                      CM_t **ret_cm) {
+    DBReader<unsigned int> &qDbr = *ctx.qDbr;
+    DBReader<unsigned int> *tDbr = ctx.tDbr;
+    DBReader<unsigned int> &resultReader = *ctx.resultReader;
+    SubstitutionMatrix &subMat = *ctx.subMat;
+    MsaFilter &msaFilter = *ctx.msaFilter;
+    Sequence &targetMapper = *ctx.targetMapper;
+    const std::vector<int> &qid_vec = ctx.qid_vec;
+    const float alifoldMinCov = ctx.alifoldMinCov;
+    const float minColCoverage = ctx.minColCoverage;
+    const bool doMsaFilter = ctx.doMsaFilter;
+    const bool decodeTargetDinuc = ctx.decodeTargetDinuc;
+    const bool targetGpuDb = ctx.targetGpuDb;
+    std::vector<Matcher::result_t> alnResults; alnResults.reserve(300);
+    std::set<unsigned int> seenKeys;
+    std::vector<unsigned char> encBuf;
+    std::vector<const char *> rowPtrs;
             unsigned int queryKey = resultReader.getDbKey(id);
             size_t queryId = qDbr.getId(queryKey);
             if (queryId == UINT_MAX) {
-                Debug(Debug::WARNING) << "cmbuild: invalid query " << queryKey << "\n";
-                continue;
+                err = "invalid query " + std::to_string(queryKey);
+                return false;
             }
 
             // Render the query row directly from raw nucleotide DB chars.
@@ -807,29 +621,203 @@ int cmbuild(int argc, const char **argv, const Command &command) {
                 stoSeqs = std::move(keptSeqs);
             }
 
-            std::string stoText = buildStockholmText(
-                "query_" + std::to_string(queryKey), stoSeqs, ssCons);
-
-            if (const char *dumpPath = std::getenv("RIBOSEEK_DUMP_STOCKHOLM")) {
-                std::string outPath = std::string(dumpPath) + "/query_" + std::to_string(queryKey) + ".sto";
-                FILE *fp = std::fopen(outPath.c_str(), "w");
-                if (fp != nullptr) {
-                    std::fwrite(stoText.data(), 1, stoText.size(), fp);
-                    std::fclose(fp);
-                }
+            const std::string modelName = "query_" + std::to_string(queryKey);
+            std::string buildErr;
+            std::vector<std::string> sqnames;
+            std::vector<std::string> aseqs;
+            sqnames.reserve(stoSeqs.size());
+            aseqs.reserve(stoSeqs.size());
+            for (const AlnSeq &s : stoSeqs) {
+                sqnames.push_back(s.id);
+                std::string row = s.aln;
+                convertTsToUs(row);
+                aseqs.push_back(std::move(row));
             }
+#ifdef RIBOSEEK_CMBUILD_DUMP_STOCKHOLM
+            // Serializes seed MSA + SS_cons fed to Infernal cmbuild
+            std::ofstream sto(std::string(RIBOSEEK_CMBUILD_DUMP_STOCKHOLM) + "/" + modelName + ".sto");
+            if (sto) {
+                sto << "# STOCKHOLM 1.0\n#=GF ID " << modelName << "\n";
+                for (size_t i = 0; i < sqnames.size(); ++i)
+                    sto << sqnames[i] << " " << aseqs[i] << "\n";
+                if (!aseqs.empty() && !aseqs[0].empty())
+                    sto << "#=GC RF " << std::string(aseqs[0].size(), 'x') << "\n";
+                if (!ssCons.empty())
+                    sto << "#=GC SS_cons " << ssCons << "\n";
+                sto << "//\n";
+            }
+#endif
+            bool success = cmbuildFromAlignment(modelName, sqnames, aseqs, ssCons, cmText, buildErr,
+                                                par.cmbuildEre, par.cmbuildSymfrac, par.cmbuildNoss != 0,
+                                                forScan, useInside, useLocal, ret_cm);
+    if (!success) { err = "build failed for query " + std::to_string(queryKey) + ": " + buildErr; return false; }
+    return true;
+}
 
-            // Call Infernal bridge to build CM. Bridge forks per call so OMP workers
-            // can build in parallel despite Infernal's process-wide global state.
-            std::string cmText;
-            std::string infernalErr;
-            bool success = InfernalBridge::buildCmFromStockholmText(workerPool, stoText, cmText, infernalErr, par.calibrateCm);
+int cmbuild(int argc, const char **argv, const Command &command) {
+    LocalParameters &par = LocalParameters::getLocalInstance();
+    // Defaults for the optional MSA row filter (off; rMSA-style cov+id+Ndiff
+    // when the user opts in via --filter-msa 1). qsc disabled because our
+    // substitution matrix is dinucleotide so qsc scores would be in the wrong
+    // space; cov + filterMaxSeqId + Ndiff are pure byte comparisons and unaffected.
+    par.filterMsa = 0;
+    par.qsc = -50.0f;
+    par.covMSAThr = 0.5f;
+    par.filterMaxSeqId = 0.99f;
+    par.Ndiff = 128;
 
-            if (success) {
-                cmWriter.writeData(cmText.c_str(), cmText.size(), queryKey, thread_idx);
-            } else {
-                Debug(Debug::WARNING) << "cmbuild: Infernal failed for query " << queryKey
-                                      << ": " << infernalErr << "\n";
+    std::string rawTargetDbArg;
+    std::string rawResultDbArg;
+    std::vector<std::string> parseArgStorage;
+    std::vector<const char *> parseArgv;
+    if (argc > 2) {
+        rawTargetDbArg = argv[1];
+        rawResultDbArg = argv[2];
+        if (rawTargetDbArg.find(',') != std::string::npos
+            || rawResultDbArg.find(',') != std::string::npos) {
+            parseArgStorage.reserve(static_cast<size_t>(argc));
+            parseArgv.reserve(static_cast<size_t>(argc));
+            for (int i = 0; i < argc; ++i) {
+                parseArgStorage.push_back(argv[i]);
+            }
+            const std::vector<std::string> targetParts = splitCommaList(rawTargetDbArg);
+            const std::vector<std::string> resultParts = splitCommaList(rawResultDbArg);
+            if (!targetParts.empty()) {
+                parseArgStorage[1] = targetParts[0];
+            }
+            if (!resultParts.empty()) {
+                parseArgStorage[2] = resultParts[0];
+            }
+            for (size_t i = 0; i < parseArgStorage.size(); ++i) {
+                parseArgv.push_back(parseArgStorage[i].c_str());
+            }
+        }
+    }
+    par.parseParameters(argc,
+                        parseArgv.empty() ? argv : parseArgv.data(),
+                        command,
+                        true,
+                        0,
+                        0);
+
+    // initialize Infernal logsum tables once
+    cmInfernalGlobalInit();
+
+    const std::vector<std::string> targetDbList = splitCommaList(rawTargetDbArg.empty() ? par.db2 : rawTargetDbArg);
+    const std::vector<std::string> resultDbList = splitCommaList(rawResultDbArg.empty() ? par.db3 : rawResultDbArg);
+    if (targetDbList.size() != resultDbList.size()) {
+        Debug(Debug::ERROR) << "cmbuild: targetDB/resultDB list sizes differ ("
+                            << targetDbList.size() << " vs " << resultDbList.size() << ")\n";
+        return EXIT_FAILURE;
+    }
+    const bool useMergedInputs = (targetDbList.size() > 1 || resultDbList.size() > 1);
+    if (useMergedInputs) {
+        const std::string mergedTargetDb = par.db4 + "_target_merged";
+        const std::string mergedResultDb = par.db4 + "_result_merged";
+        removeDbFiles(mergedTargetDb);
+        removeDbFiles(mergedResultDb);
+        std::string mergeErr;
+        Debug(Debug::INFO) << "cmbuild: merging " << targetDbList.size()
+                           << " target/result DB pairs next to output CM DB\n";
+        if (!mergeCmbuildInputs(par.db1, targetDbList, resultDbList,
+                                mergedTargetDb, mergedResultDb,
+                                par.threads, mergeErr)) {
+            Debug(Debug::ERROR) << "cmbuild: failed to merge multi-DB input: " << mergeErr << "\n";
+            return EXIT_FAILURE;
+        }
+        par.db2 = mergedTargetDb;
+        par.db2Index = mergedTargetDb + ".index";
+        par.db3 = mergedResultDb;
+        par.db3Index = mergedResultDb + ".index";
+        Debug(Debug::INFO) << "cmbuild: merged target DB: " << par.db2 << "\n";
+        Debug(Debug::INFO) << "cmbuild: merged result DB: " << par.db3 << "\n";
+    }
+
+    DBReader<unsigned int> qDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
+                                DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
+    qDbr.open(DBReader<unsigned int>::NOSORT);
+
+    const bool sameDatabase = (par.db1 == par.db2);
+    DBReader<unsigned int> *tDbr = &qDbr;
+    if (!sameDatabase) {
+        tDbr = new DBReader<unsigned int>(par.db2.c_str(), par.db2Index.c_str(), par.threads,
+                                          DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
+        tDbr->open(DBReader<unsigned int>::NOSORT);
+    }
+
+    DBReader<unsigned int> resultReader(par.db3.c_str(), par.db3Index.c_str(), par.threads,
+                                        DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
+    resultReader.open(DBReader<unsigned int>::LINEAR_ACCCESS);
+
+    DBWriter cmWriter(par.db4.c_str(), par.db4Index.c_str(), par.threads,
+                      par.compressed, Parameters::DBTYPE_GENERIC_DB);
+    cmWriter.open();
+
+    Debug(Debug::INFO) << "Query database size: " << qDbr.getSize() << " type: " << qDbr.getDbTypeName() << "\n";
+    Debug(Debug::INFO) << "Target database size: " << tDbr->getSize() << " type: " << tDbr->getDbTypeName() << "\n";
+    {
+        std::ostringstream msaEvalStream;
+        msaEvalStream << std::scientific << par.cmliteMsaEvalThr;
+        Debug(Debug::INFO) << "cmbuild seed E-value threshold: " << msaEvalStream.str() << "\n";
+    }
+
+    Debug::Progress progress(resultReader.getSize());
+
+    // Stockholm rows are filtered: drop any target with non-gap coverage
+    // below this threshold. Infernal's cm_parsetree_Doctor() can fail when
+    // many short fragments dominate the column statistics.
+    const float minColCoverage = 0.30f;
+    // Stricter filter for the alifold input: noisy rows degrade the
+    // covariation signal, so feed only well-covered rows to alifold
+    // (default 0.70, override with RIBOSEEK_ALIFOLD_MINCOV).
+    float alifoldMinCov = 0.70f;
+    if (const char *envCov = std::getenv("RIBOSEEK_ALIFOLD_MINCOV")) {
+        float v = std::atof(envCov);
+        if (v > 0.0f && v <= 1.0f) alifoldMinCov = v;
+    }
+
+    // Optional rMSA/hhfilter-style row filter on the cmbuild input MSA. Knobs
+    // map 1:1 to MMseqs MsaFilter: --cov-msa, --filter-max-seqid, --diff (Ndiff),
+    // --qid, --qsc, --filter-min-enable. Default is off.
+    const bool doMsaFilter = (par.filterMsa != 0);
+    SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, 0.0f);
+    const unsigned int targetExt = DBReader<unsigned int>::getExtendedDbtype(tDbr->getDbtype());
+    const bool targetGpuDb = (targetExt & Parameters::DBTYPE_EXTENDED_GPU) != 0;
+    const bool decodeTargetDinuc = ((targetExt & Parameters::DBTYPE_EXTENDED_DINUCLEOTIDE) != 0) || targetGpuDb;
+    const int targetSeqType = effectiveDecodeSeqType(tDbr->getDbtype(), decodeTargetDinuc);
+    std::vector<std::string> qid_str_vec = Util::split(par.qid, ",");
+    std::vector<int> qid_vec;
+    qid_vec.reserve(qid_str_vec.size());
+    for (size_t i = 0; i < qid_str_vec.size(); ++i) {
+        float qidf = static_cast<float>(std::atof(qid_str_vec[i].c_str()));
+        qid_vec.push_back(static_cast<int>(qidf * 100));
+    }
+    if (qid_vec.empty()) qid_vec.push_back(0);
+    std::sort(qid_vec.begin(), qid_vec.end());
+
+#pragma omp parallel
+    {
+        unsigned int thread_idx = 0;
+#ifdef OPENMP
+        thread_idx = (unsigned int) omp_get_thread_num();
+#endif
+        MsaFilter msaFilter(8192, 1024, &subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid());
+        Sequence targetMapper(tDbr->getMaxSeqLen(), targetSeqType, &subMat, 0, false, false);
+        CmBuildCtx ctx;
+        ctx.qDbr = &qDbr; ctx.tDbr = tDbr; ctx.resultReader = &resultReader;
+        ctx.subMat = &subMat; ctx.msaFilter = &msaFilter; ctx.targetMapper = &targetMapper;
+        ctx.qid_vec = qid_vec; ctx.alifoldMinCov = alifoldMinCov; ctx.minColCoverage = minColCoverage;
+        ctx.doMsaFilter = doMsaFilter; ctx.decodeTargetDinuc = decodeTargetDinuc; ctx.targetSeqType = targetSeqType;
+        ctx.targetGpuDb = targetGpuDb;
+
+#pragma omp for schedule(dynamic, 1)
+        for (size_t id = 0; id < resultReader.getSize(); id++) {
+            progress.updateProgress();
+            std::string cmText, buildErr;
+            if (buildQueryCmText(par, ctx, id, thread_idx, cmText, buildErr)) {
+                cmWriter.writeData(cmText.c_str(), cmText.size(), resultReader.getDbKey(id), thread_idx);
+            } else if (!buildErr.empty()) {
+                Debug(Debug::WARNING) << "cmbuild: " << buildErr << "\n";
             }
         }
     }
@@ -842,7 +830,5 @@ int cmbuild(int argc, const char **argv, const Command &command) {
     }
     qDbr.close();
 
-    InfernalBridge::stopWorkerPool(workerPool);
     return EXIT_SUCCESS;
-#endif // HAVE_INFERNAL_BRIDGE
 }

@@ -1,0 +1,27 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (make, C++11, scalar path on x86)
+        run: make
+
+      - name: Self-consistency (verify)
+        run: ./verify
+
+      - name: Smoke test (ArchiveII golden MFE + structure)
+        run: python3 tests/smoke_test.py
+
+      - name: CMake build (header library + tools)
+        run: |
+          cmake -S . -B build
+          cmake --build build --parallel
+          ./build/verify
+          TORNADOFOLD=./build/tornadofold python3 tests/smoke_test.py

@@ -21,21 +21,18 @@ target_include_directories(riboseek-framework BEFORE PUBLIC ${CMAKE_BINARY_DIR}/
 add_dependencies(riboseek-framework generated_riboseek)
 target_include_directories(riboseek-framework PUBLIC ${CMAKE_SOURCE_DIR}/lib)
 
-# Infernal bridge
-if (TARGET infernal-bridge)
-    target_link_libraries(riboseek-framework infernal-bridge)
-    target_compile_definitions(riboseek-framework PUBLIC -DHAVE_INFERNAL_BRIDGE=1)
-endif()
+target_link_libraries(riboseek-framework
+    infernal-vendor-core
+    infernal-vendor-hmmer
+    infernal-vendor-easel)
+target_include_directories(riboseek-framework PRIVATE
+    ${INFERNAL_CONFIG_DIR}
+    ${INFERNAL_ROOT}/src
+    ${INFERNAL_ROOT}/hmmer/src
+    ${INFERNAL_ROOT}/easel
+)
+target_link_libraries(riboseek-framework tornadofold::tornadofold)
 
-# ViennaRNA
-if (TARGET viennarna)
-    get_target_property(VRNA_INCLUDES viennarna INTERFACE_INCLUDE_DIRECTORIES)
-    if (VRNA_INCLUDES)
-        target_include_directories(riboseek-framework PUBLIC ${VRNA_INCLUDES})
-    endif()
-    target_link_libraries(riboseek-framework viennarna)
-    target_compile_definitions(riboseek-framework PUBLIC -DHAVE_RNAFOLD_PREDICT=1)
-endif()
 
 if (NOT RIBOSEEK_FRAMEWORK_ONLY)
     add_executable(riboseek riboseek.cpp)

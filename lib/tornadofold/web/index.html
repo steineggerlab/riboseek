@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ToRNAdoFold: RNA MFE folding</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fornac@1.1.8/app/styles/fornac.css">
+<style>
+  :root { --fg:#1a1a1a; --muted:#6b7280; --line:#e5e7eb; --accent:#2b6cb0; }
+  * { box-sizing: border-box; }
+  body {
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--fg); background: #fff; margin: 0;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 3rem 1.25rem 4rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  h2 { font-size: 1rem; margin: 2.5rem 0 1rem; }
+  .sub { color: var(--muted); margin: 0 0 2rem; }
+  label { display: block; font-weight: 600; margin-bottom: .5rem; }
+  textarea {
+    width: 100%; min-height: 5.5rem; padding: .75rem; resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .9rem; color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: .9rem; align-items: center; margin-top: .85rem; flex-wrap: wrap; }
+  button {
+    font: inherit; font-weight: 600; color: #fff; background: var(--accent);
+    border: 0; border-radius: 8px; padding: .55rem 1.2rem; cursor: pointer;
+  }
+  button:disabled { background: #a8c0da; cursor: default; }
+  button.ghost { background: #fff; color: var(--accent); border: 1px solid var(--line); }
+  .status { color: var(--muted); font-size: .85rem; }
+  .result { margin-top: 2rem; display: none; }
+  .mfe { font-size: 1.05rem; margin-bottom: .75rem; }
+  .mfe b { color: var(--accent); }
+  #rna-view {
+    width: 100%; height: 420px; border: 1px solid var(--line); border-radius: 8px;
+    background: #fafafa; overflow: hidden;
+  }
+  #rna-view svg { display: block; }
+  details { margin-top: 1rem; }
+  summary { cursor: pointer; color: var(--muted); font-size: .85rem; }
+  pre {
+    margin: .5rem 0 0; padding: 1rem; background: #fafafa; border: 1px solid var(--line);
+    border-radius: 8px; overflow-x: auto; white-space: pre;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .85rem; line-height: 1.5;
+  }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 2.5rem 0 0; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: .9rem; }
+  th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #f5f8fc; }
+  footer {
+    margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: .8rem;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ToRNAdoFold</h1>
+  <p class="sub">Minimum-free-energy RNA secondary structure folded via WebAssembly (SIMD) and drawn with <a href="https://github.com/ViennaRNA/forna">fornac</a>.</p>
+
+  <label for="seq">RNA sequence</label>
+  <textarea id="seq" spellcheck="false" autocapitalize="off" placeholder="Paste a sequence (ACGU / T)…">GGGCUAUUAGCUCAGUUGGUUAGAGCGCACCCCUGAUAAGGGUGAGGUCGCUGAUUCGAAUUCAGCAUAGCCCA</textarea>
+  <div class="row">
+    <button id="fold" disabled>Fold</button>
+    <span class="status" id="status">Loading…</span>
+  </div>
+
+  <div class="result" id="result">
+    <div class="mfe"><span id="rna-name"></span>MFE <b><span id="mfe"></span></b> kcal/mol</div>
+    <div id="rna-view"></div>
+    <details>
+      <summary>Dot-bracket</summary>
+      <pre id="out"></pre>
+    </details>
+  </div>
+
+  <hr>
+  <h2>Batch — fold a file</h2>
+  <p class="sub" style="margin-bottom:1rem">FASTA, or one sequence per line. Folded in parallel with <span id="ncpu">?</span> web workers.</p>
+  <div class="row">
+    <input type="file" id="file" accept=".fa,.fasta,.fna,.txt,.seq">
+    <button id="dl" class="ghost" disabled>Download results</button>
+    <span class="status" id="batch-status"></span>
+  </div>
+  <div id="batch-results"></div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/jquery@2.2.4/dist/jquery.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@3.5.17/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/fornac@1.1.8/dist/scripts/fornac.js"></script>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const clean = (s) => s.replace(/\s+/g, "").toUpperCase().replace(/T/g, "U");
+  let mod = null;
+
+  // Use SIMD only if the browser supports it 
+  function simdSupported() {
+    try {
+      return WebAssembly.validate(new Uint8Array([
+        0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3,
+        2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]));
+    } catch (e) { return false; }
+  }
+  const SIMD = simdSupported();
+  const WASM_JS = SIMD ? "tornadofold-simd.js" : "tornadofold.js";
+
+  function loadScript(src) {
+    return new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = src; s.onload = res; s.onerror = () => rej(new Error("load " + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  loadScript(WASM_JS).then(() => tornadofold()).then((m) => {
+    mod = m;
+    $("fold").disabled = false;
+    $("status").textContent = "Ready" + (SIMD ? " (SIMD)." : ".");
+  }).catch((e) => { $("status").textContent = "Failed to load the WASM module."; console.error(e); });
+
+  function draw(seq, db) {
+    const host = $("rna-view");
+    host.innerHTML = "";
+    const c = new fornac.FornaContainer("#rna-view", {
+      applyForce: true, allowPanningAndZooming: true,
+      initialSize: [host.clientWidth, host.clientHeight],
+    });
+    c.addRNA(db, { sequence: seq });
+  }
+  function show(name, seq, db, mfe) {
+    $("rna-name").textContent = name ? name + " — " : "";
+    $("mfe").textContent = (mfe / 100).toFixed(2);
+    $("out").textContent = seq + "\n" + db;
+    $("result").style.display = "block";
+    draw(seq, db);
+  }
+
+  function foldOne() {
+    if (!mod) return;
+    const seq = clean($("seq").value);
+    if (!seq) { $("status").textContent = "Enter a sequence."; return; }
+    const res = mod.foldSeq(seq);
+    const tab = res.lastIndexOf("\t");
+    show("", seq, res.slice(0, tab), parseInt(res.slice(tab + 1), 10));
+    $("status").textContent = seq.length + " nt";
+  }
+  $("fold").addEventListener("click", foldOne);
+
+  const NCPU = Math.max(1, navigator.hardwareConcurrency || 4);
+  $("ncpu").textContent = NCPU;
+  let batch = [];
+
+  function parseSeqs(text) {
+    const recs = [];
+    let name = null, seq = "";
+    const flush = () => { if (seq) recs.push({ name: name || ("seq" + (recs.length + 1)), seq: clean(seq) }); seq = ""; };
+    for (const line of text.split(/\r?\n/)) {
+      if (line[0] === ">") { flush(); name = line.slice(1).trim(); }
+      else seq += line;
+    }
+    flush();
+    if (!recs.length) {  // no FASTA headers: one sequence per line
+      text.split(/\r?\n/).forEach((l) => { const s = clean(l); if (s) recs.push({ name: "seq" + (recs.length + 1), seq: s }); });
+    }
+    return recs.filter((r) => r.seq.length);
+  }
+
+  async function foldBatch(recs) {
+    if (window.Worker) {
+      try { return await foldBatchWorkers(recs); }
+      catch (e) { console.warn("workers unavailable, folding on main thread", e); }
+    }
+    return foldBatchMain(recs);
+  }
+
+  function foldBatchWorkers(recs) {
+    const n = Math.min(recs.length, NCPU);
+    const results = new Array(recs.length);
+    let next = 0, done = 0, failed = false;
+    return new Promise((resolve, reject) => {
+      let workers;
+      try { workers = Array.from({ length: n }, () => new Worker("tornadofold-worker.js?m=" + WASM_JS)); }
+      catch (e) { reject(e); return; }
+      const pump = (w) => {
+        if (next >= recs.length) { w.terminate(); return; }
+        const id = next++;
+        w.onmessage = (e) => {
+          results[e.data.id] = { ...recs[e.data.id], db: e.data.db, mfe: e.data.mfe };
+          done++;
+          $("batch-status").textContent = "Folded " + done + " / " + recs.length;
+          pump(w);
+          if (done === recs.length) resolve(results);
+        };
+        w.postMessage({ id, seq: recs[id].seq });
+      };
+      workers.forEach((w) => {
+        w.onerror = () => { if (!failed) { failed = true; workers.forEach((x) => x.terminate()); reject(new Error("worker error")); } };
+        pump(w);
+      });
+    });
+  }
+
+  async function foldBatchMain(recs) {
+    const results = [];
+    for (let i = 0; i < recs.length; i++) {
+      const res = mod.foldSeq(recs[i].seq);
+      const t = res.lastIndexOf("\t");
+      results.push({ ...recs[i], db: res.slice(0, t), mfe: parseInt(res.slice(t + 1), 10) });
+      $("batch-status").textContent = "Folded " + (i + 1) + " / " + recs.length + " (main thread)";
+      if ((i & 7) === 7) await new Promise((r) => setTimeout(r));  // keep the UI responsive
+    }
+    return results;
+  }
+
+  function renderTable(rows) {
+    const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    let html = "<table><thead><tr><th>Name</th><th class='num'>nt</th><th class='num'>MFE</th></tr></thead><tbody>";
+    rows.forEach((r, i) => {
+      html += "<tr data-i='" + i + "'><td>" + esc(r.name) + "</td><td class='num'>" + r.seq.length +
+              "</td><td class='num'>" + (r.mfe / 100).toFixed(2) + "</td></tr>";
+    });
+    html += "</tbody></table>";
+    const host = $("batch-results");
+    host.innerHTML = html;
+    host.querySelectorAll("tr[data-i]").forEach((tr) => {
+      tr.addEventListener("click", () => {
+        const r = rows[+tr.dataset.i];
+        show(r.name, r.seq, r.db, r.mfe);
+        $("result").scrollIntoView({ behavior: "smooth" });
+      });
+    });
+  }
+
+  $("file").addEventListener("change", async (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    const recs = parseSeqs(await file.text());
+    if (!recs.length) { $("batch-status").textContent = "No sequences found."; return; }
+    $("dl").disabled = true;
+    $("batch-status").textContent = "Folding " + recs.length + " sequences…";
+    const t0 = performance.now();
+    batch = await foldBatch(recs);
+    $("batch-status").textContent = recs.length + " sequences in " + ((performance.now() - t0) / 1000).toFixed(2) + " s";
+    renderTable(batch);
+    $("dl").disabled = false;
+  });
+
+  $("dl").addEventListener("click", () => {
+    const text = batch.map((r) => ">" + r.name + "\n" + r.seq + "\n" + r.db + " (" + (r.mfe / 100).toFixed(2) + ")").join("\n") + "\n";
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = "tornadofold_results.txt"; a.click();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+</body>
+</html>

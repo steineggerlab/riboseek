@@ -63,6 +63,7 @@ set +e
 run_test SEARCH "run_search.sh"
 run_test SEARCH_INDEX "run_search_index.sh"
 run_test SEARCH_GAPLESS_INDEX "run_search_gapless_index.sh"
+run_test CMSEARCH "run_cmsearch.sh"
 if [ -n "${RIBOSEEK_GPU_TESTS}" ]; then
   run_test SEARCH_GPU_INDEX "run_search_gpu_index.sh"
 fi

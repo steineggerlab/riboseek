@@ -3240,7 +3240,23 @@ extern void         debug_print_ij_bands(CM_t *cm);
 
 /* from logsum.c */
 extern void  init_ilogsum(void);
-extern int   ILogsum(int s1, int s2);
+/* Moved to header to allow inlining */
+/* u16: log-add corrections are 0..1000 */
+extern uint16_t ilogsum_lookup[LOGSUM_TBL];
+static inline int ILogsum(int s1, int s2)
+{
+  /* Old version:
+   * This is called billions of times in inside scoring.
+   * Not fully the same, impossible cells, can shift slighly up in score, but harmless
+  const int max = ESL_MAX(-INFTY, ESL_MAX(s1, s2));
+  const int min = ESL_MIN(s1, s2);
+  return  (min <= -INFTY || (max-min) >= LOGSUM_TBL) ? max : max + ilogsum_lookup[max-min];
+  */
+  const int d     = s1 - s2;
+  const int max   = (d >= 0) ? s1 : s2;
+  const int adiff = (d >= 0) ? d : -d;
+  return  ((unsigned)adiff >= (unsigned)LOGSUM_TBL) ? max : max + ilogsum_lookup[adiff];
+}
 extern int   ILogsumNI(int s1, int s2);
 extern int   ILogsumNI_diff(int s1a, int s1b, int s2a, int s2b, int db);
 extern void  FLogsumInit(void);

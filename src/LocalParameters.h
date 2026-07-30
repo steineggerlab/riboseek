@@ -24,19 +24,30 @@ public:
 
     float cmRegionFlanking;
     int cmMode;
+    int cmAlign;
+    int cmAlignBanded;
+    int cmLocal;
     size_t dbSize;
-    bool calibrateCm;
     double cmliteMsaEvalThr;
+    double cmbuildEre;
+    double cmbuildSymfrac;
+    int cmbuildNoss;
 
     PARAMETER(PARAM_CM_REGION)
     PARAMETER(PARAM_CM_MODE)
+    PARAMETER(PARAM_CM_ALIGN)
+    PARAMETER(PARAM_CM_ALIGN_BANDED)
+    PARAMETER(PARAM_CM_LOCAL)
     PARAMETER(PARAM_DB_SIZE)
-    PARAMETER(PARAM_CALIBRATE_CM)
     PARAMETER(PARAM_CMLITE_MSA_EVAL)
+    PARAMETER(PARAM_CMBUILD_ERE)
+    PARAMETER(PARAM_CMBUILD_SYMFRAC)
+    PARAMETER(PARAM_CMBUILD_NOSS)
 
     std::vector<MMseqsParameter*> splitstrand;
     std::vector<MMseqsParameter*> rnaalign;
     std::vector<MMseqsParameter*> cmbuild;
+    std::vector<MMseqsParameter*> cmscan;
 };
 
 #endif

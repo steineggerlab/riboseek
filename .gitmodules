@@ -1,6 +1,3 @@
-[submodule "lib/ViennaRNA"]
-	path = lib/viennarna/ViennaRNA
-	url = https://github.com/ViennaRNA/ViennaRNA.git
 [submodule "util/regression"]
     path = lib/mmseqs/util/regression
     url = https://github.com/soedinglab/MMseqs2-Regression.git

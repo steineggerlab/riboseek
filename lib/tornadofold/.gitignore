@@ -1,0 +1,24 @@
+# compiled binaries
+/tornadofold
+/tornadofold_noneon
+/tornadofold_omp
+/tornadofold_v2
+/verify
+/kbench
+*.o
+*.dSYM/
+
+# stray tool outputs
+*.ps
+
+# benchmark data (fetched) and generated inputs / logs
+bench/archiveII/
+bench/archiveII.tar.gz
+bench/*.fa
+bench/*.log
+
+# WebAssembly build artifacts (built in CI, deployed to Pages)
+/web/tornadofold.js
+/web/tornadofold.wasm
+/web/tornadofold-simd.js
+/web/tornadofold-simd.wasm

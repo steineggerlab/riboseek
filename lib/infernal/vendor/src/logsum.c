@@ -69,7 +69,7 @@
 
 #include "infernal.h"
 
-static int   ilogsum_lookup[LOGSUM_TBL];
+uint16_t ilogsum_lookup[LOGSUM_TBL];
 void 
 init_ilogsum(void)
 {
@@ -82,14 +82,6 @@ init_ilogsum(void)
     ilogsum_lookup[i] = rint(INTSCALE * (sreLOG2(1.+sreEXP2((double) -i/INTSCALE))));
 }
 
-
-int 
-ILogsum(int s1, int s2)
-{
-  const int max = ESL_MAX(-INFTY, ESL_MAX(s1, s2));
-  const int min = ESL_MIN(s1, s2);
-  return  (min <= -INFTY || (max-min) >= LOGSUM_TBL) ? max : max + ilogsum_lookup[max-min];
-} 
 
 /* guaranteed s1 >= -INFTY, s2 >= -INFTY */
 int 
