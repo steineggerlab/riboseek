@@ -178,10 +178,6 @@ Many of Riboseek's modules (subprograms) come from MMseqs2. For those, refer to 
 
 Riboseek bundles the following under `lib/`:
 
-- [MMseqs2](https://github.com/soedinglab/MMseqs2) — search framework and GPU prefilter (GPLv3)
+- [MMseqs2](https://github.com/soedinglab/MMseqs2) — search framework and GPU prefilter (MIT)
 - [Infernal](https://github.com/EddyRivasLab/infernal) — covariance model construction (BSD-3-Clause)
-
-## License
-
-Riboseek is released under the MIT, matching MMseqs2. See [LICENCE.md](LICENCE.md).
 
