@@ -53,7 +53,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmRegionFlanking = 1.0f;  // 1.0 => pad by full W (prior hardcoded behavior)
     cmMode = 1;
     cmAlign = 0;
-    cmAlignBanded = 0;
+    cmAlignBanded = 1;
     cmLocal = 0;        // config: glocal (current shipped default)
     dbSize = 0;
     cmliteMsaEvalThr = DBL_MAX;
