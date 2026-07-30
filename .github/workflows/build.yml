@@ -167,9 +167,9 @@ jobs:
           make install
           cd "${TMP_DIR}"
 
-          curl -fsSL -o bzip2.tar.gz https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz
+          curl -fsSL -o bzip2.tar.gz https://github.com/libarchive/bzip2/archive/refs/tags/bzip2-1.0.8.tar.gz
           tar -xzf bzip2.tar.gz
-          cd bzip2-1.0.8
+          cd "$(find . -maxdepth 1 -type d -name 'bzip2-*' | head -n 1)"
           make -j $(nproc --all) \
             CC=${{ matrix.CPREF }}-linux-gnu-gcc-12 \
             AR=${{ matrix.CPREF }}-linux-gnu-ar \
