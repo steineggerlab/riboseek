@@ -143,7 +143,7 @@ jobs:
           HEREDOC
           sudo apt-get update
           sudo apt-get -y install -o APT::Immediate-Configure=false \
-            cmake crossbuild-essential-${{ matrix.ARCH }} zlib1g-dev:${{ matrix.ARCH }} libbz2-dev:${{ matrix.ARCH }} \
+            cmake crossbuild-essential-${{ matrix.ARCH }} \
             gcc-12-${{ matrix.CPREF }}-linux-gnu g++-12-${{ matrix.CPREF }}-linux-gnu
           rustup target add ${{ matrix.CPREF }}-unknown-linux-gnu
 
