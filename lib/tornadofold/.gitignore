@@ -22,3 +22,11 @@ bench/*.log
 /web/tornadofold.wasm
 /web/tornadofold-simd.js
 /web/tornadofold-simd.wasm
+
+# npm package artifacts
+/npm/tornadofold.js
+/npm/tornadofold-simd.js
+/npm/LICENSE
+/npm/README.md
+/npm/*.tgz
+/npm/node_modules/

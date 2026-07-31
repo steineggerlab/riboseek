@@ -1,0 +1,82 @@
+name: npm
+
+on:
+  push:
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish"
+        required: false
+      tag:
+        description: "npm dist-tag"
+        required: false
+        default: latest
+      dry_run:
+        description: "Dry run build, test and pack"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build WebAssembly package
+        run: make npm
+
+      - name: Test
+        run: npm test
+        working-directory: npm
+
+      - name: Set version
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+        working-directory: npm
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ] && [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -n "$VERSION" ]; then
+            npm version "$VERSION" --no-git-tag-version --allow-same-version
+          fi
+
+      - name: Pack
+        working-directory: npm
+        run: |
+          npm pack
+          echo "packed $(ls *.tgz)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tornadofold-wasm
+          path: npm/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tornadofold-wasm
+
+      - name: Publish
+        run: npm publish *.tgz --access public --tag "${{ inputs.tag || 'latest' }}"

@@ -1,0 +1,32 @@
+{
+  "name": "tornadofold-wasm",
+  "version": "0.0.3",
+  "description": "Fast RNA minimum free energy secondary structure prediction",
+  "keywords": [
+    "rna",
+    "secondary-structure",
+    "mfe",
+    "folding",
+    "bioinformatics",
+    "wasm",
+    "webassembly"
+  ],
+  "homepage": "https://github.com/mirditalab/ToRNAdoFold",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mirditalab/ToRNAdoFold.git",
+    "directory": "npm"
+  },
+  "bugs": "https://github.com/mirditalab/ToRNAdoFold/issues",
+  "license": "MIT",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "tornadofold.js",
+    "tornadofold-simd.js"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "test": "node test.js"
+  }
+}
