@@ -65,7 +65,7 @@ Riboseek runs on CPU and optionally offloads the prefilter to one or more GPUs. 
 The `easy-search` module searches one or more RNA sequences in FASTA/FASTQ format (flat or gzipped) against a target database, a folder, or individual FASTA files. It creates the databases internally and writes a tab-separated alignment file.
 
 ```
-riboseek easy-search example/query.fasta example/target.fasta aln.m8 tmp
+riboseek easy-search example/QUERY.fasta example/DB.fasta aln.m8 tmp
 ```
 
 #### Output format
@@ -85,16 +85,11 @@ See the [MMseqs2 documentation](https://github.com/soedinglab/MMseqs2/wiki#custo
 
 #### Important search parameters
 
-<!-- TODO: verify defaults against `riboseek easy-search -h` -->
-
 | Option           | Category    | Description                                                                                       |
 | ---------------- | ----------- | ------------------------------------------------------------------------------------------------- |
 | -s               | Sensitivity | Sensitivity/speed trade-off; lower is faster, higher is more sensitive (default: TBD)              |
 | --max-seqs       | Sensitivity | Number of prefilter hits passed to alignment; increasing it can yield more hits (default: 1000)    |
 | -e               | Sensitivity | Report matches below this E-value (default: 0.001)                                                 |
-| --search-type    | Search      | Nucleotide search mode                                                                            |
-| -c               | Alignment   | Report matches above this fraction of aligned residues (see `--cov-mode`) (default: 0.0)           |
-| --cov-mode       | Alignment   | 0: coverage of query and target, 1: coverage of target, 2: coverage of query                       |
 | --gpu            | Performance | Enable the GPU-accelerated ungapped prefilter (default: off). Use `--gpu 1`.                        |
 | --threads        | Performance | Number of CPU threads (default: all available)                                                     |
 
@@ -105,8 +100,11 @@ See the [MMseqs2 documentation](https://github.com/soedinglab/MMseqs2/wiki#custo
 Pre-processing the target database with `createdb` avoids repeating the conversion when searching multiple times against the same target set.
 
 ```
-riboseek createdb target.fasta targetDB
+riboseek createdb example/DB.fasta targetDB
 riboseek createindex targetDB tmp   # OPTIONAL, stores the index on disk
+# Create a query database
+riboseek createdb example/QUERY.fasta queryDB
+# Now search the query database against the target database and write the results to aln.m8
 riboseek search queryDB targetDB aln tmp
 riboseek convertalis queryDB targetDB aln aln.m8
 ```
@@ -125,22 +123,22 @@ riboseek search queryDB targetDB_gpu aln tmp --gpu 1
 Add `--gpu 1` to any search to run the ungapped prefilter on the GPU:
 
 ```
-riboseek easy-search query.fasta targetDB_gpu aln.m8 tmp --gpu 1
+riboseek search queryDB targetDB_gpu aln tmp --gpu 1
 ```
 
 - Use `CUDA_VISIBLE_DEVICES` to select the device(s).
   * `CUDA_VISIBLE_DEVICES=0` uses GPU 0.
   * `CUDA_VISIBLE_DEVICES=0,1` uses GPUs 0 and 1.
 
-For databases larger than GPU memory, Riboseek loads the padded database in chunks. <!-- TODO: document the chunking flag and recommended NVMe layout for NT-scale runs -->
+For databases larger than GPU memory, Riboseek loads the padded database in chunks.
 
 ### Multiple sequence alignments
 
 Riboseek can write query-centered MSAs in a3m format:
 
 ```
-riboseek createdb query.fasta queryDB
-riboseek createdb target.fasta targetDB
+riboseek createdb example/QUERY.fasta queryDB
+riboseek createdb example/DB.fasta targetDB
 riboseek search queryDB targetDB aln tmp -a
 riboseek result2msa queryDB targetDB aln msa --msa-format-mode 6
 riboseek unpackdb msa msa_out --unpack-suffix a3m --unpack-name-mode 0
@@ -152,9 +150,27 @@ To convert a3m to FASTA, use [reformat.pl](https://raw.githubusercontent.com/soe
 
 Riboseek embeds an Infernal-backed bridge to build covariance models from the alignments it produces, so an MSA can be turned into a CM without a separate Infernal installation.
 
-<!-- TODO: fill in the actual module name and invocation, e.g.
-riboseek msa2cm msa model.cm
--->
+You can generate CM and realign the hits with CM by:
+```
+riboseek cmbuild queryDB targetDB aln cm
+riboseek cmsearch cm targetDB aln aln_cm
+```
+
+You can also use multiple targetDBs and alnDBs to build a CM from multiple alignments:
+```
+riboseek cmbuild queryDB targetDB1,targetDB2 aln1,aln2 cm
+riboseek cmsearch cm cm_target_merged cm_result_merged aln_cm
+```
+
+You can use `aln_cm` instead of `aln` as input to `result2msa` to generate a CM-based MSA or `convertalis` to generate a CM-based tabular alignment file.
+
+#### Important parameters
+
+| Option           | Category    | Description                                                                                       |
+| ---------------- | ----------- | ------------------------------------------------------------------------------------------------- |
+| --cmlite-msa-eval| Sensitivity | Include only hits with <= this E-value when building the **cmbuild** seed CM                          |
+| --cm-region      | Sensitivity | **CM alignment** window: flanking pad on each side of the prefilter region, as a fraction of the model max hit length W|
+| --threads        | Performance | Number of CPU threads (default: all available)                                                     |
 
 ## Main modules
 
@@ -167,6 +183,8 @@ riboseek msa2cm msa model.cm
 - `makepaddedseqdb` convert a database into the padded layout used for GPU search
 - `result2msa` build multiple sequence alignments from search results
 - `convertalis` convert alignment results to a tab-separated file
+- `cmbuild` build a covariance model from an alignment
+- `cmsearch` realign hits with a covariance model
 
 
 ## Documentation
