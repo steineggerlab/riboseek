@@ -320,26 +320,27 @@ bool cmbuildFromAlignment(const std::string &name,
         return false;
     }
 
-    // serialize to an in-memory buffer
     bool ok = true;
-    {
-        char *buf = NULL;
-        size_t sz = 0;
-        FILE *fp = open_memstream(&buf, &sz);
-        if (fp == NULL) {
-            err = "open_memstream failed";
+    const size_t cap = (size_t) cm->M * 512 + 65536;
+    std::string text(cap, '\0');
+    if (FILE *fp = fmemopen(&text[0], cap, "w")) {
+        if (cm_file_WriteASCII(fp, -1, cm) != eslOK) {
+            err = "cm_file_WriteASCII failed";
             ok = false;
-        } else {
-            if (cm_file_WriteASCII(fp, -1, cm) != eslOK) {
-                err = "cm_file_WriteASCII failed";
-                ok = false;
-            }
-            fclose(fp);
-            if (ok) {
-                cmText.assign(buf, sz);
-            }
-            free(buf);
         }
+        const long need = ftell(fp);
+        const int closeRc = fclose(fp);
+        if (ok && (closeRc != 0 || need <= 0 || (size_t) need >= cap)) {
+            err = "cm serialization overflowed its buffer";
+            ok = false;
+        }
+        if (ok) {
+            text.resize((size_t) need);
+            cmText.swap(text);
+        }
+    } else {
+        err = "fmemopen failed";
+        ok = false;
     }
 
     // Cleanup

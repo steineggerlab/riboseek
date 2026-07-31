@@ -3328,19 +3328,26 @@ read_bin_string(FILE *fp, char **ret_s)
   return status;
 }
 
+#if defined(_MSC_VER)
+#  define RS_THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#  define RS_THREAD_LOCAL _Thread_local
+#else // defined(__GNUC__) || defined(__clang__)
+#  define RS_THREAD_LOCAL __thread
+#endif
 /* Function: prob2ascii()
  * 
  * Purpose:  Format a probability for output to an ASCII save
- *           file. Returns a ptr to a static internal buffer.
+ *           file. Returns a ptr to a static thread-local buffer.
  *              
  */
 static char *
 prob2ascii(float p, float null)
 {
-  static char buffer[32];
+  static RS_THREAD_LOCAL char buffer[32];
 
-  if (p == 0.0) return "*";
-  snprintf(buffer, 32, "%.3f", sreLOG2(p/null)); /* 32 matches static buffer size */
+  if (p <= 0.0) return "*";
+  snprintf(buffer, sizeof(buffer), "%.3f", sreLOG2(p/null));
   return buffer;
 }
 

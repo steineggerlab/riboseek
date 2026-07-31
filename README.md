@@ -2,17 +2,13 @@
 
 Riboseek enables fast and sensitive search of large RNA sequence sets. It uses a dinucleotide-based alphabet for prefiltering, and supports GPU acceleration for searching nucleotide databases at the scale of the NT database. Beyond search, Riboseek generates multiple sequence alignments and covariance models for downstream RNA analysis.
 
-<!-- TODO: add .github/riboseek.png overview figure, as in Foldseek -->
-<!-- ![Riboseek](.github/riboseek.png) -->
+<p align="center"><img src="https://raw.githubusercontent.com/steineggerlab/riboseek/master/.github/logo.png" height="256" /></p>
+
 
 ## Publications
 
-[Authors. Riboseek: fast and sensitive RNA homology search. bioRxiv, doi:TBD (2026)](TBD)
-
-<!-- TODO: add badges once bioconda / releases / CI exist
-[![BioConda Install](https://img.shields.io/conda/dn/bioconda/riboseek.svg?style=flag&label=BioConda%20install)](https://anaconda.org/bioconda/riboseek)
-[![Github All Releases](https://img.shields.io/github/downloads/steineggerlab/riboseek/total.svg)](https://github.com/steineggerlab/riboseek/releases/latest)
--->
+[Sukhwan Park, Kieran Didi, Andrew Favor, Anton Bushuiev, Soohyun Kim, Milot Mirdita,  Martin
+Steinegger. Fast remote nucleotide sequence alignment with Riboseek. bioRxiv, (2026)](TBD)
 
 ## Table of Contents
 
@@ -54,9 +50,6 @@ conda install -c conda-forge -c bioconda riboseek
 
 > [!NOTE]
 > GPU-accelerated search requires an NVIDIA GPU of the Ampere generation or newer for full speed, and runs at reduced speed on Turing-generation GPUs. The precompiled and bioconda binaries do not support older generations (e.g. Volta or Pascal).
-
-## Hardware and memory requirements
-Riboseek runs on CPU and optionally offloads the prefilter to one or more GPUs. Memory scales with the number of database nucleotides; for GPU search the padded database must fit in GPU memory, or is streamed in chunks when it does not. Add the concrete figures for a reference database (e.g. Rfam, SILVA, NT) here.
 
 ## Quick start
 

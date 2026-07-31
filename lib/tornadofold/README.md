@@ -48,6 +48,22 @@ std::string structure = f.traceback(mfe);
 ## In the browser
 
 ```sh
+npm install tornadofold-wasm
+```
+
+```js
+import { fold } from "tornadofold-wasm";
+
+// structure is dot-bracket, one character per base; mfe is in kcal/mol
+const { structure, mfe } = await fold("GGGCUAUUAGCUCAGUUGGUUAGAGCGCACCC");
+```
+
+`T` is read as `U`, whitespace is removed and any other character is treated as unknown
+(`N`), therefore positions in `structure` line up with the input. 
+
+To run the demo page locally:
+
+```sh
 make wasm
 python3 -m http.server -d web
 # open http://localhost:8000

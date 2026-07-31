@@ -176,7 +176,7 @@ struct EM {
             return t2004::int21[pit2r][P.pit1][bidx(sq1)][P.bsi1][bidx(sp1)];
         }
         if (n1 == 2 && n2 == 2) {
-            return t2004::int22[P.pit1][pit2r][P.si1][sp1][sq1][P.sj1];
+            return t2004::int22[P.pit1][pit2r][bidx(P.si1)][bidx(sp1)][bidx(sq1)][bidx(P.sj1)];
         }
         // general: (i,j)-side mismatch is hoisted in P; only (p,q)-side varies.
         int L = n1 + n2;

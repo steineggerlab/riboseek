@@ -39,8 +39,22 @@ web/tornadofold.js: web/tornadofold_wasm.cpp $(HDRS)
 web/tornadofold-simd.js: web/tornadofold_wasm.cpp $(HDRS)
 	$(EMCC) $(EMFLAGS) -msimd128 -o $@ web/tornadofold_wasm.cpp
 
+
+NPMFLAGS ?= $(EMFLAGS) -sSINGLE_FILE=1
+
+npm: npm/tornadofold.js npm/tornadofold-simd.js npm/LICENSE npm/README.md
+npm/tornadofold.js: web/tornadofold_wasm.cpp $(HDRS)
+	$(EMCC) $(NPMFLAGS) -o $@ web/tornadofold_wasm.cpp
+npm/tornadofold-simd.js: web/tornadofold_wasm.cpp $(HDRS)
+	$(EMCC) $(NPMFLAGS) -msimd128 -o $@ web/tornadofold_wasm.cpp
+npm/LICENSE: LICENSE
+	cp LICENSE $@
+npm/README.md: README.md
+	cp README.md $@
+
 clean:
 	rm -f tornadofold tornadofold_omp tornadofold_noneon verify \
-	  web/tornadofold.js web/tornadofold.wasm web/tornadofold-simd.js web/tornadofold-simd.wasm
+	  web/tornadofold.js web/tornadofold.wasm web/tornadofold-simd.js web/tornadofold-simd.wasm \
+	  npm/tornadofold.js npm/tornadofold-simd.js npm/LICENSE npm/README.md npm/*.tgz
 
-.PHONY: all clean wasm
+.PHONY: all clean wasm npm
