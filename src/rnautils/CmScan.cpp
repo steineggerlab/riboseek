@@ -402,6 +402,7 @@ InfHit scanRegionInfernal(const InfModel &model, CM_t *tcm, const std::string &r
         h.start1 = static_cast<int>(targetCoord[firstM]);
         h.end1 = static_cast<int>(targetCoord[lastM]);
         // Query coords must match the cigar
+        const int qConsOffset = (ad->cfrom_emit > 0) ? (ad->cfrom_emit - 1) : 0;
         int qConsBefore = 0;
         for (int k = 0; k < firstM; ++k) {
             if (ops[k] == 'M' || ops[k] == 'D') {
@@ -414,8 +415,8 @@ InfHit scanRegionInfernal(const InfModel &model, CM_t *tcm, const std::string &r
                 ++qConsSpan;
             }
         }
-        h.qStart = qConsBefore;
-        h.qEnd = qConsBefore + qConsSpan - 1;
+        h.qStart = qConsOffset + qConsBefore;
+        h.qEnd = h.qStart + qConsSpan - 1;
         h.seqId = (idDenom > 0) ? static_cast<float>(idCount) / static_cast<float>(idDenom) : -1.0f;
         h.score = hitScore;
         h.valid = true;
