@@ -247,7 +247,7 @@ int convertalignments(int argc, const char **argv, const Command &command) {
     bool queryProfile = false;
     bool targetProfile = false;
     const Sequence::SeqAuxInfo *auxInfo = needSequenceDB ? Sequence::getAuxInfo(qDbr.sequenceReader->getDbtype()) : NULL;
-    bool isGpuDb = (DBReader<unsigned int>::getExtendedDbtype(tDbr->sequenceReader->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU);
+    const bool isGpuDb = (DBReader<unsigned int>::getExtendedDbtype(tDbr->sequenceReader->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU);
     const unsigned char *num2outputnum = (auxInfo != NULL) ? auxInfo->num2outputnum : NULL;
     if (needSequenceDB) {
         queryProfile = Parameters::isEqualDbtype(qDbr.sequenceReader->getDbtype(), Parameters::DBTYPE_HMM_PROFILE);
@@ -345,6 +345,9 @@ int convertalignments(int argc, const char **argv, const Command &command) {
 
         std::string targetProfData;
         targetProfData.reserve(1024);
+
+        std::string targetSeqBuffer;
+        targetSeqBuffer.reserve(1024);
 
         std::string newBacktrace;
         newBacktrace.reserve(1024);
@@ -487,9 +490,20 @@ int convertalignments(int argc, const char **argv, const Command &command) {
                                     Sequence::extractProfileConsensus(targetSeqData, targetEntryLen, *subMat, targetProfData);
                                 }
                                 #ifdef RIBOSEEK
-                                // If the DB is a GPU db, get uncompressed sequence data
-                                if (DBReader<unsigned int>::getExtendedDbtype(tDbr->sequenceReader->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU) {
-                                    targetSeqData = tDbr->sequenceReader->getDataUncompressed(tId);
+                                if (isGpuDb && targetProfile == false && num2outputnum != NULL) {
+                                    const unsigned char *padded =
+                                        (const unsigned char *) tDbr->sequenceReader->getDataUncompressed(tId);
+                                    size_t targetSeqLen = tDbr->sequenceReader->getSeqLen(tId);
+                                    targetSeqBuffer.clear();
+                                    targetSeqBuffer.reserve(targetSeqLen);
+                                    for (size_t pos = 0; pos < targetSeqLen; pos++) {
+                                        // masked residues are stored as code + 32, i.e. lower case
+                                        unsigned char code = padded[pos];
+                                        bool masked = (code >= 32);
+                                        char nucl = subMat->num2aa[num2outputnum[masked ? code - 32 : code]];
+                                        targetSeqBuffer.push_back(masked ? (char) (nucl | ' ') : nucl);
+                                    }
+                                    targetSeqData = (char *) targetSeqBuffer.c_str();
                                 }
                                 #endif
                             }
@@ -561,15 +575,6 @@ int convertalignments(int argc, const char **argv, const Command &command) {
                                     case Parameters::OUTFMT_TSEQ:
                                         if (targetProfile) {
                                             result.append(targetProfData.c_str(), res.dbLen);
-                                        } else if (num2outputnum != NULL) {
-                                            for (int pos = 0; pos < res.dbLen; pos++) {
-                                                // If it is GPU db, don't do aa2num
-                                                if (isGpuDb) {
-                                                    result.push_back(subMat->num2aa[num2outputnum[static_cast<int>(targetSeqData[pos])]]);
-                                                } else {
-                                                    result.push_back(subMat->num2aa[num2outputnum[subMat->aa2num[(unsigned char)targetSeqData[pos]]]]);
-                                                }
-                                            }
                                         } else {
                                             result.append(targetSeqData, res.dbLen);
                                         }
