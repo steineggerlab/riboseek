@@ -125,6 +125,44 @@ riboseek search queryDB targetDB_gpu aln tmp --gpu 1
 
 For databases larger than GPU memory, Riboseek loads the padded database in chunks.
 
+### Clustering
+
+`cluster` and `linclust` cluster an RNA database the way the MMseqs2 protein workflows do,
+but in dinucleotide space. The sequence database is first encoded into the 25 letter
+dinucleotide alphabet of `dinuc.out` (`riboseek dinucdb`), then the regular cascaded or
+linear-time clustering runs on top of it. Keys are preserved, so the resulting cluster
+database is used together with the original nucleotide database.
+
+```
+riboseek createdb example/DB.fasta seqDB
+# linear time, less sensitive
+riboseek linclust seqDB clusterDB tmp --min-seq-id 0.9
+# cascaded, slower and more sensitive
+riboseek cluster seqDB clusterDB tmp --min-seq-id 0.9
+riboseek createtsv seqDB seqDB clusterDB clusters.tsv
+```
+
+`easy-cluster` and `easy-linclust` work as well and take FASTA input directly.
+
+Sequence identity and coverage are measured on **dinucleotides**, not on single
+nucleotides: one nucleotide mismatch breaks the two dinucleotides it is part of, so
+`id_nucleotide` is roughly `(1 + id_dinucleotide) / 2` for scattered mismatches. A
+`--min-seq-id 0.8` clustering therefore corresponds to roughly 90% nucleotide identity.
+
+Only the forward strand is clustered. Unlike `mmseqs cluster` on a nucleotide database,
+which compares both strands via `extractframes`, sequences that are reverse complements of
+each other end up in different clusters.
+
+Defaults that differ from the protein workflows (all overridable):
+
+| Option                 | Value               | Reason                                                                    |
+| ---------------------- | ------------------- | ------------------------------------------------------------------------- |
+| `--alph-size`          | `aa:25`             | Dinucleotide letters are concrete base pairs, so they are not reduced      |
+| `-k` (linclust)        | 14                  | Maximum for the dinucleotide k-mer index, spans 15 nucleotides             |
+| `--kmer-per-seq[-scale]` | 60 / `aa:0.2`     | rRNA is long, so it is seeded as densely as the nucleotide path            |
+| `--gap-open/-extend`   | `aa:23` / `aa:1`    | Matches the gap costs `riboseek search` uses with `dinuc.out`              |
+| `-s` (cluster)         | at least 4          | The `-s` k-mer thresholds are calibrated on BLOSUM62 and are too strict here |
+
 ### Multiple sequence alignments
 
 Riboseek can write query-centered MSAs in a3m format:

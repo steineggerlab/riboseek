@@ -40,6 +40,37 @@ std::vector<Command> riboseekCommands = {
                                       {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                       {"resultDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb },
                                       {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
+    {"cluster", riboseekCluster, &localPar.clusterworkflow, COMMAND_MAIN,
+            "Cascaded RNA clustering in dinucleotide space",
+            "# Cascaded clustering of a riboseek createdb database\n"
+            "riboseek cluster sequenceDB clusterDB tmp\n\n"
+            "# Sequence identity and coverage are measured on dinucleotides:\n"
+            "# a single nucleotide mismatch breaks the two dinucleotides it is part of,\n"
+            "# so id_nucleotide is roughly (1 + id_dinucleotide) / 2\n"
+            "riboseek cluster sequenceDB clusterDB tmp --min-seq-id 0.8\n",
+            "Martin Steinegger <martin.steinegger@snu.ac.kr>",
+            "<i:sequenceDB> <o:clusterDB> <tmpDir>",
+            CITATION_MMSEQS2, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                      {"clusterDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::clusterDb },
+                                      {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
+    {"linclust", riboseekLinclust, &localPar.linclustworkflow, COMMAND_MAIN,
+            "Linear-time RNA clustering in dinucleotide space",
+            "# Linear-time clustering of a riboseek createdb database\n"
+            "riboseek linclust sequenceDB clusterDB tmp\n",
+            "Martin Steinegger <martin.steinegger@snu.ac.kr>",
+            "<i:sequenceDB> <o:clusterDB> <tmpDir>",
+            CITATION_MMSEQS2|CITATION_LINCLUST, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                      {"clusterDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::clusterDb },
+                                      {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
+    {"dinucdb", dinucdb, &localPar.dinucdb, COMMAND_SEQUENCE,
+            "Encode a nucleotide database in the dinucleotide alphabet",
+            "# Amino acid typed database over the 25 dinucleotide letters of dinuc.out.\n"
+            "# Keys are preserved, so results carry over to the nucleotide database.\n"
+            "riboseek dinucdb sequenceDB dinucDB\n",
+            "Martin Steinegger <martin.steinegger@snu.ac.kr>",
+            "<i:sequenceDB> <o:dinucSeqDB>",
+            CITATION_MMSEQS2, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::nuclDb },
+                                      {"dinucSeqDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::aaDb }}},
     {"cmsearch", cmsearch, &localPar.cmscan, COMMAND_ALIGNMENT,
             "CM search with in-tree CYK/Inside dynamic programming",
             "riboseek cmsearch queryCMDB targetDB resultDB alignmentDB\n",

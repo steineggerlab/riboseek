@@ -1162,7 +1162,13 @@ int kmermatcherInner(Parameters& par, DBReader<unsigned int>& seqDbr) {
     if (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES)) {
         subMat = new NucleotideMatrix(par.scoringMatrixFile.values.nucleotide().c_str(), 1.0, 0.0);
     }else {
+#ifdef RIBOSEEK
+        // the dinucleotide alphabet has 25 letters: >= 21 means "keep the alphabet of the
+        // matrix" instead of reducing it
+        if (par.alphabetSize.values.aminoacid() >= 21) {
+#else
         if (par.alphabetSize.values.aminoacid() == 21) {
+#endif
             subMat = new SubstitutionMatrix(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, 0.0);
         } else {
             SubstitutionMatrix sMat(par.scoringMatrixFile.values.aminoacid().c_str(), 8.0, -0.2f);

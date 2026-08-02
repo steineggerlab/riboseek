@@ -3,6 +3,7 @@ set(rnautils_source_files
     rnautils/CmBuild.cpp
     rnautils/GenerateCm.cpp
     rnautils/splitstrand.cpp
+    rnautils/DinucDb.cpp
     rnautils/RnaAlign.cpp
     rnautils/RnaMatcher.cpp
     rnautils/RnaSmithWaterman.cpp)

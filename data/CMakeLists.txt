@@ -10,6 +10,7 @@ set(GENERATED_WORKFLOWS
         blastsplitdi.sh
         blastsplitdigp.sh
         blastsplitdigp2.sh
+        rnaclust.sh
         )
 
 set(GENERATED_OUTPUT_HEADERS "")

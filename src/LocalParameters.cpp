@@ -101,6 +101,11 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuild.push_back(&PARAM_COMPRESSED);
     cmbuild.push_back(&PARAM_V);
 
+    dinucdb.push_back(&PARAM_SUB_MAT);
+    dinucdb.push_back(&PARAM_THREADS);
+    dinucdb.push_back(&PARAM_COMPRESSED);
+    dinucdb.push_back(&PARAM_V);
+
     // result2profile needs --strand so the RNA-corrected E-value gets the
     // both-strands doubling (matches MMseqs2 RNA fork behavior)
     result2profile.push_back(&PARAM_STRAND);

@@ -48,6 +48,7 @@ public:
     std::vector<MMseqsParameter*> rnaalign;
     std::vector<MMseqsParameter*> cmbuild;
     std::vector<MMseqsParameter*> cmscan;
+    std::vector<MMseqsParameter*> dinucdb;
 };
 
 #endif
