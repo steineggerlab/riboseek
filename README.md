@@ -8,7 +8,7 @@ Riboseek enables fast and sensitive search of large RNA sequence sets. It uses a
 ## Publications
 
 [Sukhwan Park, Kieran Didi, Andrew Favor, Anton Bushuiev, Soohyun Kim, Milot Mirdita,  Martin
-Steinegger. Fast remote nucleotide sequence alignment with Riboseek. bioRxiv, (2026)](TBD)
+Steinegger. Fast remote nucleotide sequence alignment with Riboseek. bioRxiv, (2026)](https://www.biorxiv.org/content/10.64898/2026.07.31.741718v1)
 
 ## Table of Contents
 
