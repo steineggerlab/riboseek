@@ -8,7 +8,17 @@ LocalParameters& localPar = LocalParameters::getLocalInstance();
 void updateValidation() {}
 void (*validatorUpdate)(void) = updateValidation;
 
-std::vector<KmerThreshold> externalThreshold = {};
+// Dinucleotide k-mer thresholds for the prefilter. dinuc.out has a nearly flat diagonal
+// (~19-24 per dinucleotide at the seeding bit factor) instead of the wide BLOSUM62 spread,
+// so MMseqs2's built-in thresholds land in the wrong range: below -s ~2 they exceed the
+// self-score of every dinucleotide k-mer and the index stays completely empty. base and
+// sensPerStep are anchored so that -s 1 still indexes every k-mer (measured saturation:
+// 95 / 116 / 135 for k = 5 / 6 / 7) while -s 7.5 keeps the threshold MMseqs2 would use.
+std::vector<KmerThreshold> externalThreshold = {
+    {Parameters::DBTYPE_AMINO_ACIDS, 5,  99.6f, 4.60f},
+    {Parameters::DBTYPE_AMINO_ACIDS, 6, 119.0f, 3.03f},
+    {Parameters::DBTYPE_AMINO_ACIDS, 7, 140.1f, 5.08f},
+};
 std::vector<DatabaseDownload> externalDownloads = {};
 
 std::vector<Command> riboseekCommands = {

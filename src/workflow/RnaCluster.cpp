@@ -16,22 +16,6 @@
 // k = 15 overflows.
 static const int DINUC_KMER_SIZE = 14;
 
-// Mirrors setAutomaticThreshold() of MMseqs2's cluster workflow, but with a floor: the
-// k-mer score thresholds behind -s are calibrated on BLOSUM62 statistics, and on the
-// dinucleotide matrix the protein setting for high identity (-s 1) makes the prefilter
-// miss even identical sequence pairs.
-static float dinucSensitivity(float seqIdThr) {
-    float sens;
-    if (seqIdThr <= 0.3f) {
-        sens = 6.0f;
-    } else if (seqIdThr > 0.8f) {
-        sens = 1.0f;
-    } else {
-        sens = 1.0f + 10.0f * (0.7f - seqIdThr);
-    }
-    return std::max(4.0f, sens);
-}
-
 static bool contains(const std::vector<MMseqsParameter*> &list, const MMseqsParameter *par) {
     for (size_t i = 0; i < list.size(); i++) {
         if (list[i]->uniqid == par->uniqid) {
@@ -76,16 +60,10 @@ static std::string dinucParameterString(LocalParameters &par, bool linear,
     }
     owned.push_back(&par.PARAM_KMER_PER_SEQ_SCALE);
 
-    if (linear == false) {
-        if (par.PARAM_S.wasSet == false) {
-            par.sensitivity = dinucSensitivity(par.seqIdThr);
-        }
-        owned.push_back(&par.PARAM_S);
-        if (par.clusterVersion == Parameters::CLUSTER_VERSION2) {
-            Debug(Debug::WARNING) << "--cluster-version 2 derives the prefilter sensitivity from --min-seq-id itself, "
-                                  << "which is calibrated for proteins and under-clusters in dinucleotide space.\n";
-        }
-    } else {
+    // -s needs no override: the dinucleotide k-mer thresholds registered in
+    // externalThreshold (RiboseekBase.cpp) make the MMseqs2 sensitivity automagic work on
+    // the dinuc.out score scale.
+    if (linear) {
         // k is only used by kmermatcher here; the cascaded workflow needs it unset so
         // that prefilter can pick its own (much smaller) k-mer size
         if (par.PARAM_K.wasSet == false) {
@@ -123,6 +101,16 @@ static int rnaClusterWorkflow(int argc, const char **argv, const Command &comman
     const bool convert = Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_NUCLEOTIDES);
     if (convert == false && Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_AMINO_ACIDS) == false) {
         Debug(Debug::ERROR) << "Input " << par.db1 << " is not a sequence database\n";
+        return EXIT_FAILURE;
+    }
+
+    // MMseqs2's MultiParam parser silently turns a partial "--alph-size aa:13" into
+    // aa:0,nucl:0, which makes the k-mer alphabet reduction corrupt the heap. Catch it
+    // here instead of letting kmermatcher die.
+    const int aaAlphabetSize = par.alphabetSize.values.aminoacid();
+    if (par.PARAM_ALPH_SIZE.wasSet && (aaAlphabetSize < 2 || aaAlphabetSize > 25)) {
+        Debug(Debug::ERROR) << "--alph-size aa:" << aaAlphabetSize << " is out of range for the 25 letter "
+                            << "dinucleotide alphabet.\nPass both values, e.g. --alph-size aa:13,nucl:5.\n";
         return EXIT_FAILURE;
     }
 
