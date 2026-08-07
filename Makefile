@@ -10,51 +10,51 @@ else
 OMPFLAGS ?= -fopenmp
 endif
 
-HDRS = src/tornadofold.h src/energy.h src/t2004.h
+HDRS = src/ribossfold.h src/energy.h src/t2004.h
 
-all: tornadofold verify
+all: ribossfold verify
 
-tornadofold: src/main.cpp $(HDRS)
+ribossfold: src/main.cpp $(HDRS)
 	$(CXX) $(CXXFLAGS) -o $@ src/main.cpp
 
 # OpenMP batch build (needs libomp: brew install libomp)
-tornadofold_omp: src/main.cpp $(HDRS)
+ribossfold_omp: src/main.cpp $(HDRS)
 	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ src/main.cpp
 
 # NEON disabled, isolates the scalar constant factor
-tornadofold_noneon: src/main.cpp $(HDRS)
+ribossfold_noneon: src/main.cpp $(HDRS)
 	$(CXX) $(CXXFLAGS) -DDISABLE_NEON -o $@ src/main.cpp
 
 verify: src/verify.cpp $(HDRS)
 	$(CXX) $(CXXFLAGS) -o $@ src/verify.cpp
 
-EMCC ?= emcc
+EMCC ?= em++
 EMFLAGS ?= -O3 -std=c++17 -Isrc -lembind \
-	-sMODULARIZE=1 -sEXPORT_NAME=tornadofold -sENVIRONMENT=web,worker \
+	-sMODULARIZE=1 -sEXPORT_NAME=ribossfold -sENVIRONMENT=web,worker \
 	-sINITIAL_MEMORY=268435456
 
-wasm: web/tornadofold.js web/tornadofold-simd.js
-web/tornadofold.js: web/tornadofold_wasm.cpp $(HDRS)
-	$(EMCC) $(EMFLAGS) -o $@ web/tornadofold_wasm.cpp
-web/tornadofold-simd.js: web/tornadofold_wasm.cpp $(HDRS)
-	$(EMCC) $(EMFLAGS) -msimd128 -o $@ web/tornadofold_wasm.cpp
+wasm: web/ribossfold.js web/ribossfold-simd.js
+web/ribossfold.js: web/ribossfold_wasm.cpp $(HDRS)
+	$(EMCC) $(EMFLAGS) -o $@ web/ribossfold_wasm.cpp
+web/ribossfold-simd.js: web/ribossfold_wasm.cpp $(HDRS)
+	$(EMCC) $(EMFLAGS) -msimd128 -o $@ web/ribossfold_wasm.cpp
 
 
 NPMFLAGS ?= $(EMFLAGS) -sSINGLE_FILE=1
 
-npm: npm/tornadofold.js npm/tornadofold-simd.js npm/LICENSE npm/README.md
-npm/tornadofold.js: web/tornadofold_wasm.cpp $(HDRS)
-	$(EMCC) $(NPMFLAGS) -o $@ web/tornadofold_wasm.cpp
-npm/tornadofold-simd.js: web/tornadofold_wasm.cpp $(HDRS)
-	$(EMCC) $(NPMFLAGS) -msimd128 -o $@ web/tornadofold_wasm.cpp
+npm: npm/ribossfold.js npm/ribossfold-simd.js npm/LICENSE npm/README.md
+npm/ribossfold.js: web/ribossfold_wasm.cpp $(HDRS)
+	$(EMCC) $(NPMFLAGS) -o $@ web/ribossfold_wasm.cpp
+npm/ribossfold-simd.js: web/ribossfold_wasm.cpp $(HDRS)
+	$(EMCC) $(NPMFLAGS) -msimd128 -o $@ web/ribossfold_wasm.cpp
 npm/LICENSE: LICENSE
 	cp LICENSE $@
 npm/README.md: README.md
 	cp README.md $@
 
 clean:
-	rm -f tornadofold tornadofold_omp tornadofold_noneon verify \
-	  web/tornadofold.js web/tornadofold.wasm web/tornadofold-simd.js web/tornadofold-simd.wasm \
-	  npm/tornadofold.js npm/tornadofold-simd.js npm/LICENSE npm/README.md npm/*.tgz
+	rm -f ribossfold ribossfold_omp ribossfold_noneon verify \
+	  web/ribossfold.js web/ribossfold.wasm web/ribossfold-simd.js web/ribossfold-simd.wasm \
+	  npm/ribossfold.js npm/ribossfold-simd.js npm/LICENSE npm/README.md npm/*.tgz
 
 .PHONY: all clean wasm npm

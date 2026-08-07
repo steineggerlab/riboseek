@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-# Accuracy benchmark on ArchiveII: compare tornadofold vs RNAfold -d2 against
+# Accuracy benchmark on ArchiveII: compare ribossfold vs RNAfold -d2 against
 # reference structures. Reports micro- and macro-averaged sensitivity/PPV/F1.
 #
 # Point it at a directory of .ct or .bpseq reference files (the ArchiveII
 # tarballs ship .bpseq):
-#   ARCHIVEII=path/to/archiveII TORNADOFOLD=./tornadofold RNAFOLD=RNAfold \
+#   ARCHIVEII=path/to/archiveII RIBOSSFOLD=./ribossfold RNAFOLD=RNAfold \
 #       python3 util/accuracy.py [maxlen]
 import os, sys, glob, subprocess, re
 
 DATADIR = os.environ.get("ARCHIVEII",
                          os.path.join(os.path.dirname(__file__), "..", "archiveII"))
-TORNADOFOLD = os.environ.get("TORNADOFOLD", os.path.join(os.path.dirname(__file__), "..", "tornadofold"))
+RIBOSSFOLD = os.environ.get("RIBOSSFOLD", os.path.join(os.path.dirname(__file__), "..", "ribossfold"))
 # RNAfold comparison is opt-in: only run it when RNAFOLD points at a binary.
 RNAFOLD = os.environ.get("RNAFOLD")
 
@@ -110,7 +110,7 @@ if __name__=="__main__":
     recs = load_dataset(maxlen)
     print(f"loaded {len(recs)} structures"+(f" (<= {maxlen} nt)" if maxlen else ""), flush=True)
     import time
-    tools = [("tornadofold",[TORNADOFOLD])]
+    tools = [("ribossfold",[RIBOSSFOLD])]
     if RNAFOLD:
         tools.append(("RNAfold -d2",[RNAFOLD,"--noPS","-d2"]))
     for label,cmd in tools:

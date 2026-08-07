@@ -24,4 +24,4 @@ jobs:
           cmake -S . -B build
           cmake --build build --parallel
           ./build/verify
-          TORNADOFOLD=./build/tornadofold python3 tests/smoke_test.py
+          RIBOSSFOLD=./build/ribossfold python3 tests/smoke_test.py

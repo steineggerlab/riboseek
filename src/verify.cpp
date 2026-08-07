@@ -1,6 +1,6 @@
 // Self-consistency test: for random sequences the DP optimum must equal the
 // energy of its own traceback structure re-scored by the energy model.
-#include "tornadofold.h"
+#include "ribossfold.h"
 #include <cstdio>
 #include <random>
 
@@ -15,7 +15,7 @@ int main() {
             for (int i = 0; i < L; ++i) {
                 s += B[d(rng)];
             }
-            tornadofold::TornadoFold f;
+            ribossfold::RibossFold f;
             int e = f.fold(s);
             std::string db = f.traceback(e);
             int e2 = f.em.evalStructure(db); // re-score the traceback

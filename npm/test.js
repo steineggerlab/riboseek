@@ -44,8 +44,8 @@ async function main() {
     .map((l) => l.split("\t"));
 
   // test both build
-  let fails = await checkBuild("scalar", require("./tornadofold.js"), rows);
-  fails += await checkBuild("simd", require("./tornadofold-simd.js"), rows);
+  let fails = await checkBuild("scalar", require("./ribossfold.js"), rows);
+  fails += await checkBuild("simd", require("./ribossfold-simd.js"), rows);
 
   // and the package entry point
   const { fold, simdSupported } = require("./index.js");

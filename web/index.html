@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ToRNAdoFold: RNA MFE folding</title>
+<title>RibossFold: RNA MFE folding</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fornac@1.1.8/app/styles/fornac.css">
 <style>
   :root { --fg:#1a1a1a; --muted:#6b7280; --line:#e5e7eb; --accent:#2b6cb0; }
@@ -63,7 +63,7 @@
 </head>
 <body>
 <main>
-  <h1>ToRNAdoFold</h1>
+  <h1>RibossFold</h1>
   <p class="sub">Minimum-free-energy RNA secondary structure folded via WebAssembly (SIMD) and drawn with <a href="https://github.com/ViennaRNA/forna">fornac</a>.</p>
 
   <label for="seq">RNA sequence</label>
@@ -83,7 +83,7 @@
   </div>
 
   <hr>
-  <h2>Batch — fold a file</h2>
+  <h2>Batch folding</h2>
   <p class="sub" style="margin-bottom:1rem">FASTA, or one sequence per line. Folded in parallel with <span id="ncpu">?</span> web workers.</p>
   <div class="row">
     <input type="file" id="file" accept=".fa,.fasta,.fna,.txt,.seq">
@@ -111,7 +111,7 @@
     } catch (e) { return false; }
   }
   const SIMD = simdSupported();
-  const WASM_JS = SIMD ? "tornadofold-simd.js" : "tornadofold.js";
+  const WASM_JS = SIMD ? "ribossfold-simd.js" : "ribossfold.js";
 
   function loadScript(src) {
     return new Promise((res, rej) => {
@@ -121,7 +121,7 @@
     });
   }
 
-  loadScript(WASM_JS).then(() => tornadofold()).then((m) => {
+  loadScript(WASM_JS).then(() => ribossfold()).then((m) => {
     mod = m;
     $("fold").disabled = false;
     $("status").textContent = "Ready" + (SIMD ? " (SIMD)." : ".");
@@ -188,7 +188,7 @@
     let next = 0, done = 0, failed = false;
     return new Promise((resolve, reject) => {
       let workers;
-      try { workers = Array.from({ length: n }, () => new Worker("tornadofold-worker.js?m=" + WASM_JS)); }
+      try { workers = Array.from({ length: n }, () => new Worker("ribossfold-worker.js?m=" + WASM_JS)); }
       catch (e) { reject(e); return; }
       const pump = (w) => {
         if (next >= recs.length) { w.terminate(); return; }
@@ -258,7 +258,7 @@
     const text = batch.map((r) => ">" + r.name + "\n" + r.seq + "\n" + r.db + " (" + (r.mfe / 100).toFixed(2) + ")").join("\n") + "\n";
     const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
     const a = document.createElement("a");
-    a.href = url; a.download = "tornadofold_results.txt"; a.click();
+    a.href = url; a.download = "ribossfold_results.txt"; a.click();
     URL.revokeObjectURL(url);
   });
 })();

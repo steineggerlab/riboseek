@@ -1,4 +1,4 @@
-// tornadofold — wavefront (anti-diagonal) SIMD folder with exact Turner 2004 energy.
+// ribossfold — wavefront (anti-diagonal) SIMD folder with exact Turner 2004 energy.
 // Matrices stored diagonal-by-diagonal: D[s][i] holds cell (i, i+s). The O(N^3)
 // multibranch bifurcation FMbif(i,j)=min_k FM(i,k)+FM1(k+1,j) becomes, per split
 // span, a unit-stride vector add + min over i (NEON, 4x int32).
@@ -28,7 +28,7 @@
 #define HAVE_SSE2 1
 #endif
 
-namespace tornadofold {
+namespace ribossfold {
 using en::INF;
 
 // Lower bound on any single internal-loop closure energy: the most stabilizing
@@ -45,7 +45,7 @@ static inline __m128i sse2_min_epi32(__m128i a, __m128i b) {
 }
 #endif
 
-struct TornadoFold {
+struct RibossFold {
     int n = 0;
     std::vector<int> b;
     std::string seq;
@@ -390,4 +390,4 @@ struct TornadoFold {
     }
 };
 
-} // namespace tornadofold
+} // namespace ribossfold
