@@ -1,8 +1,8 @@
 # compiled binaries
-/tornadofold
-/tornadofold_noneon
-/tornadofold_omp
-/tornadofold_v2
+/ribossfold
+/ribossfold_noneon
+/ribossfold_omp
+/ribossfold_v2
 /verify
 /kbench
 *.o
@@ -18,14 +18,14 @@ bench/*.fa
 bench/*.log
 
 # WebAssembly build artifacts (built in CI, deployed to Pages)
-/web/tornadofold.js
-/web/tornadofold.wasm
-/web/tornadofold-simd.js
-/web/tornadofold-simd.wasm
+/web/ribossfold.js
+/web/ribossfold.wasm
+/web/ribossfold-simd.js
+/web/ribossfold-simd.wasm
 
 # npm package artifacts
-/npm/tornadofold.js
-/npm/tornadofold-simd.js
+/npm/ribossfold.js
+/npm/ribossfold-simd.js
 /npm/LICENSE
 /npm/README.md
 /npm/*.tgz

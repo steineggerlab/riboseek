@@ -1,6 +1,6 @@
-// tornadofold driver: reads FASTA (or one seq per line) from stdin/file, prints
+// ribossfold driver: reads FASTA (or one seq per line) from stdin/file, prints
 // dot-bracket and MFE. Scalar reference path (fold.h).
-#include "tornadofold.h"
+#include "ribossfold.h"
 #include <cstdio>
 #include <iostream>
 #include <chrono>
@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
 #endif
     {
         // one folder per thread, reused across sequences (buffers amortise)
-        tornadofold::TornadoFold f;
+        ribossfold::RibossFold f;
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif

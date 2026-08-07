@@ -1,7 +1,7 @@
 // WebAssembly entry point: expose the folder to JavaScript via embind.
-// Built with emcc (see `make wasm`); the NEON block in tornadofold.h is inactive
+// Built with emcc (see `make wasm`); the NEON block in ribossfold.h is inactive
 // on wasm, so this is the exact-int32 scalar path.
-#include "tornadofold.h"
+#include "ribossfold.h"
 #include <emscripten/bind.h>
 #include <cctype>
 #include <string>
@@ -24,12 +24,12 @@ static std::string foldSeq(const std::string& seq) {
     if (s.empty()) {
         return std::string("\t0");
     }
-    tornadofold::TornadoFold f;
+    ribossfold::RibossFold f;
     int e = f.fold(s);
     std::string db = f.traceback(e);
     return db + "\t" + std::to_string(e);
 }
 
-EMSCRIPTEN_BINDINGS(tornadofold) {
+EMSCRIPTEN_BINDINGS(ribossfold) {
     emscripten::function("foldSeq", &foldSeq);
 }

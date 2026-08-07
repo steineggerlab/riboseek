@@ -1,6 +1,6 @@
 {
-  "name": "tornadofold-wasm",
-  "version": "0.0.3",
+  "name": "ribossfold-wasm",
+  "version": "0.0.4",
   "description": "Fast RNA minimum free energy secondary structure prediction",
   "keywords": [
     "rna",
@@ -11,19 +11,19 @@
     "wasm",
     "webassembly"
   ],
-  "homepage": "https://github.com/mirditalab/ToRNAdoFold",
+  "homepage": "https://github.com/mirditalab/RibossFold",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mirditalab/ToRNAdoFold.git",
+    "url": "git+https://github.com/mirditalab/RibossFold.git",
     "directory": "npm"
   },
-  "bugs": "https://github.com/mirditalab/ToRNAdoFold/issues",
+  "bugs": "https://github.com/mirditalab/RibossFold/issues",
   "license": "MIT",
   "main": "index.js",
   "files": [
     "index.js",
-    "tornadofold.js",
-    "tornadofold-simd.js"
+    "ribossfold.js",
+    "ribossfold-simd.js"
   ],
   "sideEffects": false,
   "scripts": {

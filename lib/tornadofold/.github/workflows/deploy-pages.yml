@@ -25,8 +25,8 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p _site
-          cp web/index.html web/tornadofold-worker.js _site/
-          cp web/tornadofold.js web/tornadofold.wasm web/tornadofold-simd.js web/tornadofold-simd.wasm _site/
+          cp web/index.html web/ribossfold-worker.js _site/
+          cp web/ribossfold.js web/ribossfold.wasm web/ribossfold-simd.js web/ribossfold-simd.wasm _site/
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

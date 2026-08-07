@@ -3,26 +3,26 @@
 # (28-282 nt) and check the MFE *and* the traceback structure against
 # precomputed golden values in data/archiveii_smoke.tsv.
 #
-# The golden values are tornadofold's own deterministic output; every MFE was
+# The golden values are ribossfold's own deterministic output; every MFE was
 # verified byte-exact against RNAfold -d2 when the file was generated (see
-# util/gen note below). Structure is checked against tornadofold's golden rather
+# util/gen note below). Structure is checked against ribossfold's golden rather
 # than RNAfold's because co-optimal (equal-energy) structures are resolved by
 # implementation-specific traceback tie-breaking. The sample avoids hairpin
 # loops > 30 nt so the golden reproduces exactly across platforms/libm.
 #
-# Usage: python3 tests/smoke_test.py   (set TORNADOFOLD=path to override the binary)
+# Usage: python3 tests/smoke_test.py   (set RIBOSSFOLD=path to override the binary)
 import os
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.environ.get("TORNADOFOLD", os.path.join(HERE, "..", "tornadofold"))
+BIN = os.environ.get("RIBOSSFOLD", os.path.join(HERE, "..", "ribossfold"))
 DATA = os.path.join(HERE, "data", "archiveii_smoke.tsv")
 
 
 def main():
     if not os.path.exists(BIN):
-        print(f"error: tornadofold binary not found at {BIN} (build it first: `make`)")
+        print(f"error: ribossfold binary not found at {BIN} (build it first: `make`)")
         return 2
     rows = [l.rstrip("\n").split("\t") for l in open(DATA)][1:]
     fails = 0

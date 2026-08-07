@@ -1,4 +1,4 @@
-# ToRNAdoFold
+# RibossFold
 
 Fast RNA secondary-structure prediction by minimum free energy using the Turner 2004
 nearest-neighbour model ([Mathews et al., 2004](https://www.pnas.org/doi/10.1073/pnas.0401799101)),
@@ -17,28 +17,28 @@ SIMD-accelerated and header-only C++11 library. Runs on the command line, as a l
 ```sh
 make
 # prints sequence, structure, and MFE
-echo GGGGAAAACCCC | ./tornadofold
+echo GGGGAAAACCCC | ./ribossfold
 # FASTA, or one sequence per line
-./tornadofold < sequences.fa
+./ribossfold < sequences.fa
 ```
 
 Fold a batch in parallel:
 ```sh
-make tornadofold_omp
-OMP_NUM_THREADS=8 ./tornadofold_omp < sequences.fa
+make ribossfold_omp
+OMP_NUM_THREADS=8 ./ribossfold_omp < sequences.fa
 ```
 
 ## As a library
 
 ```cmake
 add_subdirectory(path/to/lib EXCLUDE_FROM_ALL)
-target_link_libraries(myapp PRIVATE tornadofold::tornadofold)
+target_link_libraries(myapp PRIVATE ribossfold::ribossfold)
 ```
 
 ```cpp
-#include "tornadofold.h"
+#include "ribossfold.h"
 
-tornadofold::TornadoFold f;
+ribossfold::RibossFold f;
 // minimum free energy, in 0.01 kcal/mol
 int mfe = f.fold("GGGGAAAACCCC");
 // dot-bracket
@@ -48,11 +48,11 @@ std::string structure = f.traceback(mfe);
 ## In the browser
 
 ```sh
-npm install tornadofold-wasm
+npm install ribossfold-wasm
 ```
 
 ```js
-import { fold } from "tornadofold-wasm";
+import { fold } from "ribossfold-wasm";
 
 // structure is dot-bracket, one character per base; mfe is in kcal/mol
 const { structure, mfe } = await fold("GGGCUAUUAGCUCAGUUGGUUAGAGCGCACCC");
@@ -81,6 +81,6 @@ RNAfold ([Lorenz et al., 2011](https://link.springer.com/article/10.1186/1748-71
 
 | tool        | 1 thread | 20 threads | sensitivity | PPV   | F1    | F1 (macro) |
 |-------------|---------:|-----------:|------------:|------:|------:|-----------:|
-| ToRNAdoFold |   41.5 s |      3.3 s |       0.577 | 0.506 | 0.539 |      0.577 |
+| RibossFold |   41.5 s |      3.3 s |       0.577 | 0.506 | 0.539 |      0.577 |
 | RNAfold     |  112.3 s |      9.4 s |       0.576 | 0.506 | 0.539 |      0.577 |
 
