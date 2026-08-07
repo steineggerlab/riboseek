@@ -31,7 +31,7 @@ target_include_directories(riboseek-framework PRIVATE
     ${INFERNAL_ROOT}/hmmer/src
     ${INFERNAL_ROOT}/easel
 )
-target_link_libraries(riboseek-framework tornadofold::tornadofold)
+target_link_libraries(riboseek-framework ribossfold::ribossfold)
 
 
 if (NOT RIBOSEEK_FRAMEWORK_ONLY)

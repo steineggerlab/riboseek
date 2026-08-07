@@ -5,7 +5,7 @@
 #include <vector>
 
 #include <cctype>
-#include <tornadofold.h>
+#include <ribossfold.h>
 
 static inline bool rnaFoldPredictDotBracket(const std::string &rna,
                                             std::string &dotBracket,
@@ -18,7 +18,7 @@ static inline bool rnaFoldPredictDotBracket(const std::string &rna,
         return false;
     }
 
-    tornadofold::TornadoFold folder;
+    ribossfold::RibossFold folder;
     int mfe = folder.fold(rna);
     dotBracket = folder.traceback(mfe);
     if (dotBracket.size() != rna.size()) {

@@ -38,7 +38,7 @@ if (NOT EXISTS ${INFERNAL_ROOT}/src/infernal.h)
 endif ()
 add_subdirectory(lib/infernal)
 
-add_subdirectory(lib/tornadofold EXCLUDE_FROM_ALL)
+add_subdirectory(lib/ribossfold EXCLUDE_FROM_ALL)
 
 add_subdirectory(data)
 add_subdirectory(src)
