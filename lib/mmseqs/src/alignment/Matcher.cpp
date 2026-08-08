@@ -9,6 +9,49 @@
 #include "CovSeqidQscPercMinDiag.lib.h"
 #include "CovSeqidQscPercMinDiagTargetCov.lib.h"
 
+#ifdef RIBOSEEK
+// Count nucleotide-level identities in an alignment of dinucleotide-encoded sequences.
+//
+// A dinucleotide letter encodes the pair (b_i, b_i+1), so two letters agree in their first
+// nucleotide exactly when b_i matches. Counting first-nucleotide agreements over the aligned
+// columns therefore yields the true nucleotide identity, with no assumption about how
+// mismatches are distributed -- unlike the (1 + id_dinuc) / 2 bound, which only holds for
+// isolated mismatches and over-estimates by up to ~0.18 on real RNA alignments, where
+// mismatches cluster.
+//
+// The final nucleotide of the alignment is the second base of the last column and is not
+// counted, a <= 1/alnLen effect. Columns whose first nucleotide is unknown (the NX sentinel
+// letters) never count as identical, since "unknown == unknown" is not a match.
+//
+// The backtrace is forward-oriented and anchored at (qStartPos, tStartPos) by the time
+// getSWResult inspects it, for both backtrace producers in StripedSmithWaterman.
+unsigned int Matcher::countNucIdentities(const unsigned char *qNum, const unsigned char *tNum,
+                                        int qPos, int tPos, const std::string &backtrace,
+                                        const unsigned char *num2firstnuc,
+                                        unsigned char firstnucAny) {
+    unsigned int ids = 0;
+    for (size_t i = 0; i < backtrace.size(); i++) {
+        switch (backtrace[i]) {
+            case 'M': {
+                const unsigned char qn = num2firstnuc[qNum[qPos]];
+                const unsigned char tn = num2firstnuc[tNum[tPos]];
+                ids += (qn == tn && qn != firstnucAny);
+                qPos++;
+                tPos++;
+                break;
+            }
+            case 'I':
+                qPos++;
+                break;
+            default:
+                tPos++;
+                break;
+        }
+    }
+    return ids;
+}
+#endif
+
 
 Matcher::Matcher(int querySeqType, int maxSeqLen, BaseMatrix *m, EvalueComputation * evaluer,
                  bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend, float correlationScoreWeight, int zdrop)
@@ -112,6 +155,15 @@ Matcher::result_t Matcher::getSWResult(Sequence* dbSeq, const int diagonal, bool
             // OVERWRITE alnLength with gapped value
             alnLength = backtrace.size();
         }
+#ifdef RIBOSEEK
+        // dinucleotide alphabet: report (and threshold on) nucleotide identity
+        if (m->num2firstnuc != NULL && backtrace.empty() == false) {
+            unsigned int ntIds = Matcher::countNucIdentities(currentQuery->numSequence, dbSeq->numSequence,
+                                                            alignment.qStartPos1, alignment.dbStartPos1,
+                                                            backtrace, m->num2firstnuc, m->firstnucAny);
+            seqId = Util::computeSeqId(seqIdMode, ntIds, origQueryLen, dbSeq->L, alnLength);
+        } else
+#endif
         seqId = Util::computeSeqId(seqIdMode, alignment.identicalAACnt, origQueryLen, dbSeq->L, alnLength);
     }else if( alignmentMode == Matcher::SCORE_COV){
         // "20%   30%   40%   50%   60%   70%   80%   90%   99%"

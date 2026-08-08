@@ -25,6 +25,9 @@ BaseMatrix::BaseMatrix(){
     for (int i = 0; i < UCHAR_MAX; ++i) {
         num2revcompnum[i] = UCHAR_MAX;
     }
+    // not a dinucleotide matrix until registerDinucleotideMapping says otherwise
+    num2firstnuc = NULL;
+    firstnucAny = 0;
 #else
     aa2num = new unsigned char[UCHAR_MAX];
     for (int i = 0; i < UCHAR_MAX; ++i) {

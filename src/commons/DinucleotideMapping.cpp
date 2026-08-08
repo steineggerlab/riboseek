@@ -240,7 +240,8 @@ static void dinucSetupMatrix(BaseMatrix *mat) {
     dinucTail[aa2num[(int)'Y']] = aa2num[(int)'X'];
     dinucTail[aa2num[(int)'X']] = aa2num[(int)'X'];
 
-    // dinucToNuc — maps dinucleotide encoding back to second nucleotide
+    // dinucToNuc — maps a dinucleotide letter back to its FIRST nucleotide
+    // (AA, AC, AG, AU all start with A, so they all map to A)
     memset(dinucToNucTbl, 0, sizeof(dinucToNucTbl));
     // AA=C, AC=G, AG=L, AU=Q -> A
     dinucToNucTbl[aa2num[(int)'C']] = aa2num[(int)'A'];
@@ -275,6 +276,16 @@ static void dinucSetupMatrix(BaseMatrix *mat) {
     dinucToNucTbl[aa2num[(int)'X']] = aa2num[(int)'X'];
 
     dinucTablesReady = true;
+
+    // Publish the first-nucleotide table on the matrix so the aligners can report sequence
+    // identity in nucleotides instead of in dinucleotide letters. Only the 25 letter
+    // dinucleotide matrix gets it: this callback runs for every SubstitutionMatrix, and on
+    // e.g. BLOSUM62 (21 letters) dinucToNucTbl is meaningless. Same alphabet-size test the
+    // dinucleotide branch of kmermatcher uses.
+    if (mat->alphabetSize == 25) {
+        mat->num2firstnuc = dinucToNucTbl;
+        mat->firstnucAny = aa2num[(int)'X'];
+    }
 
     // Create alignSubMat (bitFactor=2.0) for profile_for_alignment if not yet created
     // Guard against recursion: SubstitutionMatrix constructor calls all setupMatrixFn callbacks

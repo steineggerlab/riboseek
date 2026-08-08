@@ -211,6 +211,14 @@ public:
 
     static float estimateSeqIdByScorePerCol(uint16_t score, unsigned int qLen, unsigned int tLen);
 
+#ifdef RIBOSEEK
+    // exact nucleotide identity count for dinucleotide-encoded alignments, see Matcher.cpp
+    static unsigned int countNucIdentities(const unsigned char *qNum, const unsigned char *tNum,
+                                          int qPos, int tPos, const std::string &backtrace,
+                                          const unsigned char *num2firstnuc,
+                                          unsigned char firstnucAny);
+#endif
+
     static std::string compressAlignment(const std::string &bt);
 
     static std::string uncompressAlignment(const std::string &cbt);

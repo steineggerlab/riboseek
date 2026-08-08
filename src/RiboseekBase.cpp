@@ -54,10 +54,9 @@ std::vector<Command> riboseekCommands = {
             "Cascaded RNA clustering in dinucleotide space",
             "# Cascaded clustering of a riboseek createdb database\n"
             "riboseek cluster sequenceDB clusterDB tmp\n\n"
-            "# Sequence identity and coverage are measured on dinucleotides:\n"
-            "# a single nucleotide mismatch breaks the two dinucleotides it is part of,\n"
-            "# so id_nucleotide is roughly (1 + id_dinucleotide) / 2\n"
-            "riboseek cluster sequenceDB clusterDB tmp --min-seq-id 0.8\n",
+            "# Alignment runs in dinucleotide space, but --min-seq-id is nucleotide\n"
+            "# identity: this keeps pairs at 90% or more identical nucleotides\n"
+            "riboseek cluster sequenceDB clusterDB tmp --min-seq-id 0.9\n",
             "Martin Steinegger <martin.steinegger@snu.ac.kr>",
             "<i:sequenceDB> <o:clusterDB> <tmpDir>",
             CITATION_MMSEQS2, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },

@@ -13,6 +13,29 @@
 #include "AlignmentSymmetry.h"
 #include <thread>
 #include <mutex>
+
+#ifdef RIBOSEEK
+// Nucleotide identities in a gapless alignment of dinucleotide-encoded sequences, working on
+// the raw letters rather than on numeric codes. See Matcher::countNucIdentities for why it is
+// the first nucleotide of each dinucleotide letter that gets compared.
+// Returns -1 when the matrix is not the dinucleotide matrix, so the caller keeps its
+// letter-wise count.
+static int countNucIdentitiesUngapped(const char *qSeq, const char *tSeq, int qStart, int qEnd,
+                                      int tStart, const BaseMatrix *subMat) {
+    if (subMat->num2firstnuc == NULL) {
+        return -1;
+    }
+    int ids = 0;
+    for (int q = qStart; q <= qEnd; q++) {
+        const unsigned char qc = (unsigned char) (qSeq[q] & ~0x20);
+        const unsigned char tc = (unsigned char) (tSeq[tStart + (q - qStart)] & ~0x20);
+        const unsigned char qn = subMat->num2firstnuc[subMat->aa2num[qc]];
+        const unsigned char tn = subMat->num2firstnuc[subMat->aa2num[tc]];
+        ids += (qn == tn && qn != subMat->firstnucAny);
+    }
+    return ids;
+}
+#endif
 #include <condition_variable>
 #include <queue>
 
@@ -481,6 +504,15 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                         char targetLetter = targetSequence[ungappedAlignment.tStart + (q - ungappedAlignment.qStart)] & static_cast<unsigned char>(~0x20);
                         identicalCount += (queryLetter == targetLetter) ? 1 : 0;
                     }
+#ifdef RIBOSEEK
+                    // dinucleotide alphabet: count nucleotide identities instead
+                    int ntIds = countNucIdentitiesUngapped(querySequence, targetSequence,
+                                                           ungappedAlignment.qStart, ungappedAlignment.qEnd,
+                                                           ungappedAlignment.tStart, subMat);
+                    if (ntIds >= 0) {
+                        identicalCount = ntIds;
+                    }
+#endif
                     seqId = Util::computeSeqId(par.seqIdMode, identicalCount, query.L, target.L, ungappedAlignment.alnLen);
                 }
                 
@@ -550,6 +582,16 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                                     char elementLetter = elementSequence[elementUngappedAlignment.tStart + (q - elementUngappedAlignment.qStart)] & static_cast<unsigned char>(~0x20);
                                     elementIdenticalCount += (queryLetter == elementLetter) ? 1 : 0;
                                 }
+#ifdef RIBOSEEK
+                                // dinucleotide alphabet: count nucleotide identities instead
+                                int elementNtIds = countNucIdentitiesUngapped(querySequence, elementSequence,
+                                                                             elementUngappedAlignment.qStart,
+                                                                             elementUngappedAlignment.qEnd,
+                                                                             elementUngappedAlignment.tStart, subMat);
+                                if (elementNtIds >= 0) {
+                                    elementIdenticalCount = elementNtIds;
+                                }
+#endif
                                 float elementSeqId = Util::computeSeqId(par.seqIdMode, elementIdenticalCount, query.L, elementLength, elementUngappedAlignment.alnLen);
                                 bool elementHasSeqId = elementSeqId >= (par.seqIdThr - std::numeric_limits<float>::epsilon());
                                 
@@ -614,7 +656,18 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                     s_align gappedAlignment = blockAligner.bandedalign(&target, newQueryStartPos, newTargetStartPos, 
                                                                        gappedBacktrace, xDrop, par.covThr, par.covMode);
                     unsigned int gappedAlnLength = gappedBacktrace.size();
-                    double gappedSeqId = Util::computeSeqId(par.seqIdMode, gappedAlignment.identicalAACnt, 
+                    unsigned int gappedIdCnt = gappedAlignment.identicalAACnt;
+#ifdef RIBOSEEK
+                    // dinucleotide alphabet: count nucleotide identities instead
+                    if (subMat->num2firstnuc != NULL && gappedBacktrace.empty() == false) {
+                        gappedIdCnt = Matcher::countNucIdentities(query.numSequence, target.numSequence,
+                                                                 gappedAlignment.qStartPos1,
+                                                                 gappedAlignment.dbStartPos1,
+                                                                 gappedBacktrace, subMat->num2firstnuc,
+                                                                 subMat->firstnucAny);
+                    }
+#endif
+                    double gappedSeqId = Util::computeSeqId(par.seqIdMode, gappedIdCnt,
                                                            query.L, targetLength, gappedAlnLength);
                     Matcher::result_t result = Matcher::result_t(
                         targetKey, gappedAlignment.score1, gappedAlignment.qCov, gappedAlignment.tCov, 
@@ -665,6 +718,16 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                                         char elementLetter = elementSequence[elementUngappedAlignment.tStart + (q - elementUngappedAlignment.qStart)] & static_cast<unsigned char>(~0x20);
                                         elementIdenticalCount += (queryLetter == elementLetter) ? 1 : 0;
                                     }
+#ifdef RIBOSEEK
+                                    // dinucleotide alphabet: count nucleotide identities instead
+                                    int elementNtIds = countNucIdentitiesUngapped(querySequence, elementSequence,
+                                                                                 elementUngappedAlignment.qStart,
+                                                                                 elementUngappedAlignment.qEnd,
+                                                                                 elementUngappedAlignment.tStart, subMat);
+                                    if (elementNtIds >= 0) {
+                                        elementIdenticalCount = elementNtIds;
+                                    }
+#endif
                                     float elementSeqId = Util::computeSeqId(par.seqIdMode, elementIdenticalCount, query.L, elementLength, elementUngappedAlignment.alnLen);
                                     bool elementHasSeqId = elementSeqId >= (par.seqIdThr - std::numeric_limits<float>::epsilon());
                                     

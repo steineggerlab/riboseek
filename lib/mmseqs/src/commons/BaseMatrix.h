@@ -22,6 +22,14 @@ public:
     /* reverse complement lookup: num2revcompnum[i] = complement of residue i */
     unsigned char* num2revcompnum;
     static std::vector<size_t> returnCanonicalIndices(size_t index);
+
+    /* Dinucleotide letter -> numeric code of its FIRST nucleotide, plus the code that
+       table uses for "first nucleotide unknown". Only set for the dinucleotide matrix
+       (registerDinucleotideMapping fills them in); NULL/0 for every other matrix.
+       When num2firstnuc is set, the aligners report sequence identity in nucleotides
+       instead of in dinucleotide letters. */
+    const unsigned char* num2firstnuc;
+    unsigned char firstnucAny;
 #endif
 
     /* size of alphabet*/
