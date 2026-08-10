@@ -34,6 +34,9 @@ Steinegger. Fast remote nucleotide sequence alignment with Riboseek. bioRxiv, (2
   * [License](#license)
   * [Contact](#contact)
 
+## Webserver 
+Search your RNA sequences against RNAcentral, NCBI nt_rna, and Rfam in seconds using the Riboseek webserver [search.foldseek.com/riboseek](https://search.foldseek.com/riboseek) 🚀
+
 ## Installation
 
 
@@ -167,8 +170,6 @@ You can use `aln_cm` instead of `aln` as input to `result2msa` to generate a CM-
 
 ## Main modules
 
-<!-- TODO: replace with the output of `riboseek -h` -->
-
 - `easy-search` fast RNA sequence search (all-in-one workflow)
 - `search` search a query database against a target database
 - `createdb` create a database from FASTA/FASTQ files
@@ -184,6 +185,10 @@ You can use `aln_cm` instead of `aln` as input to `result2msa` to generate a CM-
 
 Many of Riboseek's modules (subprograms) come from MMseqs2. For those, refer to the [MMseqs2 wiki](https://github.com/soedinglab/MMseqs2/wiki). 
 
+
+ ### Precomputed multiple sequence alignments:
+
+For RNAcentral queries, see the [precomputed MSA dataset](https://steineggerlab.s3.us-east-1.amazonaws.com/riboseek/rna_central_msa/README.md) — 1.7 million alignments, already built.
 
 ## Third-party components
 
