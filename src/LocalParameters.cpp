@@ -10,6 +10,10 @@ LocalParameters::LocalParameters() : Parameters(),
         "long/genomic targets, may clip hits near the prefilter edge)\n 0: full target (no windowing)",
         typeid(float), (void *) &cmRegionFlanking,
         "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CM_SCAN_CUTOFF(PARAM_CM_SCAN_CUTOFF_ID, "--cm-scan-cutoff", "CM scan score cutoff",
+        "Minimum bit score a window must reach in the CM scan to be considered for alignment",
+        typeid(float), (void *) &cmScanCutoff,
+        "^-?[0-9]*(\\.[0-9]+)?([eE][-+]?[0-9]+)?$", MMseqsParameter::COMMAND_ALIGN),
     PARAM_CM_MODE(PARAM_CM_MODE_ID, "--cm-mode", "CM scan scoring",
         "CM detection scoring: 0 = CYK (max, faster), 1 = Inside (sum, more sensitive)",
         typeid(int), (void *) &cmMode,
@@ -51,6 +55,7 @@ LocalParameters::LocalParameters() : Parameters(),
         "^[0-1]$", MMseqsParameter::COMMAND_PROFILE)
 {
     cmRegionFlanking = 1.0f;  // 1.0 => pad by full W (prior hardcoded behavior)
+    cmScanCutoff = 0.0f;
     cmMode = 1;
     cmAlign = 0;
     cmAlignBanded = 1;
@@ -72,6 +77,7 @@ LocalParameters::LocalParameters() : Parameters(),
 
     cmscan = align;
     cmscan.push_back(&PARAM_CM_REGION);
+    cmscan.push_back(&PARAM_CM_SCAN_CUTOFF);
     cmscan.push_back(&PARAM_CM_MODE);
     cmscan.push_back(&PARAM_CM_ALIGN);
     cmscan.push_back(&PARAM_CM_ALIGN_BANDED);

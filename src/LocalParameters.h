@@ -23,6 +23,7 @@ public:
     static const int CM_MODE_INSIDE = 1;
 
     float cmRegionFlanking;
+    float cmScanCutoff;
     int cmMode;
     int cmAlign;
     int cmAlignBanded;
@@ -34,6 +35,7 @@ public:
     int cmbuildNoss;
 
     PARAMETER(PARAM_CM_REGION)
+    PARAMETER(PARAM_CM_SCAN_CUTOFF)
     PARAMETER(PARAM_CM_MODE)
     PARAMETER(PARAM_CM_ALIGN)
     PARAMETER(PARAM_CM_ALIGN_BANDED)
