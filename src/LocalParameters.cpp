@@ -52,7 +52,11 @@ LocalParameters::LocalParameters() : Parameters(),
     PARAM_CMBUILD_NOSS(PARAM_CMBUILD_NOSS_ID, "--cmbuild-noss", "cmbuild without secondary structure",
         "cmbuild:\n0: use SS_cons base pairs\n1: build a sequence-only CM (ignore/require-no structure).",
         typeid(int), (void *) &cmbuildNoss,
-        "^[0-1]$", MMseqsParameter::COMMAND_PROFILE)
+        "^[0-1]$", MMseqsParameter::COMMAND_PROFILE),
+    PARAM_CMBUILD_MIN_ROW_COV(PARAM_CMBUILD_MIN_ROW_COV_ID, "--cmbuild-min-row-cov", "cmbuild minimum row coverage",
+        "Drop MSA rows with non-gap coverage below this fraction",
+        typeid(float), (void *) &cmbuildMinRowCov,
+        "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_PROFILE)
 {
     cmRegionFlanking = 1.0f;  // 1.0 => pad by full W (prior hardcoded behavior)
     cmScanCutoff = 0.0f;
@@ -65,6 +69,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuildEre = -1.0;      // <0 => Infernal default target rel-entropy
     cmbuildSymfrac = -1.0;  // <0 => keep all columns (current default)
     cmbuildNoss = 0;        // use SS_cons (current default)
+    cmbuildMinRowCov = 0.30f;
 
     // Register dinuc.out as compiled-in matrix and set as default
     scoringMatrixFile = MultiParam<NuclAA<std::string>>(NuclAA<std::string>("dinuc.out", "dinuc.out"));
@@ -103,6 +108,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuild.push_back(&PARAM_CMBUILD_ERE);
     cmbuild.push_back(&PARAM_CMBUILD_SYMFRAC);
     cmbuild.push_back(&PARAM_CMBUILD_NOSS);
+    cmbuild.push_back(&PARAM_CMBUILD_MIN_ROW_COV);
     cmbuild.push_back(&PARAM_THREADS);
     cmbuild.push_back(&PARAM_COMPRESSED);
     cmbuild.push_back(&PARAM_V);

@@ -21,7 +21,6 @@ struct CmBuildCtx {
     MsaFilter* msaFilter = nullptr;
     Sequence* targetMapper = nullptr;
     std::vector<int> qid_vec;
-    float alifoldMinCov = 0.70f;
     float minColCoverage = 0.30f;
     bool doMsaFilter = false;
     bool decodeTargetDinuc = false;
