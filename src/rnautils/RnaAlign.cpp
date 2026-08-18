@@ -45,6 +45,7 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     const bool bothStrands = true;
     const size_t targetDbSize = par.dbSize;
     float covThr = par.covThr;
+    const float canCovThr = par.covThr;
     const int covMode = par.covMode;
     const int seqIdMode = par.seqIdMode;
     const double evalThr = par.evalThr;
@@ -329,7 +330,7 @@ int rnaalign(int argc, const char **argv, const Command &command) {
                         dinucEncodeReverse(&dbSeq);
                     }
 
-                    if (Util::canBeCovered(covThr, covMode, static_cast<float>(origQueryLen), static_cast<float>(dbSeq.L)) == false) {
+                    if (Util::canBeCovered(canCovThr, covMode, static_cast<float>(origQueryLen), static_cast<float>(dbSeq.L)) == false) {
                         rejected++;
                         continue;
                     }
