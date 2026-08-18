@@ -48,8 +48,8 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     const int covMode = par.covMode;
     const int seqIdMode = par.seqIdMode;
     const double evalThr = par.evalThr;
-    const double seqIdThr = par.seqIdThr;
-    const int alnLenThr = par.alnLenThr;
+    double seqIdThr = par.seqIdThr;
+    int alnLenThr = par.alnLenThr;
     const bool includeIdentity = par.includeIdentity;
     bool addBacktrace = par.addBacktrace;
     const float scoreBias = par.scoreBias;
@@ -68,10 +68,21 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     const float realignScoreBias = par.realignScoreBias;
     const int realignMaxSeqs = par.realignMaxSeqs;
     float realignCov = 0.0f;
+    double realignSeqIdThr = 0.0;
+    int realignAlnLenThr = 0;
     unsigned int realignSwMode = RnaMatcher::SCORE_COV;
     if (realign) {
         realignCov = covThr;
         covThr = 0.0f;
+        // The first pass is SCORE_ONLY, where seqId is only estimated from the score per column.
+        // Filtering on that estimate discards hits whose true identity clears the threshold, so
+        // defer the check to the realignment, which counts identities in mononucleotide space.
+        realignSeqIdThr = seqIdThr;
+        seqIdThr = 0.0;
+        // Same problem for the alignment length: the first pass reports no start position, so its
+        // alnLength is one larger than the realigned one that actually gets written out.
+        realignAlnLenThr = alnLenThr;
+        alnLenThr = 0;
         if (addBacktrace == false) {
             addBacktrace = true;
         }
@@ -90,6 +101,9 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     // This ensures realignment computes backtrace when needed
     if (realign) {
         unsigned int realignAlnMode = std::max(alignmentMode, (unsigned int)Parameters::ALIGNMENT_MODE_SCORE_COV);
+        if (realignSeqIdThr > 0.0) {
+            realignAlnMode = Parameters::ALIGNMENT_MODE_SCORE_COV_SEQID;
+        }
         switch (realignAlnMode) {
             case Parameters::ALIGNMENT_MODE_SCORE_COV:
                 realignSwMode = RnaMatcher::SCORE_COV;
@@ -431,7 +445,9 @@ int rnaalign(int argc, const char **argv, const Command &command) {
                                                                            realignSwMode, seqIdMode, isIdentity, false, reverse);
 
                         const bool covOK = Util::hasCoverage(realignCov, covMode, res.qcov, res.dbcov);
-                        if (covOK || isIdentity) {
+                        const bool seqIdOK = (res.seqId >= realignSeqIdThr);
+                        const bool alnLenOK = Util::hasAlignmentLength(realignAlnLenThr, res.alnLength);
+                        if ((covOK && seqIdOK && alnLenOK) || isIdentity) {
                             res.score = swResults[result].score;
                             res.eval = swResults[result].eval;
                             swRealignResults.emplace_back(res);
