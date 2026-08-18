@@ -220,11 +220,26 @@ int convertalignments(int argc, const char **argv, const Command &command) {
             IndexReader tseqDbr(par.db2, par.threads, IndexReader::SEQUENCES, 0, IndexReader::PRELOAD_INDEX);
             seqtargetAA = Parameters::isEqualDbtype(tseqDbr.sequenceReader->getDbtype(), Parameters::DBTYPE_AMINO_ACIDS);
         } else if(targetNucs == true && queryNucs == true && par.searchType == Parameters::SEARCH_TYPE_AUTO){
+#ifdef RIBOSEEK
+            // Riboseek only ever aligns RNA in dinucleotide space, so the nucleotide/translated
+            // ambiguity that makes this undecidable for MMseqs2 cannot arise here.
+            seqtargetAA = false;
+#else
             Debug(Debug::WARNING) << "It is unclear from the input if a translated or nucleotide search was performed\n "
                                      "Please provide the parameter --search-type 2 (translated) or 3 (nucleotide)\n";
             EXIT(EXIT_FAILURE);
+#endif
         } else if(par.searchType == Parameters::SEARCH_TYPE_TRANSLATED){
+#ifdef RIBOSEEK
+            // A translated search is never valid for riboseek. Without this guard
+            // printSeqBasedOnAln() would walk three nucleotides per backtrace column over an
+            // alignment that has one nucleotide per column, reading past the end of the sequence.
+            Debug(Debug::ERROR) << "Riboseek aligns RNA in dinucleotide space; a translated search is not supported.\n"
+                                   "Remove --search-type 2, or pass --search-type 3 (nucleotide).\n";
+            EXIT(EXIT_FAILURE);
+#else
             seqtargetAA = true;
+#endif
         }
 
         if((targetNucs == true && queryNucs == false )  || (targetNucs == false && queryNucs == true ) || (targetNucs == true && seqtargetAA == true && queryNucs == true )  ){
