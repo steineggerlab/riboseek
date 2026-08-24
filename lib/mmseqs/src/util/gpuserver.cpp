@@ -72,7 +72,7 @@ int gpuserver(int argc, const char **argv, const Command& command) {
     sigaction(SIGINT, &act, NULL);
     sigaction(SIGTERM, &act, NULL);
 
-    std::string shmFile = GPUSharedMemory::getShmHash(par.db1);
+    std::string shmFile = GPUSharedMemory::getShmHash(par.db1, par.gpuServerNamespace);
     GPUSharedMemory* layout = GPUSharedMemory::alloc(shmFile, par.maxSeqLen, par.maxResListLen);
     Debug(Debug::WARNING) << shmFile << "\n";
     while (keepRunning) {
