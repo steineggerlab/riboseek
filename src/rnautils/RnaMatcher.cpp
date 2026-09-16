@@ -148,13 +148,13 @@ RnaMatcher::result_t RnaMatcher::getSWResult(Sequence* dbSeq, const int, bool is
     }else if( alignmentMode == RnaMatcher::SCORE_COV){
         // "20%   30%   40%   50%   60%   70%   80%   90%   99%"
         // "0.52  1.12  1.73  2.33  2.93  3.53  4.14  4.74  5.28"
-        unsigned int qAlnLen = std::max(qEndPos - qStartPos, static_cast<unsigned int>(1));
-        unsigned int dbAlnLen = std::max(dbEndPos - dbStartPos, static_cast<unsigned int>(1));
+        unsigned int qAlnLen = std::max(qEndPos - qStartPos, 1);
+        unsigned int dbAlnLen = std::max(dbEndPos - dbStartPos, 1);
         //seqId = (alignment.score1 / static_cast<float>(std::max(qAlnLength, dbAlnLength)))  * 0.1656 + 0.1141;
         seqId = estimateSeqIdByScorePerCol(alignment.score1, qAlnLen, dbAlnLen);
     }else if ( alignmentMode == RnaMatcher::SCORE_ONLY){
-        unsigned int qAlnLen = std::max(qEndPos, static_cast<unsigned int>(1));
-        unsigned int dbAlnLen = std::max(dbEndPos, static_cast<unsigned int>(1));
+        unsigned int qAlnLen = std::max(qEndPos, 1);
+        unsigned int dbAlnLen = std::max(dbEndPos, 1);
         //seqId = (alignment.score1 / static_cast<float>(std::max(dbAlnLen, qAlnLen)))  * 0.1656 + 0.1141;
         seqId = estimateSeqIdByScorePerCol(alignment.score1, qAlnLen, dbAlnLen);
     }
