@@ -1,6 +1,7 @@
 #include <iomanip>
 #include <itoa.h>
 #include "RnaMatcher.h"
+#include "DinucleotideMapping.h"
 #include "Util.h"
 #include "Parameters.h"
 #include "RnaSmithWaterman.h"
@@ -77,15 +78,62 @@ RnaMatcher::result_t RnaMatcher::getSWResult(Sequence* dbSeq, const int, bool is
     float dbcov = 0.0;
     float seqId = 0.0;
 
-    const unsigned int qStartPos = alignment.qStartPos1;
-    const unsigned int dbStartPos = alignment.dbStartPos1;
-    const unsigned int qEndPos = alignment.qEndPos1;
-    const unsigned int dbEndPos = alignment.dbEndPos1;
+    int qStartPos = alignment.qStartPos1;
+    int dbStartPos = alignment.dbStartPos1;
+    int qEndPos = alignment.qEndPos1;
+    int dbEndPos = alignment.dbEndPos1;
+    unsigned int identicalNt = alignment.identicalAACnt;
+
+    // Since the match scores of the sentinals are usually negative,
+    // There are cases where the alignment is one position shorter.
+    // So dealing with this problem post hoc
+    if (isIdentity == false && qStartPos >= 0 && dbStartPos >= 0) {
+        const unsigned char *dinucToSecondNuc = getDinucToSecondNucTable();
+        const unsigned char *revcomp = m->num2revcompnum;
+        const unsigned char *qNum = currentQuery->numSequence;
+        const unsigned char *tNum = dbSeq->numSequence;
+        // di-mer codes 0..15 are the canonical pairs; 16+ are half-known or unknown
+        // sentinels whose missing half must never be treated as an aligned base.
+        const unsigned char CANONICAL = 16;
+
+        const int qBoundary  = reverse ? qStartPos  : qEndPos;
+        const int dbBoundary = reverse ? dbStartPos : dbEndPos;
+        const bool inRange = reverse ? (qStartPos > 0 && dbStartPos > 0)
+                                     : (qEndPos + 1 < currentQuery->L && dbEndPos + 1 < dbSeq->L);
+
+        if (inRange && qNum[qBoundary] < CANONICAL && tNum[dbBoundary] < CANONICAL) {
+            const unsigned char qBase = dinucToSecondNuc[qNum[qBoundary]];
+            // reverse-strand hits are scored against the complemented target di-mer,
+            // matching what computerBacktrace does for the columns it counts
+            const unsigned char tBase = reverse ? dinucToSecondNuc[revcomp[tNum[dbBoundary]]]
+                                                : dinucToSecondNuc[tNum[dbBoundary]];
+            if (qBase == tBase) {
+                if (reverse) {
+                    qStartPos--;
+                    dbStartPos--;
+                    backtrace.insert(backtrace.begin(), 'M');
+                } else {
+                    qEndPos++;
+                    dbEndPos++;
+                    backtrace.push_back('M');
+                }
+                identicalNt++;
+            }
+        }
+    }
+
     // normalize score
 //    alignment->score1 = alignment->score1 - log2(dbSeq->L);
     if(alignmentMode == RnaMatcher::SCORE_COV || alignmentMode == RnaMatcher::SCORE_COV_SEQID) {
-        qcov  = alignment.qCov;
-        dbcov = alignment.tCov;
+        if (qStartPos >= 0 && dbStartPos >= 0) {
+            // recompute from the nucleotide-space span; the aligner's qCov/tCov
+            // divide an edge count by a base count and are short by 1/L
+            qcov  = RnaSmithWaterman::computeCov(qStartPos, qEndPos, origQueryLen);
+            dbcov = RnaSmithWaterman::computeCov(dbStartPos, dbEndPos, dbSeq->L);
+        } else {
+            qcov  = alignment.qCov;
+            dbcov = alignment.tCov;
+        }
     }
 
     unsigned int alnLength = RnaMatcher::computeAlnLength(qStartPos, qEndPos, dbStartPos, dbEndPos);
@@ -96,7 +144,7 @@ RnaMatcher::result_t RnaMatcher::getSWResult(Sequence* dbSeq, const int, bool is
             // OVERWRITE alnLength with gapped value
             alnLength = backtrace.size();
         }
-        seqId = Util::computeSeqId(seqIdMode, alignment.identicalAACnt, origQueryLen, dbSeq->L, alnLength);
+        seqId = Util::computeSeqId(seqIdMode, identicalNt, origQueryLen, dbSeq->L, alnLength);
     }else if( alignmentMode == RnaMatcher::SCORE_COV){
         // "20%   30%   40%   50%   60%   70%   80%   90%   99%"
         // "0.52  1.12  1.73  2.33  2.93  3.53  4.14  4.74  5.28"

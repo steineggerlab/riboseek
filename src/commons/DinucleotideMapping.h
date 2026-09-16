@@ -6,9 +6,12 @@ class Sequence;
 // Register dinucleotide mapSequence callback via SeqAuxInfo
 void registerDinucleotideMapping();
 
-// Get the num2outputnum lookup table (maps dinuc encoding -> second nucleotide, numeric)
+// Get the num2outputnum lookup table (maps dinuc encoding -> first nucleotide, numeric)
 // Populated after registerDinucleotideMapping() + matrix setup
 const unsigned char* getDinucToNucTable();
+
+// Counterpart of getDinucToNucTable(): maps a dinuc encoding -> second nucleotide.
+const unsigned char* getDinucToSecondNucTable();
 
 // Re-encode a Sequence with reverse-shifted dinucleotide pairing.
 // Call after mapSequence() on target sequences when the query is on the reverse strand.

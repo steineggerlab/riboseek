@@ -265,8 +265,8 @@ s_align RnaSmithWaterman::ssw_align_private (
 		return align;
 	}
 
-	align.qCov = computeCov(0, align.qEndPos1, query_length);
-	align.tCov = computeCov(0, align.dbEndPos1, db_length);
+	align.qCov = computeCov(0, align.qEndPos1 + 1, query_length);
+	align.tCov = computeCov(0, align.dbEndPos1 + 1, db_length);
 
 	bool hasLowerCoverage = !(Util::hasCoverage(covThr, covMode, align.qCov, align.tCov));
 	align.evalue = rnaEvalueCorrection(evaluer->computeEvalue(align.score1, query_length));
@@ -529,8 +529,8 @@ s_align RnaSmithWaterman::alignStartPosBacktraceBlock(
 	r.qStartPos1 = (r.qEndPos1 + 1) - queryPos;
 	r.dbStartPos1 = (r.dbEndPos1 + 1) - targetPos;
 
-	r.qCov = computeCov(r.qStartPos1, r.qEndPos1, query_len);
-	r.tCov = computeCov(r.dbStartPos1, r.dbEndPos1, db_length);
+	r.qCov = computeCov(r.qStartPos1, r.qEndPos1 + 1, query_len);
+	r.tCov = computeCov(r.dbStartPos1, r.dbEndPos1 + 1, db_length);
 
 cleanup:
 	block_free_padded_aa(target);
@@ -627,8 +627,8 @@ s_align RnaSmithWaterman::alignStartPosBacktrace (
         EXIT(EXIT_FAILURE);
     }
 
-    r.qCov = computeCov(r.qStartPos1, r.qEndPos1, query_length);
-    r.tCov = computeCov(r.dbStartPos1, r.dbEndPos1, db_length);
+    r.qCov = computeCov(r.qStartPos1, r.qEndPos1 + 1, query_length);
+    r.tCov = computeCov(r.dbStartPos1, r.dbEndPos1 + 1, db_length);
     bool hasLowerCoverage = !(Util::hasCoverage(covThr, covMode, r.qCov, r.tCov));
 
     // only start and end point are needed
@@ -1768,8 +1768,11 @@ unsigned short RnaSmithWaterman::sse2_extract_epi16(__m128i v, int pos) {
 	return 0;
 }
 
+// Callers pass NUCLEOTIDE coordinates. Dinucleotide-space callers inside this file must
+// therefore pass endPos + 1: a span of n di-mer columns covers n + 1 bases (columns are
+// edges between bases), while len is a nucleotide length. See RnaMatcher::getSWResult.
 float RnaSmithWaterman::computeCov(unsigned int startPos, unsigned int endPos, unsigned int len) {
-	return (std::min(len, std::max(startPos, endPos)) - std::min(startPos, endPos) + 1) / (float) len;
+	return std::min(len, std::min(len, std::max(startPos, endPos)) - std::min(startPos, endPos) + 1) / (float) len;
 }
 
 s_align RnaSmithWaterman::scoreIdentical(unsigned char *dbSeq, int L, EvalueComputation * evaluer,

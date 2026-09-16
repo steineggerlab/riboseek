@@ -31,7 +31,8 @@ static void dinucDbgDump(const char *tag, unsigned int dbKey, const unsigned cha
 // Static lookup tables populated by dinucSetupMatrix
 static unsigned char dinucHead[256];      // dinuc code -> XN sentinel (first nuc as head)
 static unsigned char dinucTail[256];      // dinuc code -> NX sentinel (second nuc as tail)
-static unsigned char dinucToNucTbl[256];  // dinuc code -> second nucleotide (numeric)
+static unsigned char dinucToNucTbl[256];  // dinuc code -> first nucleotide (numeric)
+static unsigned char dinucToSecondNucTbl[256];  // dinuc code -> second nucleotide (numeric)
 static bool dinucTablesReady = false;
 static BaseMatrix *dinucAlignSubMat = NULL;  // bitFactor=2.0 for profile_for_alignment
 
@@ -240,7 +241,7 @@ static void dinucSetupMatrix(BaseMatrix *mat) {
     dinucTail[aa2num[(int)'Y']] = aa2num[(int)'X'];
     dinucTail[aa2num[(int)'X']] = aa2num[(int)'X'];
 
-    // dinucToNuc — maps dinucleotide encoding back to second nucleotide
+    // dinucToNuc — maps dinucleotide encoding back to its first nucleotide
     memset(dinucToNucTbl, 0, sizeof(dinucToNucTbl));
     // AA=C, AC=G, AG=L, AU=Q -> A
     dinucToNucTbl[aa2num[(int)'C']] = aa2num[(int)'A'];
@@ -273,6 +274,40 @@ static void dinucSetupMatrix(BaseMatrix *mat) {
     dinucToNucTbl[aa2num[(int)'O']] = aa2num[(int)'X'];
     dinucToNucTbl[aa2num[(int)'U']] = aa2num[(int)'X'];
     dinucToNucTbl[aa2num[(int)'X']] = aa2num[(int)'X'];
+
+    // dinucToSecondNuc — maps a dinucleotide encoding back to its second nucleotide
+    memset(dinucToSecondNucTbl, 0, sizeof(dinucToSecondNucTbl));
+    // AA=C, CA=D, GA=M, UA=E -> A
+    dinucToSecondNucTbl[aa2num[(int)'C']] = aa2num[(int)'A'];
+    dinucToSecondNucTbl[aa2num[(int)'D']] = aa2num[(int)'A'];
+    dinucToSecondNucTbl[aa2num[(int)'M']] = aa2num[(int)'A'];
+    dinucToSecondNucTbl[aa2num[(int)'E']] = aa2num[(int)'A'];
+    // AC=G, CC=F, GC=A, UC=N -> C
+    dinucToSecondNucTbl[aa2num[(int)'G']] = aa2num[(int)'C'];
+    dinucToSecondNucTbl[aa2num[(int)'F']] = aa2num[(int)'C'];
+    dinucToSecondNucTbl[aa2num[(int)'A']] = aa2num[(int)'C'];
+    dinucToSecondNucTbl[aa2num[(int)'N']] = aa2num[(int)'C'];
+    // AG=L, CG=R, GG=P, UG=H -> G
+    dinucToSecondNucTbl[aa2num[(int)'L']] = aa2num[(int)'G'];
+    dinucToSecondNucTbl[aa2num[(int)'R']] = aa2num[(int)'G'];
+    dinucToSecondNucTbl[aa2num[(int)'P']] = aa2num[(int)'G'];
+    dinucToSecondNucTbl[aa2num[(int)'H']] = aa2num[(int)'G'];
+    // AU=Q, CU=K, GU=I, UU=S -> U
+    dinucToSecondNucTbl[aa2num[(int)'Q']] = aa2num[(int)'U'];
+    dinucToSecondNucTbl[aa2num[(int)'K']] = aa2num[(int)'U'];
+    dinucToSecondNucTbl[aa2num[(int)'I']] = aa2num[(int)'U'];
+    dinucToSecondNucTbl[aa2num[(int)'S']] = aa2num[(int)'U'];
+    // XN sentinels (second nuc known)
+    dinucToSecondNucTbl[aa2num[(int)'B']] = aa2num[(int)'A'];
+    dinucToSecondNucTbl[aa2num[(int)'J']] = aa2num[(int)'C'];
+    dinucToSecondNucTbl[aa2num[(int)'O']] = aa2num[(int)'G'];
+    dinucToSecondNucTbl[aa2num[(int)'U']] = aa2num[(int)'U'];
+    // NX sentinels (second nuc unknown)
+    dinucToSecondNucTbl[aa2num[(int)'T']] = aa2num[(int)'X'];
+    dinucToSecondNucTbl[aa2num[(int)'V']] = aa2num[(int)'X'];
+    dinucToSecondNucTbl[aa2num[(int)'W']] = aa2num[(int)'X'];
+    dinucToSecondNucTbl[aa2num[(int)'Y']] = aa2num[(int)'X'];
+    dinucToSecondNucTbl[aa2num[(int)'X']] = aa2num[(int)'X'];
 
     dinucTablesReady = true;
 
@@ -546,6 +581,10 @@ static void dinucReverseComplement(unsigned char *numSequence, unsigned int L,
 
 const unsigned char* getDinucToNucTable() {
     return dinucToNucTbl;
+}
+
+const unsigned char* getDinucToSecondNucTable() {
+    return dinucToSecondNucTbl;
 }
 
 // void dinucEncodeReverse(Sequence *seq) {
