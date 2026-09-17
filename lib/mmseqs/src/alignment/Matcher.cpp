@@ -144,6 +144,16 @@ Matcher::result_t Matcher::getSWResult(Sequence* dbSeq, const int diagonal, bool
 }
 
 
+static Matcher::fragmentMergerFn fragmentMergerCallback = NULL;
+
+void Matcher::registerFragmentMerger(Matcher::fragmentMergerFn fn) {
+    fragmentMergerCallback = fn;
+}
+
+Matcher::fragmentMergerFn Matcher::getFragmentMerger() {
+    return fragmentMergerCallback;
+}
+
 void Matcher::readAlignmentResults(std::vector<result_t> &result, char *data, bool readCompressed) {
     if(data == NULL) {
         return;

@@ -57,14 +57,14 @@ TARGETDB="$2"
 TMP_PATH="$4"
 MERGE_INPUT=""
 
-# if [ -n "$NEEDTARGETSPLIT" ]; then
-#     if notExists "$TMP_PATH/target_seqs_split.dbtype"; then
-#         # shellcheck disable=SC2086
-#         "$MMSEQS" splitsequence "$TARGETDB" "$TMP_PATH/target_seqs_split" ${SPLITSEQUENCE_PAR}  \
-#             || fail "Split sequence died"
-#     fi
-#     TARGETDB="$TMP_PATH/target_seqs_split"
-# fi
+if [ -n "$NEEDTARGETSPLIT" ]; then
+    if notExists "$TMP_PATH/target_seqs_split.dbtype"; then
+        # shellcheck disable=SC2086
+        "$MMSEQS" splitsequence "$TARGETDB" "$TMP_PATH/target_seqs_split" ${SPLITSEQUENCE_PAR}  \
+            || fail "Split sequence died"
+    fi
+    TARGETDB="$TMP_PATH/target_seqs_split"
+fi
 
 # Target DB stores raw nucleotide characters. Set DINUCLEOTIDE flag so
 # Sequence::mapSequence uses dinucleotide pair encoding (via auxRegistry).
@@ -72,13 +72,13 @@ MERGE_INPUT=""
 # Also make soft-link to make the target DB dinucleotide-aware without altering the original target DB
 if [ -n "$SPLITSTRAND" ] && [ -z "$GPU" ] && [ -z "$HAVE_INDEX" ]; then
     if notExists "$TMP_PATH/target_db_dinuc.dbtype"; then
-        ln -s "$(abspath "$2")" "$TMP_PATH/target_db_dinuc"
-        ln -s "$(abspath "$2.index")" "$TMP_PATH/target_db_dinuc.index"
-        ln -s "$(abspath "${2}_h")" "$TMP_PATH/target_db_dinuc_h" 2>/dev/null || true
-        ln -s "$(abspath "${2}_h.index")" "$TMP_PATH/target_db_dinuc_h.index" 2>/dev/null || true
-        ln -s "$(abspath "${2}_h.dbtype")" "$TMP_PATH/target_db_dinuc_h.dbtype" 2>/dev/null || true
-        ln -s "$(abspath "${2}.lookup")" "$TMP_PATH/target_db_dinuc.lookup" 2>/dev/null || true
-        ln -s "$(abspath "${2}.source")" "$TMP_PATH/target_db_dinuc.source" 2>/dev/null || true
+        ln -s "$(abspath "$TARGETDB")" "$TMP_PATH/target_db_dinuc"
+        ln -s "$(abspath "$TARGETDB.index")" "$TMP_PATH/target_db_dinuc.index"
+        ln -s "$(abspath "${TARGETDB}_h")" "$TMP_PATH/target_db_dinuc_h" 2>/dev/null || true
+        ln -s "$(abspath "${TARGETDB}_h.index")" "$TMP_PATH/target_db_dinuc_h.index" 2>/dev/null || true
+        ln -s "$(abspath "${TARGETDB}_h.dbtype")" "$TMP_PATH/target_db_dinuc_h.dbtype" 2>/dev/null || true
+        ln -s "$(abspath "${TARGETDB}.lookup")" "$TMP_PATH/target_db_dinuc.lookup" 2>/dev/null || true
+        ln -s "$(abspath "${TARGETDB}.source")" "$TMP_PATH/target_db_dinuc.source" 2>/dev/null || true
         awk 'BEGIN { printf("%c%c%c%c",0,0,64,0); exit; }' > "$TMP_PATH/target_db_dinuc.dbtype"
     fi
     TARGETDB="$TMP_PATH/target_db_dinuc"

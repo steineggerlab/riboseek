@@ -4,6 +4,8 @@ set(rnautils_source_files
     rnautils/GenerateCm.cpp
     rnautils/splitstrand.cpp
     rnautils/RnaAlign.cpp
+    rnautils/FragmentMerge.cpp
+    rnautils/RnaRealign.cpp
     rnautils/RnaMatcher.cpp
     rnautils/RnaSmithWaterman.cpp)
 set(rnautils_source_files ${rnautils_source_files} PARENT_SCOPE)

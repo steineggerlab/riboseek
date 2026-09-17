@@ -995,6 +995,18 @@ Parameters::Parameters():
     mergeresultsbyset.push_back(&PARAM_V);
 
     // offsetalignment
+    // Forwarded so a registered fragment merger can re-align with exactly the same
+    // scoring the alignment module used (see Matcher::registerFragmentMerger).
+    offsetalignment.push_back(&PARAM_SUB_MAT);
+    offsetalignment.push_back(&PARAM_GAP_OPEN);
+    offsetalignment.push_back(&PARAM_GAP_EXTEND);
+    offsetalignment.push_back(&PARAM_NO_COMP_BIAS_CORR);
+    offsetalignment.push_back(&PARAM_NO_COMP_BIAS_CORR_SCALE);
+    offsetalignment.push_back(&PARAM_SCORE_BIAS);
+    offsetalignment.push_back(&PARAM_E);
+    offsetalignment.push_back(&PARAM_C);
+    offsetalignment.push_back(&PARAM_COV_MODE);
+    offsetalignment.push_back(&PARAM_SEQ_ID_MODE);
     offsetalignment.push_back(&PARAM_CHAIN_ALIGNMENT);
     offsetalignment.push_back(&PARAM_MERGE_QUERY);
     offsetalignment.push_back(&PARAM_SEARCH_TYPE);
