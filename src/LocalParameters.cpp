@@ -56,7 +56,15 @@ LocalParameters::LocalParameters() : Parameters(),
     PARAM_CMBUILD_MIN_ROW_COV(PARAM_CMBUILD_MIN_ROW_COV_ID, "--cmbuild-min-row-cov", "cmbuild minimum row coverage",
         "Drop MSA rows with non-gap coverage below this fraction",
         typeid(float), (void *) &cmbuildMinRowCov,
-        "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_PROFILE)
+        "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_PROFILE),
+    PARAM_TARGET_SPLIT_DB(PARAM_TARGET_SPLIT_DB_ID, "--target-split-db", "Pre-split target DB",
+        "Pre-computed splitsequence output of the target DB. When given, search reuses it instead of\n"
+        "splitting the target again, which saves the splitsequence pass and its temporary copy.\n"
+        "Build it with something like: riboseek splitsequence <targetDB> <splitDB> --max-seq-len N --sequence-overlap 0\n"
+        "The original target DB must still be passed as the target argument: coordinates are mapped\n"
+        "back through it and fragmented hits are re-aligned against it.\n",
+        typeid(std::string), (void *) &targetSplitDb,
+        "^.*$", MMseqsParameter::COMMAND_PREFILTER)
 {
     cmRegionFlanking = 1.0f;  // 1.0 => pad by full W (prior hardcoded behavior)
     cmScanCutoff = 0.0f;
@@ -70,6 +78,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuildSymfrac = -1.0;  // <0 => keep all columns (current default)
     cmbuildNoss = 0;        // use SS_cons (current default)
     cmbuildMinRowCov = 0.30f;
+    targetSplitDb = "";
 
     // Register dinuc.out as compiled-in matrix and set as default
     scoringMatrixFile = MultiParam<NuclAA<std::string>>(NuclAA<std::string>("dinuc.out", "dinuc.out"));
@@ -116,4 +125,8 @@ LocalParameters::LocalParameters() : Parameters(),
     // result2profile needs --strand so the RNA-corrected E-value gets the
     // both-strands doubling (matches MMseqs2 RNA fork behavior)
     result2profile.push_back(&PARAM_STRAND);
+
+    // Top-level search option only: the sub-modules never see it, so it is not
+    // added to any list that feeds createParameterString for prefilter/align.
+    searchworkflow.push_back(&PARAM_TARGET_SPLIT_DB);
 }

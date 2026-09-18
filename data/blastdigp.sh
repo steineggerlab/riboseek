@@ -57,7 +57,13 @@ TARGETDB="$2"
 TMP_PATH="$4"
 MERGE_INPUT=""
 
-if [ -n "$NEEDTARGETSPLIT" ]; then
+if [ -n "$TARGET_SPLIT_DB" ]; then
+    # Caller supplied a pre-split target DB, so skip splitsequence entirely.
+    # "$2" stays the original target DB: offsetalignment still needs it to map chunk
+    # coordinates back and to re-align hits fragmented across chunk boundaries.
+    [ ! -f "$TARGET_SPLIT_DB.dbtype" ] && fail "$TARGET_SPLIT_DB.dbtype not found!"
+    TARGETDB="$TARGET_SPLIT_DB"
+elif [ -n "$NEEDTARGETSPLIT" ]; then
     if notExists "$TMP_PATH/target_seqs_split.dbtype"; then
         # shellcheck disable=SC2086
         "$MMSEQS" splitsequence "$TARGETDB" "$TMP_PATH/target_seqs_split" ${SPLITSEQUENCE_PAR}  \

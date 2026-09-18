@@ -34,6 +34,7 @@ public:
     double cmbuildSymfrac;
     int cmbuildNoss;
     float cmbuildMinRowCov;
+    std::string targetSplitDb;
 
     PARAMETER(PARAM_CM_REGION)
     PARAMETER(PARAM_CM_SCAN_CUTOFF)
@@ -47,6 +48,7 @@ public:
     PARAMETER(PARAM_CMBUILD_SYMFRAC)
     PARAMETER(PARAM_CMBUILD_NOSS)
     PARAMETER(PARAM_CMBUILD_MIN_ROW_COV)
+    PARAMETER(PARAM_TARGET_SPLIT_DB)
 
     std::vector<MMseqsParameter*> splitstrand;
     std::vector<MMseqsParameter*> rnaalign;

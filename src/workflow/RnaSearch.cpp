@@ -47,6 +47,48 @@ int riboseekSearch(int argc, const char **argv, const Command &command) {
                         MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_PREFILTER);
 
     std::string indexStr = PrefilteringIndexReader::searchForIndex(par.db2);
+
+    if (par.targetSplitDb.empty() == false) {
+        // Catch the cheap mistakes here rather than several minutes into a search:
+        // a wrong path, or a DB that cannot be a split of this target.
+        if (FileUtil::fileExists((par.targetSplitDb + ".dbtype").c_str()) == false) {
+            Debug(Debug::ERROR) << "--target-split-db " << par.targetSplitDb
+                                << " not found (no " << par.targetSplitDb << ".dbtype).\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (FileUtil::fileExists((par.targetSplitDb + "_h.dbtype").c_str()) == false) {
+            // offsetalignment reads the chunk headers to recover each chunk's source
+            // entry and offset; without them the split DB is unusable.
+            Debug(Debug::ERROR) << "--target-split-db " << par.targetSplitDb
+                                << " has no header DB (" << par.targetSplitDb << "_h).\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const int splitDbType = FileUtil::parseDbType(par.targetSplitDb.c_str());
+        if (Parameters::isEqualDbtype(splitDbType, Parameters::DBTYPE_NUCLEOTIDES) == false) {
+            Debug(Debug::ERROR) << "--target-split-db " << par.targetSplitDb
+                                << " is not a nucleotide DB.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        // A split DB has one entry per chunk, so it can never hold fewer entries than
+        // the DB it came from. Equal counts are fine: that just means nothing exceeded
+        // --max-seq-len and every entry was kept whole.
+        DBReader<unsigned int> tReader(par.db2.c_str(), par.db2Index.c_str(), 1,
+                                       DBReader<unsigned int>::USE_INDEX);
+        tReader.open(DBReader<unsigned int>::NOSORT);
+        DBReader<unsigned int> sReader(par.targetSplitDb.c_str(), (par.targetSplitDb + ".index").c_str(), 1,
+                                       DBReader<unsigned int>::USE_INDEX);
+        sReader.open(DBReader<unsigned int>::NOSORT);
+        const size_t targetSize = tReader.getSize();
+        const size_t splitSize = sReader.getSize();
+        sReader.close();
+        tReader.close();
+        if (splitSize < targetSize) {
+            Debug(Debug::ERROR) << "--target-split-db " << par.targetSplitDb << " has "
+                                << splitSize << " entries, fewer than the " << targetSize
+                                << " in the target DB, so it is not a split of it.\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
     const bool queryProfileDb =
 	    Parameters::isEqualDbtype(FileUtil::parseDbType(par.db1.c_str()), Parameters::DBTYPE_HMM_PROFILE);
     const bool targetGpuDb =
@@ -129,10 +171,27 @@ int riboseekSearch(int argc, const char **argv, const Command &command) {
     cmd.addVariable("SPLITSTRAND", "TRUE");
     cmd.addVariable("QUERY_IS_PROFILE", queryProfileDb ? "TRUE" : NULL);
     cmd.addVariable("SPLITSEQUENCE_PAR", par.createParameterString(par.splitsequence).c_str());
-    // Match fork's behavior: single-iter splits target (via blastdi.sh);
-    // multi-iter skips target split (blastdigp.sh has the block commented out).
-    if (indexStr == "" && par.numIterations == 1) {
-        cmd.addVariable("NEEDTARGETSPLIT", "TRUE");
+    // The target split applies to every iteration, not just the first: prefilter, the
+    // alignment module and offsetalignment all run against the chunked DB, and the
+    // per-iteration subtractdbs compares pref_tmp_N against aln_double_(N-1), which are
+    // both in chunk key space. result2profile is the one consumer that needs the original
+    // target DB (blastdigp.sh sets R2P_TARGET="$2"), because offsetalignment has already
+    // mapped that iteration's alignments back to original coordinates.
+    // A precomputed index is the real exclusion: it is built over the unsplit target DB.
+    if (indexStr == "") {
+        if (par.targetSplitDb.empty()) {
+            cmd.addVariable("NEEDTARGETSPLIT", "TRUE");
+        } else {
+            // A pre-split target DB was supplied: hand it to the workflow and skip
+            // splitsequence. The original target DB stays par.db2, since offsetalignment
+            // maps chunk coordinates back through it and re-aligns fragments against it.
+            cmd.addVariable("TARGET_SPLIT_DB", par.targetSplitDb.c_str());
+        }
+    } else if (par.targetSplitDb.empty() == false) {
+        // Say so rather than accepting a flag that would be ignored.
+        Debug(Debug::ERROR) << "--target-split-db cannot be combined with a precomputed "
+                            << "target index: the index is built over the unsplit target DB.\n";
+        EXIT(EXIT_FAILURE);
     }
     cmd.addVariable("NEEDQUERYSPLIT", "TRUE");
     cmd.addVariable("SPLIT_STRAND_PAR",
