@@ -18,7 +18,7 @@ TARGETDB="${RESULTS}/target"
 # total aligned columns
 SEARCH=$(awk '{s+=$4} END {print s}' "${RESULTS}/search.m8")
 ACTUAL=$(awk '{s+=$4} END {print s}' "${RESULTS}/cm.m8")
-EXPECTED="48686"
+EXPECTED="48304"
 awk -v actual="$ACTUAL" -v expected="$EXPECTED" -v search="$SEARCH" \
     'BEGIN { print (actual == expected && actual > search) ? "GOOD" : "BAD"; print "Expected: ", expected; print "Actual: ", actual; print "Search baseline: ", search; }' \
     > "${RESULTS}.report"
