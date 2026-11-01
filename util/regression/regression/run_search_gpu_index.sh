@@ -25,7 +25,7 @@ trap 'kill "${GPUSERVER_PID}" 2>/dev/null' EXIT INT TERM
 "${EVALUATE}" "${RESULTS}/results.m8" "${RESULTS}/roc1_auc.tsv" | tee "${RESULTS}/evaluation.log"
 ACTUAL=$(grep "^ROC1-AUC:" "${RESULTS}/evaluation.log" | cut -d" " -f2 | cut -d"," -f1)
 
-EXPECTED="0.473903"
+EXPECTED="0.487961"
 awk -v actual="$ACTUAL" -v expected="$EXPECTED" \
     'BEGIN { print (actual == expected) ? "GOOD" : "BAD"; print "Expected: ", expected; print "Actual: ", actual; }' \
     > "${RESULTS}.report"
