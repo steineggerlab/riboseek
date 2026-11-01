@@ -3,11 +3,16 @@
 #include "LocalParameters.h"
 #include "DBReader.h"
 #include "SubstitutionMatrix.h"
-#include "EvalueComputation.h"
+#include "RnaEvalueComputation.h"
 #include "Sequence.h"
 #include "RnaMatcher.h"
+#include "TargetGcStat.h"
+#include "EvalueModel.h"
+#include "Debug.h"
+#include "Util.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
@@ -17,7 +22,7 @@ const unsigned int MAX_WINDOW = 64 * 1024;
 
 struct Context {
     SubstitutionMatrix *subMat;
-    EvalueComputation *evaluer;
+    RnaEvalueComputation *evaluer;
     int gapOpen;
     int gapExtend;
     int querySeqType;
@@ -28,6 +33,8 @@ struct Context {
     float covThr;
     double evalThr;
     int seqIdMode;
+    bool profileQuery;   // the realigned query is a genuine profile (iterations after the first)
+    bool strandDb;       // queries come from the iteration's strand-split DB (exact rnaalign query)
 };
 
 struct ThreadLocal {
@@ -42,8 +49,8 @@ bool ctxReady = false;
 std::vector<ThreadLocal> threadLocals;
 
 // Built on first use: the hook is installed at start-up, long before parameters are
-// parsed, and the E-value statistics need the real target database size.
-void ensureContext(size_t targetTotalResidues) {
+// parsed, and the E-value model needs the real target database.
+void ensureContext(DBReader<unsigned int> *targetDb, int queryDbType, int threadIdx) {
     if (ctxReady) {
         return;
     }
@@ -56,17 +63,49 @@ void ensureContext(size_t targetTotalResidues) {
     ctx->subMat = new SubstitutionMatrix(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, par.scoreBias);
     ctx->gapOpen = par.gapOpen.values.aminoacid();
     ctx->gapExtend = par.gapExtend.values.aminoacid();
-    ctx->evaluer = new EvalueComputation(targetTotalResidues ? targetTotalResidues : 1,
+    const size_t targetTotalResidues = targetDb->getAminoAcidDBSize();
+    ctx->evaluer = new RnaEvalueComputation(targetTotalResidues ? targetTotalResidues : 1,
                                          ctx->subMat, ctx->gapOpen, ctx->gapExtend, true, false);
-    // Match the align module: the query is scored as a PROFILE. splitstrand types the
-    // query DB as HMM_PROFILE | SRC_SEQUENCE while leaving raw characters on disk, and
-    // Sequence::mapSequence then builds the profile on the fly via
-    // dinucMapProfile -> dinucBuildProfileFromSequence. Declaring the same type here
-    // reproduces that, so ssw_init takes the profile path with the identical scale
-    // instead of falling back to the raw substitution matrix.
+    // The query is the one rnaalign aligned in this iteration: a genuine profile (strand-split
+    // result2profile output, base type HMM_PROFILE) or the sequence. It gets the same per-query
+    // model and the same kind of target GC histogram as rnaalign -- of the ORIGINAL target, which
+    // is what the realigned hit is reported against (2026-10-20).
     const uint16_t dinuc = LocalParameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
-    ctx->querySeqType = DBReader<unsigned int>::setExtendedDbtype(
-        Parameters::DBTYPE_HMM_PROFILE, dinuc | Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE);
+    const uint16_t strandSplit = LocalParameters::DBTYPE_EXTENDED_STRAND_SPLIT;
+    ctx->profileQuery = queryDbType >= 0 && Parameters::isEqualDbtype(queryDbType, Parameters::DBTYPE_HMM_PROFILE)
+                        && (DBReader<unsigned int>::getExtendedDbtype(queryDbType) & Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE) == 0;
+    ctx->strandDb = queryDbType >= 0;
+    ctx->evaluer->setProfileQuery(ctx->profileQuery);
+    bool precomputed = false;
+    const std::string targetName = targetDb->getDataFileName();
+    TargetGcStat st = TargetGcStat::forTarget(targetName, targetDb, (double)targetTotalResidues, precomputed, threadIdx);
+    if (st.empty()) {
+        Debug(Debug::ERROR) << "Cannot compute E-values for re-aligned fragments: the target database "
+                            << targetName << " has no A/C/G/U residues to build its GC statistic from.\n";
+        EXIT(EXIT_FAILURE);
+    }
+    ctx->evaluer->setTargetGcHistogram(st.deriveHistogram(4, EvalueModel::R0_TARGET_LEN, (double)targetTotalResidues));
+    Debug(Debug::INFO) << "E-value for re-aligned fragments: per-query " << (ctx->profileQuery ? "profile" : "sequence")
+                       << " model (query " << (ctx->strandDb ? "as aligned in this iteration" : "sequence, legacy path")
+                       << "), target GC histogram "
+                       << (precomputed ? "from " : "sampled from ") << st.nSeq << " sequences of " << targetName
+                       << (precomputed ? " (precomputed)" : "") << "\n";
+    // Match the align module's query type exactly (the dbtype the workflow gives rnaalign's query):
+    //  - first iteration, a sequence: HMM_PROFILE | strand-split | dinucleotide | SRC_SEQUENCE. Raw
+    //    characters on disk; Sequence::mapSequence builds the profile on the fly
+    //    (dinucMapProfile -> dinucBuildProfileFromSequence), reversed for an odd (reverse) key;
+    //  - later iterations, a profile: HMM_PROFILE | strand-split; the odd key holds splitstrand's
+    //    reverse-complemented profile, and ssw_init turns its features forward-equivalent.
+    // The legacy path (no strand DB) keeps its old type: sequence, reverse built from the text.
+    if (ctx->profileQuery) {
+        ctx->querySeqType = DBReader<unsigned int>::setExtendedDbtype(Parameters::DBTYPE_HMM_PROFILE, strandSplit);
+    } else if (ctx->strandDb) {
+        ctx->querySeqType = DBReader<unsigned int>::setExtendedDbtype(
+            Parameters::DBTYPE_HMM_PROFILE, strandSplit | dinuc | Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE);
+    } else {
+        ctx->querySeqType = DBReader<unsigned int>::setExtendedDbtype(
+            Parameters::DBTYPE_HMM_PROFILE, dinuc | Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE);
+    }
     ctx->targetSeqType = DBReader<unsigned int>::setExtendedDbtype(
         Parameters::DBTYPE_AMINO_ACIDS, dinuc);
     ctx->compBiasCorrection = par.compBiasCorrection;
@@ -101,16 +140,17 @@ unsigned int rnaRealignMaxWindow() {
     return MAX_WINDOW;
 }
 
-bool rnaRealignWindow(const char *querySeq, unsigned int queryLen, bool reverse,
+bool rnaRealignWindow(const char *queryData, unsigned int queryLen, int queryDbType,
+                      unsigned int queryEntryKey, bool reverse,
                       const char *targetWindow, unsigned int windowLen,
                       unsigned int queryKey, unsigned int targetKey,
-                      size_t targetTotalResidues, int threadIdx,
+                      DBReader<unsigned int> *targetDb, int threadIdx,
                       RnaRealignHit &out, std::string &backtrace) {
-    if (querySeq == NULL || targetWindow == NULL || queryLen == 0 || windowLen == 0
+    if (queryData == NULL || targetWindow == NULL || queryLen == 0 || windowLen == 0
         || windowLen > MAX_WINDOW || queryLen > MAX_WINDOW) {
         return false;
     }
-    ensureContext(targetTotalResidues);
+    ensureContext(targetDb, queryDbType, threadIdx);
     if (ctx == NULL || (size_t)threadIdx >= threadLocals.size()) {
         return false;
     }
@@ -123,19 +163,23 @@ bool rnaRealignWindow(const char *querySeq, unsigned int queryLen, bool reverse,
                                     ctx->gapOpen, ctx->gapExtend, 0.0f, 0);
     }
 
-    std::string qRev;
-    const char *qUse = querySeq;
-    if (reverse) {
-        qRev.assign(queryLen, 'N');
-        for (unsigned int i = 0; i < queryLen; i++) {
-            qRev[i] = complementBase(querySeq[queryLen - 1 - i]);
+    if (ctx->strandDb) {
+        // the strand copy rnaalign aligned, under its own key (parity = strand)
+        tl.qSeq->mapSequence(0, queryEntryKey, queryData, queryLen);
+    } else {
+        std::string qRev;
+        const char *qUse = queryData;
+        if (reverse) {
+            qRev.assign(queryLen, 'N');
+            for (unsigned int i = 0; i < queryLen; i++) {
+                qRev[i] = complementBase(queryData[queryLen - 1 - i]);
+            }
+            qUse = qRev.c_str();
         }
-        qUse = qRev.c_str();
+        // dbKey 0 (even) on purpose: dinucBuildProfileFromSequence reverses the profile for
+        // odd keys, and the reverse strand is already handled by revcomp'ing qUse above.
+        tl.qSeq->mapSequence(0, 0, qUse, queryLen);
     }
-
-    // dbKey 0 (even) on purpose: dinucBuildProfileFromSequence reverses the profile for
-    // odd keys, and the reverse strand is already handled by revcomp'ing qUse above.
-    tl.qSeq->mapSequence(0, 0, qUse, queryLen);
     tl.wSeq->mapSequence(0, targetKey, targetWindow, windowLen);
     tl.matcher->initQuery(tl.qSeq);
     RnaMatcher::result_t r = tl.matcher->getSWResult(tl.wSeq, 0, false, ctx->covMode, ctx->covThr,

@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <cmath>
+#include <vector>
 #include "LocalParameters.h"
 #include "LocalCommandDeclarations.h"
 #include "Debug.h"
@@ -6,7 +9,7 @@
 #include "IndexReader.h"
 #include "NucleotideMatrix.h"
 #include "SubstitutionMatrix.h"
-#include "EvalueComputation.h"
+#include "RnaEvalueComputation.h"
 #include "QueryMatcher.h"
 #include "FileUtil.h"
 #include "Sequence.h"
@@ -14,6 +17,7 @@
 #include "FastSort.h"
 #include "RnaMatcher.h"
 #include "DinucleotideMapping.h"
+#include "TargetGcStat.h"
 
 #ifdef OPENMP
 #include <omp.h>
@@ -207,8 +211,42 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     }
 
     size_t effectiveDbSize = targetDbSize == 0 ? tdbr->getAminoAcidDBSize() : targetDbSize;
-    EvalueComputation evaluer(effectiveDbSize, &subMat, gapOpen, gapExtend,
+    RnaEvalueComputation evaluer(effectiveDbSize, &subMat, gapOpen, gapExtend,
                               bothStrands, /*useRnaCorrection=*/false);
+    const bool profileQuery =
+        Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_HMM_PROFILE)
+        && (DBReader<unsigned int>::getExtendedDbtype(querySeqType)
+            & Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE) == 0;
+    evaluer.setProfileQuery(profileQuery);
+
+    bool precomputed = false;
+    TargetGcStat st = TargetGcStat::forTarget(par.db2, tdbr, (double)effectiveDbSize, precomputed);
+    if (st.empty()) {
+        Debug(Debug::ERROR) << "Cannot compute E-values: the target database has no A/C/G/U residues to "
+                            << "build its GC statistic from (read as " << par.db2 << "). E-values need a "
+                            << "nucleotide target database.\n";
+        EXIT(EXIT_FAILURE);
+    }
+    std::vector<std::pair<double, double> > hist =
+        st.deriveHistogram(4, EvalueModel::R0_TARGET_LEN, (double)effectiveDbSize);
+    evaluer.setTargetGcHistogram(hist);
+    /*
+    Debug(Debug::INFO) << "E-value: per-query " << (profileQuery ? "profile" : "sequence") << " model"
+                       << (profileQuery ? " (free per-profile lambda and mu, no lambda_KA)" : "")
+                       << ", K correction; target GC histogram "
+                       << (precomputed ? "from " : "sampled from ")
+                       << st.nSeq << " of " << tdbr->getSize() << " sequences"
+                       << (precomputed ? " (precomputed)" : "")
+                       << " (weights are residues / " << EvalueModel::R0_TARGET_LEN << "):";
+    for (size_t b = 0; b < hist.size(); b++) {
+        Debug(Debug::INFO) << " [" << hist[b].first << " x " << hist[b].second << "]";
+    }
+    Debug(Debug::INFO) << "\n";
+    */
+    if (precomputed == false && tdbr->getSize() > 200000) {
+        Debug(Debug::WARNING) << "Target GC was sampled, not scanned. Run `riboseek rnagcstat "
+                              << par.db2 << "` once to precompute it.\n";
+    }
 
     Debug(Debug::INFO) << "Query database size: " << qdbr->getSize() << " type: " << Parameters::getDbTypeName(querySeqType) << "\n";
     Debug(Debug::INFO) << "Target database size: " << tdbr->getSize() << " type: " << Parameters::getDbTypeName(targetSeqType) << "\n";

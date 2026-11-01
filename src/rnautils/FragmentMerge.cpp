@@ -3,8 +3,12 @@
 
 #include "Matcher.h"
 #include "DBReader.h"
+#include "LocalParameters.h"
+#include "Debug.h"
+#include "Util.h"
 
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -27,6 +31,22 @@ namespace {
 const int JOIN_TOLERANCE = 50;
 // A lone hit covering less than this fraction of the query may have been cut by a boundary.
 const float FULL_COVERAGE = 0.95f;
+
+// The iteration's strand-split query DB (--realign-query-db, set by the search workflow): the exact query rnaalign aligned
+DBReader<unsigned int> *strandQueries = NULL;
+std::once_flag strandQueriesOnce;
+DBReader<unsigned int> *openStrandQueries() {
+    std::call_once(strandQueriesOnce, []() {
+        LocalParameters &par = LocalParameters::getLocalInstance();
+        if (par.realignQueryDb.empty()) {
+            return;
+        }
+        strandQueries = new DBReader<unsigned int>(par.realignQueryDb.c_str(), (par.realignQueryDb + ".index").c_str(),
+                                                   par.threads, DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
+        strandQueries->open(DBReader<unsigned int>::NOSORT);
+    });
+    return strandQueries;
+}
 
 void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryKey,
                     DBReader<unsigned int> *qSource, DBReader<unsigned int> *tSource,
@@ -79,12 +99,21 @@ void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryK
         bool replaced = false;
         if (looksFragmented) {
             const size_t tId = tSource->getId(results[i].dbKey);
-            const size_t qId = qSource->getId(queryKey);
+            // the query exactly as rnaalign aligned it in this iteration, if the workflow passed it
+            DBReader<unsigned int> *sq = openStrandQueries();
+            const unsigned int entryKey = 2 * queryKey + (reverse ? 1 : 0);
+            DBReader<unsigned int> *qDb = (sq != NULL) ? sq : qSource;
+            const size_t qId = qDb->getId(sq != NULL ? entryKey : queryKey);
+            if (sq != NULL && qId == UINT_MAX) {
+                Debug(Debug::ERROR) << "Query " << queryKey << " has no entry " << entryKey << " in "
+                                    << sq->getDataFileName() << ", the query DB the fragments must be re-aligned with.\n";
+                EXIT(EXIT_FAILURE);
+            }
             if (tId != UINT_MAX && qId != UINT_MAX) {
                 const char *tData = tSource->getData(tId, threadIdx);
                 const int tLen = static_cast<int>(tSource->getSeqLen(tId));
-                const char *qData = qSource->getData(qId, threadIdx);
-                const unsigned int qDataLen = qSource->getSeqLen(qId);
+                const char *qData = qDb->getData(qId, threadIdx);
+                const unsigned int qDataLen = qDb->getSeqLen(qId);
                 // window the ORIGINAL target so the realignment can cross the old boundary
                 const int pad = static_cast<int>(qDataLen);
                 const int wStart = std::max(0, tLo - pad);
@@ -93,13 +122,14 @@ void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryK
                 if (wLen > 0 && (unsigned int)wLen <= rnaRealignMaxWindow()) {
                     RnaRealignHit hit;
                     std::string backtrace;
-                    if (rnaRealignWindow(qData, qDataLen, reverse, tData + wStart, wLen,
+                    if (rnaRealignWindow(qData, qDataLen, sq != NULL ? sq->getDbtype() : -1, entryKey, reverse,
+                                         tData + wStart, wLen,
                                          queryKey, results[i].dbKey,
-                                         tSource->getAminoAcidDBSize(), threadIdx,
-                                         hit, backtrace)) {
-                        // The realignment now scores the query as a profile, exactly as
-                        // the align module does, so its score and E-value are on the same
-                        // scale as every other hit and can be adopted directly.
+                                         tSource, threadIdx, hit, backtrace)) {
+                        // The realignment scores the query the same way the align module
+                        // does and its evaluer carries the same dinucleotide calibration,
+                        // so score and E-value are on one scale with every other hit and
+                        // can be adopted directly.
                         Matcher::result_t m = results[i];   // keep orf position fields
                         m.score = hit.score;
                         m.eval = hit.eval;

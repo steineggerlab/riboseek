@@ -24,7 +24,10 @@
    Please send bug reports and/or suggestions to martin.steinegger@snu.ac.kr.
 */
 #include "Parameters.h"
+#include "LocalParameters.h"
+#include "DBReader.h"
 #include "RnaSmithWaterman.h"
+#include <atomic>
 #include "RnaMatcher.h"
 #include "UngappedAlignment.h"
 #include "DinucleotideMapping.h"
@@ -226,7 +229,7 @@ s_align RnaSmithWaterman::ssw_align (
         const uint8_t gap_extend,
         const uint8_t alignmentMode,	//  (from high to low) bit 5: return the best alignment beginning position; 6: if (ref_end1 - ref_begin1 <= filterd) && (read_end1 - read_begin1 <= filterd), return cigar; 7: if max score >= filters, return cigar; 8: always return cigar; if 6 & 7 are both setted, only return cigar when both filter fulfilled
         const double  evalueThr,
-        EvalueComputation * evaluer,
+        RnaEvalueComputation * evaluer,
         const int covMode, const float covThr, const float correlationScoreWeight,
         const int32_t maskLen, const bool reverse) {
     s_align alignment;
@@ -251,7 +254,7 @@ s_align RnaSmithWaterman::ssw_align_private (
 	const uint8_t gap_extend,
 	const uint8_t alignmentMode,	//  (from high to low) bit 5: return the best alignment beginning position; 6: if (ref_end1 - ref_begin1 <= filterd) && (read_end1 - read_begin1 <= filterd), return cigar; 7: if max score >= filters, return cigar; 8: always return cigar; if 6 & 7 are both setted, only return cigar when both filter fulfilled
 	const double  evalueThr,
-	EvalueComputation * evaluer,
+	RnaEvalueComputation * evaluer,
 	const int covMode, const float covThr, const float correlationScoreWeight,
 	const int32_t maskLen, const bool reverse) {
 
@@ -269,7 +272,7 @@ s_align RnaSmithWaterman::ssw_align_private (
 	align.tCov = computeCov(0, align.dbEndPos1 + 1, db_length);
 
 	bool hasLowerCoverage = !(Util::hasCoverage(covThr, covMode, align.qCov, align.tCov));
-	align.evalue = rnaEvalueCorrection(evaluer->computeEvalue(align.score1, query_length));
+	align.evalue = evaluer->computeRnaEvalue(align.score1, query_length, profile->queryGc, profile->neffFrac, &profile->evalueCache, &profile->evalueFeatures);
 	bool hasLowerEvalue = align.evalue > evalueThr;
 
 	if (alignmentMode == 0) {
@@ -553,7 +556,7 @@ s_align RnaSmithWaterman::alignStartPosBacktrace (
         const uint8_t alignmentMode,	//  (from high to low) bit 5: return the best alignment beginning position; 6: if (ref_end1 - ref_begin1 <= filterd) && (read_end1 - read_begin1 <= filterd), return cigar; 7: if max score >= filters, return cigar; 8: always return cigar; if 6 & 7 are both setted, only return cigar when both filter fulfilled
         std::string & backtrace,
         s_align r,
-		EvalueComputation * evaluer,
+		RnaEvalueComputation * evaluer,
         const int covMode, const float covThr,
 		const float correlationScoreWeight,
         const int32_t maskLen,
@@ -668,7 +671,7 @@ s_align RnaSmithWaterman::alignStartPosBacktrace (
 	if(correlationScoreWeight > 0.0){
         int correlationScore = computeCorrelationScore(scorePerCol, mStateCnt);
         r.score1 += static_cast<float>(correlationScore) * correlationScoreWeight;
-        r.evalue = rnaEvalueCorrection(evaluer->computeEvalue(r.score1, query_length));
+        r.evalue = evaluer->computeRnaEvalue(r.score1, query_length, profile->queryGc, profile->neffFrac, &profile->evalueCache, &profile->evalueFeatures);
     }
 	if(path != NULL) {
         delete path;
@@ -677,9 +680,9 @@ s_align RnaSmithWaterman::alignStartPosBacktrace (
 }
 
 template
-s_align RnaSmithWaterman::ssw_align_private<RnaSmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const bool);
+s_align RnaSmithWaterman::ssw_align_private<RnaSmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, RnaEvalueComputation*, const int, const float, const float, const int32_t, const bool);
 template
-s_align RnaSmithWaterman::ssw_align_private<RnaSmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const bool);
+s_align RnaSmithWaterman::ssw_align_private<RnaSmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, RnaEvalueComputation*, const int, const float, const float, const int32_t, const bool);
 
 template
 s_align RnaSmithWaterman::alignScoreEndPos<RnaSmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const int32_t);
@@ -692,9 +695,9 @@ template
 s_align RnaSmithWaterman::alignStartPosBacktraceBlock<RnaSmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, std::string&, s_align);
 
 template
-s_align RnaSmithWaterman::alignStartPosBacktrace<RnaSmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const uint8_t, std::string&, s_align, EvalueComputation*, const int, const float, const float, const int32_t, const bool);
+s_align RnaSmithWaterman::alignStartPosBacktrace<RnaSmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const uint8_t, std::string&, s_align, RnaEvalueComputation*, const int, const float, const float, const int32_t, const bool);
 template
-s_align RnaSmithWaterman::alignStartPosBacktrace<RnaSmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const uint8_t, std::string&, s_align, EvalueComputation*, const int, const float, const float, const int32_t, const bool);
+s_align RnaSmithWaterman::alignStartPosBacktrace<RnaSmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const uint8_t, std::string&, s_align, RnaEvalueComputation*, const int, const float, const float, const int32_t, const bool);
 
 void RnaSmithWaterman::computerBacktrace(s_profile * query, const unsigned char * db_sequence,
                                       s_align & alignment, std::string & backtrace,
@@ -1339,6 +1342,7 @@ std::pair<RnaSmithWaterman::alignment_end, RnaSmithWaterman::alignment_end> RnaS
 void RnaSmithWaterman::ssw_init(const Sequence* q,
 							 const int8_t* mat,
 							 const BaseMatrix *m) {
+	const unsigned int qDbKey = const_cast<Sequence *>(q)->getDbKey();
 	//init profile
     profile->bias = 0;
 	profile->query_length = q->L;
@@ -1413,6 +1417,80 @@ void RnaSmithWaterman::ssw_init(const Sequence* q,
             }
         }
     }
+
+	{
+		const bool genuineProfile = isProfile
+			&& (DBReader<unsigned int>::getExtendedDbtype(q->getSequenceType())
+			    & Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE) == 0;
+		
+		const bool isStrandSplit =
+			(DBReader<unsigned int>::getExtendedDbtype(q->getSequenceType())
+			 & LocalParameters::DBTYPE_EXTENDED_STRAND_SPLIT) != 0;
+
+		const bool reverseCopy = genuineProfile && isStrandSplit
+		                         && (qDbKey % 2 == 1);
+		const unsigned char *d2n = reverseCopy ? getDinucToSecondNucTable()
+		                                       : getDinucToNucTable();
+		const unsigned char gCode = m->aa2num[(int)'G'];
+		const unsigned char cCode = m->aa2num[(int)'C'];
+
+		double gc = 0.0;
+		if (genuineProfile) {
+			for (int j = 0; j < q->L; j++) {
+				double sum = 0.0, gcSum = 0.0;
+				for (int a = 0; a < 16; a++) {
+					double pa = std::pow(2.0,
+						q->profile_score[j * q->profile_row_size + a] / 2.0);
+					sum += pa;
+					const unsigned char n = d2n[a];
+					if (n == gCode || n == cCode) gcSum += pa;
+				}
+				if (sum > 0) gc += gcSum / sum;
+			}
+		} else {
+			for (int j = 0; j < q->L; j++) {
+				const unsigned char n = d2n[q->numSequence[j]];
+				if (n == gCode || n == cCode) gc += 1.0;
+			}
+		}
+		profile->queryGc = (q->L > 0) ? gc / q->L : 0.5;
+
+		double neffByte = 0.0;
+		if (genuineProfile && q->neffM != NULL) {
+			for (int j = 0; j < q->L; j++) {
+				double v = q->neffM[j];
+				if (v > 0) neffByte += 64.0 * (std::log(v) / std::log(2.0)) + 1.0;
+			}
+			neffByte = (q->L > 0) ? neffByte / q->L : 0.0;
+		}
+		profile->neffFrac = neffByte / 255.0;
+
+		RnaEvalueComputation::ProfileEvalueFeatures &pf = profile->evalueFeatures;
+		pf.valid = false;
+		pf.het = -1.0;
+		if (!genuineProfile) {
+			const char *sd = const_cast<Sequence *>(q)->getSeqData();
+			std::vector<char> isGc((size_t)q->L);
+			for (int j = 0; j < q->L; j++) {
+				const char ch = sd[j];
+				isGc[j] = (ch == 'G' || ch == 'C' || ch == 'g' || ch == 'c');
+			}
+			pf.het = RnaEvalueComputation::windowGcSd(isGc, EvalueModelSeq4::HETW);
+		}
+		if (genuineProfile) {
+			static std::atomic<unsigned long> featureSerial(0);
+			const int *rc = RnaEvalueComputation::stateRevcomp();
+			pf.S.resize((size_t)q->L * 16);
+			for (int j = 0; j < q->L; j++) {
+				for (int a = 0; a < 16; a++) {
+					const int src = reverseCopy ? rc[a] : a;
+					pf.S[(size_t)j * 16 + a] = (float)q->profile_score[j * q->profile_row_size + src];
+				}
+			}
+			RnaEvalueComputation::fillProfileFeatures(pf, q->L, profile->neffFrac);
+			pf.serial = ++featureSerial;
+		}
+	}
 
 	// create reverse structures
 	std::reverse_copy(profile->query_sequence, profile->query_sequence + q->L, profile->query_rev_sequence);
@@ -1775,7 +1853,7 @@ float RnaSmithWaterman::computeCov(unsigned int startPos, unsigned int endPos, u
 	return std::min(len, std::min(len, std::max(startPos, endPos)) - std::min(startPos, endPos) + 1) / (float) len;
 }
 
-s_align RnaSmithWaterman::scoreIdentical(unsigned char *dbSeq, int L, EvalueComputation * evaluer,
+s_align RnaSmithWaterman::scoreIdentical(unsigned char *dbSeq, int L, RnaEvalueComputation * evaluer,
                                       int alignmentMode, std::string &backtrace) {
 	if(profile->query_length != L){
 		std::cerr << "scoreIdentical has different length L: "
@@ -1807,7 +1885,7 @@ s_align RnaSmithWaterman::scoreIdentical(unsigned char *dbSeq, int L, EvalueComp
         backtrace.push_back('M');
 	}
 	r.score1=score;
-	r.evalue = rnaEvalueCorrection(evaluer->computeEvalue(r.score1, profile->query_length));
+	r.evalue = evaluer->computeRnaEvalue(r.score1, profile->query_length, profile->queryGc, profile->neffFrac, &profile->evalueCache, &profile->evalueFeatures);
     r.identicalAACnt = L;
 	return r;
 }

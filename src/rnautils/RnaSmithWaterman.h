@@ -44,7 +44,7 @@
 #include "BaseMatrix.h"
 
 #include "Sequence.h"
-#include "EvalueComputation.h"
+#include "RnaEvalueComputation.h"
 
 struct s_block;
 
@@ -110,6 +110,12 @@ public:
         int8_t* mat_rev; // needed for queryProfile
         int8_t* pos_aa_rev;
         int32_t query_length;
+        // Features the calibrated E-value model reads
+        double queryGc;
+        double neffFrac;
+        // (lambda, mu) per target-GC bin for the query
+        RnaEvalueComputation::QueryEvalueCache evalueCache;
+        RnaEvalueComputation::ProfileEvalueFeatures evalueFeatures;
         // int32_t sequence_type;
         int32_t alphabetSize;
         uint8_t bias;
@@ -191,7 +197,7 @@ public:
         const uint8_t alignmentMode,
         std::string & backtrace,
         s_align r,
-        EvalueComputation * evaluer,
+        RnaEvalueComputation * evaluer,
         const int covMode,
         const float covThr,
         const float correlationScoreWeight,
@@ -214,7 +220,7 @@ public:
                         const uint8_t gap_extend,
                         const uint8_t alignmentMode,	//  (from high to low) bit 5: return the best alignment beginning position; 6: if (ref_end1 - ref_begin1 <= filterd) && (read_end1 - read_begin1 <= filterd), return cigar; 7: if max score >= filters, return cigar; 8: always return cigar; if 6 & 7 are both setted, only return cigar when both filter fulfilled
                         const double filters,
-                        EvalueComputation * filterd,
+                        RnaEvalueComputation * filterd,
                         const int covMode, const float covThr, const float correlationScoreWeight,
                         const int32_t maskLen, const bool reverse=false);
 
@@ -260,7 +266,7 @@ public:
     int isProfileSearch(){
         return profile->isProfile;
     }
-    s_align scoreIdentical(unsigned char *dbSeq, int L, EvalueComputation * evaluer, int alignmentMode, std::string &backtrace);
+    s_align scoreIdentical(unsigned char *dbSeq, int L, RnaEvalueComputation * evaluer, int alignmentMode, std::string &backtrace);
 
     static void seq_reverse(int8_t * reverse, const int8_t* seq, int32_t end)	/* end is 0-based alignment ending position */
     {
@@ -323,7 +329,7 @@ private:
                         const uint8_t gap_extend,
                         const uint8_t alignmentMode,	//  (from high to low) bit 5: return the best alignment beginning position; 6: if (ref_end1 - ref_begin1 <= filterd) && (read_end1 - read_begin1 <= filterd), return cigar; 7: if max score >= filters, return cigar; 8: always return cigar; if 6 & 7 are both setted, only return cigar when both filter fulfilled
                         const double filters,
-                        EvalueComputation * filterd,
+                        RnaEvalueComputation * filterd,
                         const int covMode, const float covThr, const float correlationScoreWeight,
                         const int32_t maskLen, const bool reverse=false);
 
