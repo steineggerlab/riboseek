@@ -12,21 +12,6 @@
 #include <cctype>
 #include <cstring>
 #include <vector>
-#include <cstdio>
-#include <mutex>
-
-static void dinucDbgDump(const char *tag, unsigned int dbKey, const unsigned char *num, unsigned int L) {
-    if (dbKey > 2) return;
-    static std::mutex m;
-    std::lock_guard<std::mutex> lk(m);
-    FILE *f = fopen("/tmp/riboseek_dbg.txt", "a");
-    if (!f) return;
-    fprintf(f, "%s key=%u L=%u |", tag, dbKey, L);
-    unsigned int n = L < 64 ? L : 64;
-    for (unsigned int i = 0; i < n; i++) fprintf(f, " %02x", num[i]);
-    fprintf(f, "\n");
-    fclose(f);
-}
 
 // Static lookup tables populated by dinucSetupMatrix
 static unsigned char dinucHead[256];      // dinuc code -> XN sentinel (first nuc as head)
@@ -467,7 +452,6 @@ static void dinucMapSequence(Sequence *seq, const char *sequence, unsigned int d
     }
     numSequence[i] = aa2num[(s_1 << 8) | (unsigned int)'X'];
     seq->L = i + 1;
-    dinucDbgDump("RBS mapSeq", seq->getDbKey(), numSequence, seq->L);
 }
 
 static void dinucMapSequenceReverse(Sequence *seq, const char *sequence, unsigned int dataLen) {
@@ -490,7 +474,6 @@ static void dinucMapSequenceReverse(Sequence *seq, const char *sequence, unsigne
         s_1 = s_2;
     }
     seq->L = i;
-    dinucDbgDump("RBS mapSeqRev", seq->getDbKey(), numSequence, seq->L);
 }
 
 static void dinucMapProfile(Sequence *seq, const char *profileData, unsigned int seqLen) {
