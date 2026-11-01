@@ -4,6 +4,7 @@ set(rnautils_source_files
     rnautils/GenerateCm.cpp
     rnautils/splitstrand.cpp
     rnautils/RnaAlign.cpp
+    rnautils/RnaGcStat.cpp
     rnautils/FragmentMerge.cpp
     rnautils/RnaRealign.cpp
     rnautils/RnaMatcher.cpp

@@ -64,7 +64,13 @@ LocalParameters::LocalParameters() : Parameters(),
         "The original target DB must still be passed as the target argument: coordinates are mapped\n"
         "back through it and fragmented hits are re-aligned against it.\n",
         typeid(std::string), (void *) &targetSplitDb,
-        "^.*$", MMseqsParameter::COMMAND_PREFILTER)
+        "^.*$", MMseqsParameter::COMMAND_PREFILTER),
+    PARAM_REALIGN_QUERY_DB(PARAM_REALIGN_QUERY_DB_ID, "--realign-query-db", "Query DB for fragment re-alignment",
+        "Strand-split query DB of the current search iteration,\n"
+        "set by the search workflow. offsetalignment re-aligns target-split fragments with exactly the\n"
+        "query the aligner used: the sequence in the first iteration, the profile in later ones.",
+        typeid(std::string), (void *) &realignQueryDb,
+        "^.*$", MMseqsParameter::COMMAND_EXPERT)
 {
     cmRegionFlanking = 1.0f;  // 1.0 => pad by full W (prior hardcoded behavior)
     cmScanCutoff = 0.0f;
@@ -79,6 +85,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuildNoss = 0;        // use SS_cons (current default)
     cmbuildMinRowCov = 0.30f;
     targetSplitDb = "";
+    realignQueryDb = "";
 
     // Register dinuc.out as compiled-in matrix and set as default
     scoringMatrixFile = MultiParam<NuclAA<std::string>>(NuclAA<std::string>("dinuc.out", "dinuc.out"));
@@ -99,6 +106,9 @@ LocalParameters::LocalParameters() : Parameters(),
 
     rnaalign = align;
     rnaalign.push_back(&PARAM_DB_SIZE);
+
+    rnagcstat.push_back(&PARAM_THREADS);
+    rnagcstat.push_back(&PARAM_V);
 
     splitstrand.push_back(&PARAM_STRAND);
     splitstrand.push_back(&PARAM_THREADS);
@@ -128,5 +138,6 @@ LocalParameters::LocalParameters() : Parameters(),
 
     // Top-level search option only: the sub-modules never see it, so it is not
     // added to any list that feeds createParameterString for prefilter/align.
+    offsetalignment.push_back(&PARAM_REALIGN_QUERY_DB);
     searchworkflow.push_back(&PARAM_TARGET_SPLIT_DB);
 }

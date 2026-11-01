@@ -85,9 +85,14 @@ if [ -n "$SPLITSTRAND" ] && [ -z "$GPU" ] && [ -z "$HAVE_INDEX" ]; then
         ln -s "$(abspath "${TARGETDB}_h.dbtype")" "$TMP_PATH/target_db_dinuc_h.dbtype" 2>/dev/null || true
         ln -s "$(abspath "${TARGETDB}.lookup")" "$TMP_PATH/target_db_dinuc.lookup" 2>/dev/null || true
         ln -s "$(abspath "${TARGETDB}.source")" "$TMP_PATH/target_db_dinuc.source" 2>/dev/null || true
+        ln -s "$(abspath "${2}.gcstat")" "$TMP_PATH/target_db_dinuc.gcstat" 2>/dev/null || true
         awk 'BEGIN { printf("%c%c%c%c",0,0,64,0); exit; }' > "$TMP_PATH/target_db_dinuc.dbtype"
     fi
     TARGETDB="$TMP_PATH/target_db_dinuc"
+elif [ "$TARGETDB" = "$TMP_PATH/target_seqs_split" ]; then
+    if [ ! -e "$TMP_PATH/target_seqs_split.gcstat" ] && [ -f "${2}.gcstat" ]; then
+        ln -s "$(abspath "${2}.gcstat")" "$TMP_PATH/target_seqs_split.gcstat"
+    fi
 fi
 
 STEP=0
@@ -117,6 +122,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
                         || fail "Split strand died"
                 fi
                 QUERYDB="$TMP_PATH/query_strand"
+                STRANDDB="$TMP_PATH/query_strand"
             fi
             if [ -n "$NEEDQUERYSPLIT" ]; then
                 if notExists "$TMP_PATH/query_seqs_split.dbtype"; then
@@ -146,6 +152,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
                         || fail "Split strand died"
                 fi
                 QUERYDB="$TMP_PATH/query_strand_${STEP}"
+                STRANDDB="$TMP_PATH/query_strand_${STEP}"
             fi
             if [ -n "$NEEDQUERYSPLIT" ]; then
                 if notExists "$TMP_PATH/query_seqs_split_$STEP.dbtype"; then
@@ -211,7 +218,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
     # offset alignment
     if notExists "$TMP_PATH/aln_offset_$STEP.done"; then
         # shellcheck disable=SC2086
-        "$MMSEQS" offsetalignment "$OFFSET_QUERYDB" "$QUERYDB" "$2" "$TARGETDB" "$MERGE_INPUT" "$TMP_PATH/aln_offset_$STEP" ${OFFSETALIGNMENT_PAR} \
+        "$MMSEQS" offsetalignment "$OFFSET_QUERYDB" "$QUERYDB" "$2" "$TARGETDB" "$MERGE_INPUT" "$TMP_PATH/aln_offset_$STEP" ${OFFSETALIGNMENT_PAR} ${STRANDDB:+--realign-query-db "$STRANDDB"} \
             || fail "Offset step died"
         # replace alignment with offset alignment
         if [ "$STEP" -eq 0 ]; then
