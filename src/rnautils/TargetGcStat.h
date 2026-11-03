@@ -178,19 +178,24 @@ struct TargetGcStat {
     // sequences. This is the expensive path; it is what `rnagcstat` pays once.
     static TargetGcStat fromFullScan(DBReader<unsigned int> *r, int threads) {
         TargetGcStat out;
-        const size_t nSeq = r->getSize();
         const bool padded = isPadded(r);
         std::vector<TargetGcStat> part((size_t)std::max(threads, 1));
 #pragma omp parallel num_threads(threads)
         {
             unsigned int thread_idx = 0;
+            unsigned int thread_count = 1;
 #ifdef OPENMP
             thread_idx = (unsigned int)omp_get_thread_num();
+            thread_count = (unsigned int)omp_get_num_threads();
 #endif
             TargetGcStat &acc = part[thread_idx];
             std::string buf;
-#pragma omp for schedule(static)
-            for (size_t id = 0; id < nSeq; id++) {
+            // Balance residues, not sequence counts: a padded DB is sorted by length, so a
+            // static split by count handed the last thread every long sequence. A fixed
+            // range per thread also keeps the merged sums identical from run to run.
+            size_t start = 0, count = 0;
+            r->decomposeDomainByAminoAcid(thread_idx, thread_count, &start, &count);
+            for (size_t id = start; id < start + count; id++) {
                 const char *data = r->getData(id, thread_idx);
                 const size_t len = r->getSeqLen(id);
                 if (data == NULL || len == 0) continue;
