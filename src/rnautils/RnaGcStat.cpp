@@ -7,6 +7,10 @@
 #include "EvalueModel.h"
 #include "CommandDeclarations.h"
 #include "CreatedbObserver.h"
+#include "MakepaddedseqdbObserver.h"
+
+#include <algorithm>
+#include <vector>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -136,10 +140,50 @@ int riboseekCreatedb(int argc, const char **argv, const Command &command) {
 // source DB's GC statistic, so GPU searches load it instead of sampling the target on
 // every run (2026-10-15). Padding re-orders and re-encodes the sequences but keeps every
 // base, so the source's statistic is exact for the padded DB. A source without one (made
-// by base:createdb, or before createdb wrote it) is scanned here; the padded DB's own
-// statistic is always rewritten so it can never describe an earlier source.
+// by base:createdb, or before createdb wrote it) gets it gathered while it is padded --
+// the MakepaddedseqdbObserver hook sees each raw source entry in the padding loop, so the
+// database is read once (2026-11-04). The padded DB's own statistic is always rewritten so
+// it can never describe an earlier source.
+namespace {
+struct PaddedGcStatObserver : public MakepaddedseqdbObserver {
+    std::vector<TargetGcStat> part;
+    bool active = false;
+    void begin(unsigned int threads) {
+        // Decided here, after makepaddedseqdb has parsed its parameters: gather only when
+        // the source has no usable statistic to copy and holds raw nucleotides. A padded
+        // source hands back dinucleotide letters, which addSequence would misread; it is
+        // left to the full scan below, which decodes them.
+        Parameters &par = Parameters::getInstance();
+        const std::string src = TargetGcStat::pathFor(par.db1);
+        TargetGcStat old;
+        if (FileUtil::fileExists(src.c_str()) && old.load(src) && old.hasDinuc) {
+            return;
+        }
+        const int dbtype = FileUtil::parseDbType(par.db1.c_str());
+        if (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_NUCLEOTIDES) == false
+            || (DBReader<unsigned int>::getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_GPU) != 0) {
+            return;
+        }
+        unsigned int slots = std::max(threads, 1u);
+#ifdef OPENMP
+        slots = std::max(slots, (unsigned int)omp_get_max_threads());
+#endif
+        part.assign(slots, TargetGcStat());
+        active = true;
+    }
+    void addSequence(unsigned int threadIdx, const char *seq, size_t len) {
+        if (active) {
+            part[threadIdx].addSequence(seq, len);
+        }
+    }
+};
+}
+
 int riboseekMakepaddedseqdb(int argc, const char **argv, const Command &command) {
+    PaddedGcStatObserver obs;
+    makepaddedseqdbObserver = &obs;
     const int ret = makepaddedseqdb(argc, argv, command);
+    makepaddedseqdbObserver = NULL;
     if (ret != EXIT_SUCCESS) {
         return ret;
     }
@@ -149,20 +193,30 @@ int riboseekMakepaddedseqdb(int argc, const char **argv, const Command &command)
     if (FileUtil::fileExists(out.c_str())) {
         FileUtil::remove(out.c_str());
     }
-    TargetGcStat old;
-    if (FileUtil::fileExists(src.c_str()) && old.load(src) && old.hasDinuc) {
-        FileUtil::copyFile(src, out);
-        Debug(Debug::INFO) << "Copied " << src << " to " << out << " for E-value calibration\n";
-        return EXIT_SUCCESS;
+    TargetGcStat st;
+    if (obs.active) {
+        // per-thread parts merged in thread order: the ranges are fixed per thread count,
+        // so the statistic is the same from run to run
+        for (size_t t = 0; t < obs.part.size(); t++) {
+            st.merge(obs.part[t]);
+        }
+        st.sampled = false;
+    } else {
+        TargetGcStat old;
+        if (FileUtil::fileExists(src.c_str()) && old.load(src) && old.hasDinuc) {
+            FileUtil::copyFile(src, out);
+            Debug(Debug::INFO) << "Copied " << src << " to " << out << " for E-value calibration\n";
+            return EXIT_SUCCESS;
+        }
+        if (Parameters::isEqualDbtype(FileUtil::parseDbType(par.db1.c_str()), Parameters::DBTYPE_NUCLEOTIDES) == false) {
+            return EXIT_SUCCESS;
+        }
+        DBReader<unsigned int> reader(par.db1.c_str(), par.db1Index.c_str(), par.threads,
+                                      DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
+        reader.open(DBReader<unsigned int>::NOSORT);
+        st = TargetGcStat::fromFullScan(&reader, par.threads);
+        reader.close();
     }
-    if (Parameters::isEqualDbtype(FileUtil::parseDbType(par.db1.c_str()), Parameters::DBTYPE_NUCLEOTIDES) == false) {
-        return EXIT_SUCCESS;
-    }
-    DBReader<unsigned int> reader(par.db1.c_str(), par.db1Index.c_str(), par.threads,
-                                  DBReader<unsigned int>::USE_DATA | DBReader<unsigned int>::USE_INDEX);
-    reader.open(DBReader<unsigned int>::NOSORT);
-    TargetGcStat st = TargetGcStat::fromFullScan(&reader, par.threads);
-    reader.close();
     if (st.empty()) {
         Debug(Debug::WARNING) << par.db1 << " has no A/C/G/U residues, so it has no GC statistic: a search against "
                               << par.db2 << " cannot compute E-values and will stop.\n";

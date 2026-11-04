@@ -6,6 +6,10 @@
 #include "SubstitutionMatrix.h"
 #include "tantan.h"
 #include "Masker.h"
+#ifdef RIBOSEEK
+#include "MakepaddedseqdbObserver.h"
+MakepaddedseqdbObserver *makepaddedseqdbObserver = NULL;
+#endif
 
 #ifdef OPENMP
 #include <omp.h>
@@ -32,6 +36,11 @@ int makepaddedseqdb(int argc, const char **argv, const Command &command) {
 
     // need to prune low scoring k-mers through masking
 
+#ifdef RIBOSEEK
+    if (makepaddedseqdbObserver != NULL) {
+        makepaddedseqdbObserver->begin(par.threads);
+    }
+#endif
     Debug::Progress progress(dbr.getSize());
 #pragma omp parallel
 {
@@ -81,6 +90,11 @@ int makepaddedseqdb(int argc, const char **argv, const Command &command) {
         unsigned int key = dbr.getDbKey(id);
         char *data = dbr.getData(id, thread_idx);
         size_t seqLen = dbr.getSeqLen(id);
+#ifdef RIBOSEEK
+        if (makepaddedseqdbObserver != NULL) {
+            makepaddedseqdbObserver->addSequence(thread_idx, data, seqLen);
+        }
+#endif
         seq.mapSequence(id, key, data, seqLen);
 
         if (charSequence != NULL) {
