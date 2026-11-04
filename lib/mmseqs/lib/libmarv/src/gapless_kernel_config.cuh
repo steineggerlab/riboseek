@@ -480,8 +480,11 @@ namespace cudasw4{
 
         // Apply filter configs if any. There should be only one filter config.
         if (!gaplessFilterConfigs.empty()){
+            // the opt-in limit: the kernels raise their dynamic shared memory up to it at launch
+            // (cudaFuncAttributeMaxDynamicSharedMemorySize); the default per-block limit (48 KB)
+            // dropped configs that fit and pushed queries of 961-2048 nt to the multi-tile kernel
             int maxSharedMemoryPerBlock = 0;
-            cudaDeviceGetAttribute(&maxSharedMemoryPerBlock, cudaDevAttrMaxSharedMemoryPerBlock, deviceId);
+            cudaDeviceGetAttribute(&maxSharedMemoryPerBlock, cudaDevAttrMaxSharedMemoryPerBlockOptin, deviceId);
             configs = gaplessFilterConfigs[0].filterConfigFn(configs, maxSharedMemoryPerBlock);
         }
 
