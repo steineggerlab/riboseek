@@ -331,6 +331,20 @@ uint64_t Util::getL2CacheSize() {
     return 262144;
 }
 
+void Util::adviseHugePages(void* addr, size_t len) {
+#ifdef MADV_HUGEPAGE
+    const uintptr_t hugePageSize = 2 * 1024 * 1024;
+    const uintptr_t begin = (reinterpret_cast<uintptr_t>(addr) + hugePageSize - 1) & ~(hugePageSize - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + len) & ~(hugePageSize - 1);
+    if (end > begin) {
+        // purely a performance hint, THP might be disabled
+        madvise(reinterpret_cast<void*>(begin), end - begin, MADV_HUGEPAGE);
+    }
+#else
+    (void)addr; (void)len;
+#endif
+}
+
 char Util::touchMemory(const char *memory, size_t size) {
 #ifdef HAVE_POSIX_MADVISE
     if (size > 0 && posix_madvise ((void*)memory, size, POSIX_MADV_WILLNEED) != 0){
