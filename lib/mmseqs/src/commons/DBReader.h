@@ -429,6 +429,17 @@ public:
         return dbtype | ((extended & 0x7FFE) << 16);
     }
 
+#ifdef RIBOSEEK
+    static inline int encodedGpuDbtype(int dbtype) {
+        uint16_t ext = getExtendedDbtype(dbtype);
+        if ((ext & Parameters::DBTYPE_EXTENDED_GPU) == 0) {
+            return dbtype;
+        }
+        ext &= ~Parameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
+        return setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, ext);
+    }
+#endif
+
     const char* getDbTypeName() const {
         return Parameters::getDbTypeName(dbtype);
     }

@@ -562,7 +562,11 @@ void runFilterOnCpu(Parameters & par, BaseMatrix * subMat, int8_t * tinySubMat,
     std::vector<hit_t> shortResults;
     shortResults.reserve(tdbr->getSize()/2);
     Debug::Progress progress(qdbr->getSize());
+#ifdef RIBOSEEK
+    const int targetSeqType = DBReader<unsigned int>::encodedGpuDbtype(tdbr->getDbtype());
+#else
     const int targetSeqType = tdbr->getDbtype();
+#endif
     const int querySeqType = qdbr->getDbtype();
 #ifdef OPENMP
     omp_set_nested(1);

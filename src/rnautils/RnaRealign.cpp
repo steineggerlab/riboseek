@@ -106,8 +106,14 @@ void ensureContext(DBReader<unsigned int> *targetDb, int queryDbType, int thread
         ctx->querySeqType = DBReader<unsigned int>::setExtendedDbtype(
             Parameters::DBTYPE_HMM_PROFILE, dinuc | Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE);
     }
-    ctx->targetSeqType = DBReader<unsigned int>::setExtendedDbtype(
-        Parameters::DBTYPE_AMINO_ACIDS, dinuc);
+    // A padded (GPU) target already holds dinucleotide letters: read them as they are, the way
+    // rnaalign does, instead of encoding them a second time
+    if (DBReader<unsigned int>::getExtendedDbtype(targetDb->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU) {
+        ctx->targetSeqType = DBReader<unsigned int>::encodedGpuDbtype(targetDb->getDbtype());
+    } else {
+        ctx->targetSeqType = DBReader<unsigned int>::setExtendedDbtype(
+            Parameters::DBTYPE_AMINO_ACIDS, dinuc);
+    }
     ctx->compBiasCorrection = par.compBiasCorrection;
     ctx->compBiasCorrectionScale = par.compBiasCorrectionScale;
     ctx->covMode = par.covMode;
