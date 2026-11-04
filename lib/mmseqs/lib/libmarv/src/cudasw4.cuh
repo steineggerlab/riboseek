@@ -4311,7 +4311,12 @@ namespace cudasw4{
                 const int numGroupsPerBlock = threadBlockSize / config.groupsize;
                                             
                 auto dbview = fullDB.getData();  //TODO only consider length of gpu partition, not full db
-                const int maxSubjectLength = dbview.lengths()[dbview.numSequences()-1];
+                // the db is sorted by length, except that a split db can end in a short remainder
+                // chunk; the entry before it is then a full chunk, which is the longest
+                int maxSubjectLength = dbview.lengths()[dbview.numSequences()-1];
+                if(dbview.numSequences() > 1){
+                    maxSubjectLength = std::max(maxSubjectLength, int(dbview.lengths()[dbview.numSequences()-2]));
+                }
 
                 //need to store 1 half value per subject position. kernel uses float2 for vectorized stores
                 //4 halfs per float2
@@ -4484,7 +4489,12 @@ namespace cudasw4{
                 const int numGroupsPerBlock = threadBlockSize / config.groupsize;
                                             
                 auto dbview = fullDB.getData();  //TODO only consider length of gpu partition, not full db
-                const int maxSubjectLength = dbview.lengths()[dbview.numSequences()-1];
+                // the db is sorted by length, except that a split db can end in a short remainder
+                // chunk; the entry before it is then a full chunk, which is the longest
+                int maxSubjectLength = dbview.lengths()[dbview.numSequences()-1];
+                if(dbview.numSequences() > 1){
+                    maxSubjectLength = std::max(maxSubjectLength, int(dbview.lengths()[dbview.numSequences()-2]));
+                }
 
                 const int maxSubjectLengthPadded = maxSubjectLength + config.groupsize;
                 const size_t tempBytesPerGroup = sizeof(float2) * maxSubjectLengthPadded;
