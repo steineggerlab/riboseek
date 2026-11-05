@@ -2025,7 +2025,7 @@ namespace cudasw4{
             if(int8IsAllowed){
                 currentInt8SubstitutionScoreBias = std::abs(std::min(0, hostFullQueryPSSM.getMinElement()));
 
-                for(int r = 0; r < 21; r++){
+                for(int r = 0; r < hostFullQueryPSSM.alphabetSize; r++){
                     for(int c = 0; c < queryLength; c++){
                         hostFullQueryPSSM[r][c] = hostFullQueryPSSM[r][c] + currentInt8SubstitutionScoreBias;
                     }
