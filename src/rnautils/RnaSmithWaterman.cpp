@@ -283,15 +283,16 @@ s_align RnaSmithWaterman::ssw_align_private (
 		return align;
 	}
 
-	// run very shot and long overflowing alignments with SW instead of block aligner
-	// short alignments are very fast with byte SW, long alignments produce slightly different scores FIXME
-	if (true || align.word != 1) {
+	// only alignments that overflow the byte SW but fit the word SW go through the block aligner;
+	// short ones are fastest with byte SW. The block aligner must reproduce the SW score or we fall
+	// back to SW; with equal scores it can still pick a different co-optimal path
+	if (align.word != 1) {
 		return alignStartPosBacktrace<type>(db_sequence, db_length, gap_open, gap_extend, alignmentMode, backtrace, align, evaluer, covMode, covThr, correlationScoreWeight, maskLen, reverse);
 	}
 
 	bool blockAlignFailed = false;
-	s_align alignTmp = alignStartPosBacktraceBlock<type>(db_sequence, db_length, gap_open, gap_extend, backtrace, align);
-	if (align.score1 == UINT32_MAX) {
+	s_align alignTmp = alignStartPosBacktraceBlock<type>(db_sequence, db_length, gap_open, gap_extend, backtrace, align, reverse);
+	if (alignTmp.score1 == UINT32_MAX) {
 		blockAlignFailed = true;
 	} else {
 		align = alignTmp;
@@ -299,7 +300,7 @@ s_align RnaSmithWaterman::ssw_align_private (
 
 	if (blockAlignFailed) {
 		Debug(Debug::WARNING) << "Block alignment failed, falling back to Smith-Waterman\n";
-		align = alignStartPosBacktrace<type>(db_sequence, db_length, gap_open, gap_extend, alignmentMode, backtrace, align, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
+		align = alignStartPosBacktrace<type>(db_sequence, db_length, gap_open, gap_extend, alignmentMode, backtrace, align, evaluer, covMode, covThr, correlationScoreWeight, maskLen, reverse);
 	}
 
 	// Check is needed (Below is for alignStartPosBacktraceBlock not for alignStartPosBacktrace since as it's already handled internally.)
@@ -368,7 +369,8 @@ s_align RnaSmithWaterman::alignStartPosBacktraceBlock(
 	const uint8_t gap_open,
 	const uint8_t gap_extend,
 	std::string & backtrace,
-	s_align r) {
+	s_align r,
+	const bool reverse) {
 	size_t query_len = profile->query_length;
 	size_t target_len = db_length;
 	Gaps gaps;
@@ -473,6 +475,8 @@ s_align RnaSmithWaterman::alignStartPosBacktraceBlock(
 
 	size_t cigar_len, queryPos, targetPos;
 	uint32_t aaIds;
+	unsigned char *revcomp = this->subMat->num2revcompnum;
+	const unsigned char *dinucToNuc = getDinucToNucTable();
 
 	Cigar* cigar = block_new_cigar(res.query_idx, res.reference_idx);
 	// char ops_char[] = {' ', 'M', '=', 'X', 'I', 'D'};
@@ -494,9 +498,10 @@ s_align RnaSmithWaterman::alignStartPosBacktraceBlock(
 		if(o.op == 1){
 			for(size_t j = 0; j < o.len; j++){
 				// change traceback with int not char
-				if(profile->query_rev_sequence[queryPos + j + queryStartPos] == db_rev_sequence[targetPos + j + targetStartPos]){
-					aaIds++;
-				}
+				// same rule as computerBacktrace: compare nucleotides, canonical query letters only
+				const int8_t q = profile->query_rev_sequence[queryPos + j + queryStartPos];
+				const unsigned char t = db_rev_sequence[targetPos + j + targetStartPos];
+				aaIds += (dinucToNuc[reverse ? revcomp[t] : t] == dinucToNuc[q]) && q < 20;
 			}
 			queryPos += o.len;
 			targetPos += o.len;
@@ -690,9 +695,9 @@ template
 s_align RnaSmithWaterman::alignScoreEndPos<RnaSmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const int32_t);
 
 template
-s_align RnaSmithWaterman::alignStartPosBacktraceBlock<RnaSmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, std::string&, s_align);
+s_align RnaSmithWaterman::alignStartPosBacktraceBlock<RnaSmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, std::string&, s_align, const bool);
 template
-s_align RnaSmithWaterman::alignStartPosBacktraceBlock<RnaSmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, std::string&, s_align);
+s_align RnaSmithWaterman::alignStartPosBacktraceBlock<RnaSmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, std::string&, s_align, const bool);
 
 template
 s_align RnaSmithWaterman::alignStartPosBacktrace<RnaSmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const uint8_t, std::string&, s_align, RnaEvalueComputation*, const int, const float, const float, const int32_t, const bool);
