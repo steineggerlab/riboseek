@@ -56,6 +56,7 @@ OFFSET_QUERYDB="$1"
 TARGETDB="$2"
 TMP_PATH="$4"
 MERGE_INPUT=""
+ALIGN_TARGETDB=""
 
 if [ -n "$TARGET_SPLIT_DB" ]; then
     # Caller supplied a pre-split target DB, so skip splitsequence entirely.
@@ -93,7 +94,19 @@ elif [ "$TARGETDB" = "$TMP_PATH/target_seqs_split" ]; then
     if [ ! -e "$TMP_PATH/target_seqs_split.gcstat" ] && [ -f "${2}.gcstat" ]; then
         ln -s "$(abspath "${2}.gcstat")" "$TMP_PATH/target_seqs_split.gcstat"
     fi
+elif [ -n "$TARGET_SPLIT_DB" ] && [ ! -e "${TARGETDB}.gcstat" ] && [ -f "${2}.gcstat" ]; then
+    # A caller-supplied --target-split-db without .gcstat: align against a TMP_PATH alias that
+    # carries the original target's .gcstat, so rnaalign does not fall back to sampling GC.
+    # The prefilter keeps the real path, which --gpu-server matches on.
+    if notExists "$TMP_PATH/target_split_gc.dbtype"; then
+        for f in "$TARGETDB" "$TARGETDB".* "${TARGETDB}_h" "${TARGETDB}_h".*; do
+            [ -e "$f" ] && ln -sf "$(abspath "$f")" "$TMP_PATH/target_split_gc${f#"$TARGETDB"}"
+        done
+        ln -sf "$(abspath "${2}.gcstat")" "$TMP_PATH/target_split_gc.gcstat"
+    fi
+    ALIGN_TARGETDB="$TMP_PATH/target_split_gc"
 fi
+[ -z "$ALIGN_TARGETDB" ] && ALIGN_TARGETDB="$TARGETDB"
 
 STEP=0
 # processing
@@ -194,7 +207,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
             MERGE_INPUT="$TMP_PATH/aln_tmp_double_$STEP"
         fi
         # shellcheck disable=SC2086
-        $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "$QUERYDB" "$TARGETDB" "$TMP_PATH/pref_$STEP" "$MERGE_INPUT" ${TMP} \
+        $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "$QUERYDB" "$ALIGN_TARGETDB" "$TMP_PATH/pref_$STEP" "$MERGE_INPUT" ${TMP} \
             || fail "Alignment died"
         touch "$TMP_PATH/aln_tmp_$STEP.done"
     fi
