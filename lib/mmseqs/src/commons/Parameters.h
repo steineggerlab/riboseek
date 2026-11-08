@@ -97,6 +97,8 @@ public:
     static const unsigned int DBTYPE_EXTENDED_SRC_SEQUENCE = 32;
     // Dinucleotide RNA database (riboseek): signals RNA-corrected E-value computation
     static const unsigned int DBTYPE_EXTENDED_DINUCLEOTIDE = 64;
+    // Query split into strands by riboseek splitstrand: even keys forward, odd keys reverse
+    static const unsigned int DBTYPE_EXTENDED_STRAND_SPLIT = 128;
 
     // don't forget to add new database types to DBReader::getDbTypeName and Parameters::PARAM_OUTPUT_DBTYPE
 

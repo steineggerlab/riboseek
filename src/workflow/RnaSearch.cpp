@@ -96,8 +96,7 @@ int riboseekSearch(int argc, const char **argv, const Command &command) {
 	 & Parameters::DBTYPE_EXTENDED_GPU) != 0;
     const bool gpuWorkflow = (par.gpu == 1) || targetGpuDb;
 
-    // RNA always uses both strands; mark as set so result2profile inherits --strand 2
-    par.strand = 2;
+    // mark it as set so rnaalign, offsetalignment and result2profile get it and count only those strands in E
     par.PARAM_STRAND.wasSet = true;
 
     // validate and set parameters for iterative search
@@ -204,6 +203,10 @@ int riboseekSearch(int argc, const char **argv, const Command &command) {
         par.evalThr = (par.evalThr < par.evalProfile) ? par.evalThr : par.evalProfile;
     }
 
+    // rnaalign scales its E-values by the number of query strands searched
+    std::vector<MMseqsParameter*> alignWithStrand = par.align;
+    alignWithStrand.push_back(&par.PARAM_STRAND);
+
     for (int i = 0; i < par.numIterations; i++) {
         // Match old MMseqs2 nucl-nucl iterative search: realign disabled across
         // all iterations (Search.cpp lines 511-518 in the forked MMseqs2).
@@ -226,7 +229,7 @@ int riboseekSearch(int argc, const char **argv, const Command &command) {
         }
 
         cmd.addVariable(std::string("ALIGNMENT_PAR_" + SSTR(i)).c_str(),
-                        par.createParameterString(par.align).c_str());
+                        par.createParameterString(alignWithStrand).c_str());
         cmd.addVariable(std::string("PROFILE_PAR_" + SSTR(i)).c_str(),
                         par.createParameterString(par.result2profile).c_str());
     }

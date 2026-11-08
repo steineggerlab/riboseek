@@ -96,6 +96,11 @@ LocalParameters::LocalParameters() : Parameters(),
     alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(25, 5));
     maskMode = 0;
 
+    // Search both query strands unless asked otherwise; the E-value covers the strands searched
+    strand = 2;
+    overrideParameterDescription(PARAM_STRAND,
+        "Query strand(s) to search; E-values cover only the strands searched\n0: reverse complement\n1: forward\n2: both");
+
     cmscan = align;
     cmscan.push_back(&PARAM_CM_REGION);
     cmscan.push_back(&PARAM_CM_SCAN_CUTOFF);
@@ -106,6 +111,7 @@ LocalParameters::LocalParameters() : Parameters(),
 
     rnaalign = align;
     rnaalign.push_back(&PARAM_DB_SIZE);
+    rnaalign.push_back(&PARAM_STRAND);
 
     rnagcstat.push_back(&PARAM_THREADS);
     rnagcstat.push_back(&PARAM_V);
@@ -139,5 +145,7 @@ LocalParameters::LocalParameters() : Parameters(),
     // Top-level search option only: the sub-modules never see it, so it is not
     // added to any list that feeds createParameterString for prefilter/align.
     offsetalignment.push_back(&PARAM_REALIGN_QUERY_DB);
+    // the fragment re-aligner computes E-values for the strands searched
+    offsetalignment.push_back(&PARAM_STRAND);
     searchworkflow.push_back(&PARAM_TARGET_SPLIT_DB);
 }

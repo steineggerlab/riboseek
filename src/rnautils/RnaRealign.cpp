@@ -65,7 +65,7 @@ void ensureContext(DBReader<unsigned int> *targetDb, int queryDbType, int thread
     ctx->gapExtend = par.gapExtend.values.aminoacid();
     const size_t targetTotalResidues = targetDb->getAminoAcidDBSize();
     ctx->evaluer = new RnaEvalueComputation(targetTotalResidues ? targetTotalResidues : 1,
-                                         ctx->subMat, ctx->gapOpen, ctx->gapExtend, true, false);
+                                         ctx->subMat, ctx->gapOpen, ctx->gapExtend, par.strand == 2, false);
     // The query is the one rnaalign aligned in this iteration: a genuine profile (strand-split
     // result2profile output, base type HMM_PROFILE) or the sequence. It gets the same per-query
     // model and the same kind of target GC histogram as rnaalign -- of the ORIGINAL target, which

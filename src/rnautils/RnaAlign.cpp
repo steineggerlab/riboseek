@@ -45,8 +45,8 @@ int rnaalign(int argc, const char **argv, const Command &command) {
         NULL, 0);
     par.parseParameters(argc, argv, command, true, 0, MMseqsParameter::COMMAND_ALIGN);
 
-    // RNA always searches both strands
-    const bool bothStrands = true;
+    // the search space covers the query strands searched (--strand 2: both, doubling E)
+    const bool bothStrands = (par.strand == 2);
     const size_t targetDbSize = par.dbSize;
     float covThr = par.covThr;
     const float canCovThr = par.covThr;
