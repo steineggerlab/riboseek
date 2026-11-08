@@ -6,6 +6,7 @@
 #include "LocalParameters.h"
 #include "Debug.h"
 #include "Util.h"
+#include "Orf.h"
 
 #include <algorithm>
 #include <mutex>
@@ -34,6 +35,12 @@ const float FULL_COVERAGE = 0.95f;
 
 // The iteration's strand-split query DB (--realign-query-db, set by the search workflow): the exact query rnaalign aligned
 DBReader<unsigned int> *strandQueries = NULL;
+// Key of each strand's entry in it, at 2 * original query key + (reverse ? 1 : 0); UINT_MAX if absent.
+// splitstrand renumbers its output to consecutive keys, so an entry's key is 2 * the query's POSITION
+// in the query DB (+1 for the reverse strand), which is 2 * its key only when the query DB's keys run
+// 0..N-1 -- not for a subset index or a createsubdb DB, and not with a single strand. The ORF
+// header of every entry still names the original key and the strand, so the lookup is built from those.
+std::vector<unsigned int> strandEntryKeys;
 std::once_flag strandQueriesOnce;
 DBReader<unsigned int> *openStrandQueries() {
     std::call_once(strandQueriesOnce, []() {
@@ -44,8 +51,31 @@ DBReader<unsigned int> *openStrandQueries() {
         strandQueries = new DBReader<unsigned int>(par.realignQueryDb.c_str(), (par.realignQueryDb + ".index").c_str(),
                                                    par.threads, DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
         strandQueries->open(DBReader<unsigned int>::NOSORT);
+
+        const std::string headerDb = par.realignQueryDb + "_h";
+        DBReader<unsigned int> headers(headerDb.c_str(), (headerDb + ".index").c_str(), 1,
+                                       DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
+        headers.open(DBReader<unsigned int>::NOSORT);
+        for (size_t i = 0; i < headers.getSize(); ++i) {
+            const unsigned int entryKey = headers.getDbKey(i);
+            const Orf::SequenceLocation loc = Orf::parseOrfHeader(headers.getData(i, 0));
+            // splitstrand writes forward as 0..len-1 and reverse as len-1..0; a 1-nt query has
+            // from == to on both, and then its key's parity is the strand (as everywhere else)
+            const bool reverse = loc.from > loc.to || (loc.from == loc.to && entryKey % 2 == 1);
+            const size_t slot = 2 * static_cast<size_t>(loc.id) + (reverse ? 1 : 0);
+            if (slot >= strandEntryKeys.size()) {
+                strandEntryKeys.resize(slot + 1, UINT_MAX);
+            }
+            strandEntryKeys[slot] = entryKey;
+        }
+        headers.close();
     });
     return strandQueries;
+}
+
+unsigned int strandEntryKey(unsigned int queryKey, bool reverse) {
+    const size_t slot = 2 * static_cast<size_t>(queryKey) + (reverse ? 1 : 0);
+    return slot < strandEntryKeys.size() ? strandEntryKeys[slot] : UINT_MAX;
 }
 
 void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryKey,
@@ -101,12 +131,13 @@ void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryK
             const size_t tId = tSource->getId(results[i].dbKey);
             // the query exactly as rnaalign aligned it in this iteration, if the workflow passed it
             DBReader<unsigned int> *sq = openStrandQueries();
-            const unsigned int entryKey = 2 * queryKey + (reverse ? 1 : 0);
+            const unsigned int entryKey = (sq != NULL) ? strandEntryKey(queryKey, reverse) : 2 * queryKey + (reverse ? 1 : 0);
             DBReader<unsigned int> *qDb = (sq != NULL) ? sq : qSource;
-            const size_t qId = qDb->getId(sq != NULL ? entryKey : queryKey);
+            const size_t qId = (sq != NULL && entryKey == UINT_MAX) ? UINT_MAX : qDb->getId(sq != NULL ? entryKey : queryKey);
             if (sq != NULL && qId == UINT_MAX) {
-                Debug(Debug::ERROR) << "Query " << queryKey << " has no entry " << entryKey << " in "
-                                    << sq->getDataFileName() << ", the query DB the fragments must be re-aligned with.\n";
+                Debug(Debug::ERROR) << "Query " << queryKey << " has no " << (reverse ? "reverse" : "forward")
+                                    << "-strand entry in " << sq->getDataFileName()
+                                    << ", the query DB the fragments must be re-aligned with.\n";
                 EXIT(EXIT_FAILURE);
             }
             if (tId != UINT_MAX && qId != UINT_MAX) {
