@@ -9,6 +9,7 @@
 #include <fstream>
 #include <cmath>
 #include <climits>
+#include <vector>
 
 SubstitutionMatrix::SubstitutionMatrix(const char *filename, float bitFactor, float scoreBias) : bitFactor(bitFactor) {
     std::pair<std::string, std::string> parsedMatrix = BaseMatrix::unserialize(filename);
@@ -247,12 +248,11 @@ void SubstitutionMatrix::calcGlobalAaBiasCorrection(const BaseMatrix *m,
 #endif
     for (int pos = 0; pos < N; pos++) {
         const char * subMat = profileScores + (pos * profileAASize);
-        for(size_t aa = 0; aa < 20; aa++) {
+        for(size_t aa = 0; aa < profileAASize; aa++) {
             pNullBuffer[pos] += m->pBack[aa] * static_cast<float>(subMat[aa]);
         }
     }
-//    for(size_t aa = 0; aa < 20; aa++)
-//        pNullBuffer[aa] /= N;
+    std::vector<float> aaSum(profileAASize);
     for (int i = 0; i < N; i++) {
         const int minPos = std::max(0, (i - windowSize / 2));
 #ifdef RIBOSEEK
@@ -262,19 +262,18 @@ void SubstitutionMatrix::calcGlobalAaBiasCorrection(const BaseMatrix *m,
 #endif
         const int windowLength = maxPos - minPos;
         // negative score for the amino acids in the neighborhood of i
-        float aaSum[20];
-        memset(aaSum, 0, sizeof(float) * 20);
+        std::fill(aaSum.begin(), aaSum.end(), 0.0f);
 
         for (int j = minPos; j < maxPos; j++) {
             const char *subMat = profileScores + (j * profileAASize);
             if (i == j) {
                 continue;
             }
-            for (size_t aa = 0; aa < 20; aa++) {
+            for (size_t aa = 0; aa < profileAASize; aa++) {
                 aaSum[aa] += subMat[aa] - pNullBuffer[j];
             }
         }
-        for (size_t aa = 0; aa < 20; aa++) {
+        for (size_t aa = 0; aa < profileAASize; aa++) {
             profileScores[i * profileAASize + aa] = static_cast<int>((profileScores + (i * profileAASize))[aa] -
                                                                      aaSum[aa] / windowLength);
 //            avg += static_cast<int>((profileScores + (i * profileAASize))[aa] -  aaSum[aa]/windowLength);
@@ -489,7 +488,6 @@ std::pair<int, bool> SubstitutionMatrix::setAaMappingDetectAlphSize(std::string 
     }
     return std::make_pair(-1, false);
 }
-
 
 
 

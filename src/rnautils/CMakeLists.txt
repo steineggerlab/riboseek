@@ -7,6 +7,9 @@ set(rnautils_source_files
     rnautils/EnvAlign.cpp
     rnautils/RedKmerMatcher.cpp
     rnautils/RnaAlign.cpp
+    rnautils/RnaGcStat.cpp
+    rnautils/FragmentMerge.cpp
+    rnautils/RnaRealign.cpp
     rnautils/RnaMatcher.cpp
     rnautils/RnaSmithWaterman.cpp
     rnautils/XdropAlign.cpp

@@ -5,6 +5,9 @@
 
 extern int splitstrand(int argc, const char **argv, const Command& command);
 extern int rnaalign(int argc, const char **argv, const Command& command);
+extern int rnagcstat(int argc, const char **argv, const Command& command);
+extern int riboseekCreatedb(int argc, const char **argv, const Command& command);
+extern int riboseekMakepaddedseqdb(int argc, const char **argv, const Command& command);
 extern int riboseekSearch(int argc, const char **argv, const Command& command);
 extern int riboseekCluster(int argc, const char **argv, const Command& command);
 extern int riboseekLinclust(int argc, const char **argv, const Command& command);

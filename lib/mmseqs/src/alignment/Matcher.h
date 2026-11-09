@@ -18,6 +18,8 @@
 #include "EvalueComputation.h"
 #include "BandedNucleotideAligner.h"
 
+template <typename T> class DBReader;
+
 class Matcher{
 
 public:
@@ -208,6 +210,24 @@ public:
     static result_t parseAlignmentRecord(const char *data, bool readCompressed=false);
 
     static void readAlignmentResults(std::vector<result_t> &result, char *data, bool readCompressed = false);
+
+    // Optional backend hook. A splitsequence'd target turns one alignment that straddles a
+    // chunk boundary into several colinear fragments; once offsetalignment has mapped the
+    // coordinates back onto the original sequence those fragments become adjacent and can
+    // be stitched together by re-aligning a bounded window of the original target. The
+    // aligner that can do this lives downstream (riboseek's dinucleotide Smith-Waterman),
+    // splitEntries[dbKey] != 0 marks an ORIGINAL target entry that splitsequence actually
+    // divided into more than one chunk. Entries that were passed through whole have no
+    // chunk boundary to repair, so the merger must leave their hits alone.
+    typedef void (*fragmentMergerFn)(std::vector<result_t> &results,
+                                     unsigned int queryKey,
+                                     DBReader<unsigned int> *querySource,
+                                     DBReader<unsigned int> *targetSource,
+                                     const unsigned char *splitEntries,
+                                     size_t splitEntriesSize,
+                                     int threadIdx);
+    static void registerFragmentMerger(fragmentMergerFn fn);
+    static fragmentMergerFn getFragmentMerger();
 
     static float estimateSeqIdByScorePerCol(uint16_t score, unsigned int qLen, unsigned int tLen);
 

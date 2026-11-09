@@ -206,7 +206,7 @@ int offsetalignment(int argc, const char **argv, const Command &command) {
 #endif
     IndexReader *qSourceDbr = NULL;
     if (queryNucl) {
-        qSourceDbr = new IndexReader(par.db1.c_str(), par.threads, IndexReader::SRC_SEQUENCES, (touch) ? (IndexReader::PRELOAD_INDEX) : 0, DBReader<unsigned int>::USE_INDEX);
+        qSourceDbr = new IndexReader(par.db1.c_str(), par.threads, IndexReader::SRC_SEQUENCES, (touch) ? (IndexReader::PRELOAD_INDEX) : 0, Matcher::getFragmentMerger() != NULL ? (DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA) : DBReader<unsigned int>::USE_INDEX);
     }
 
     IndexReader * tOrfDbr;
@@ -236,7 +236,8 @@ int offsetalignment(int argc, const char **argv, const Command &command) {
         if(isSameSrcDB){
             tSourceDbr = qSourceDbr;
         }else{
-            tSourceDbr = new IndexReader(par.db3.c_str(), par.threads, IndexReader::SRC_SEQUENCES, (touch) ? IndexReader::PRELOAD_INDEX : 0, DBReader<unsigned int>::USE_INDEX );
+            // USE_DATA as well: the fragment merger re-aligns against the original target
+            tSourceDbr = new IndexReader(par.db3.c_str(), par.threads, IndexReader::SRC_SEQUENCES, (touch) ? IndexReader::PRELOAD_INDEX : 0, Matcher::getFragmentMerger() != NULL ? (DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA) : DBReader<unsigned int>::USE_INDEX );
         }
 
         if(Parameters::isEqualDbtype(tSourceDbr->getDbtype(), Parameters::DBTYPE_INDEX_DB)){
@@ -351,6 +352,44 @@ int offsetalignment(int argc, const char **argv, const Command &command) {
     if (queryNucl) {
         entryCount = maxContigKey + 1;
     }
+    // Which ORIGINAL target entries did splitsequence actually divide? Each chunk's header
+    // names its source entry, so counting chunks per source key identifies exactly the
+    // entries that have chunk boundaries. Entries kept whole are excluded, so their hits
+    // are never re-aligned.
+    // Counted straight into a flat array indexed by source key (saturating at 2, since
+    // "more than one" is all we need) - one pass, no per-chunk allocation.
+    std::vector<unsigned char> splitEntries;
+    if (Matcher::getFragmentMerger() != NULL && tOrfDbr != NULL && tSourceDbr != NULL
+        && tOrfDbr->sequenceReader != NULL && tSourceDbr->sequenceReader != NULL) {
+        DBReader<unsigned int> *orfHdr = tOrfDbr->sequenceReader;
+        DBReader<unsigned int> *srcRdr = tSourceDbr->sequenceReader;
+        unsigned int maxKey = 0;
+        for (size_t i = 0; i < srcRdr->getSize(); i++) {
+            maxKey = std::max(maxKey, srcRdr->getDbKey(i));
+        }
+        splitEntries.assign((size_t)maxKey + 1, 0);
+        for (size_t i = 0; i < orfHdr->getSize(); i++) {
+            Orf::SequenceLocation loc = Orf::parseOrfHeader(orfHdr->getData(i, 0));
+            unsigned int srcKey = (loc.id != UINT_MAX) ? loc.id : orfHdr->getDbKey(i);
+            if (srcKey > maxKey) {
+                continue;
+            }
+            if (splitEntries[srcKey] < 2) {
+                splitEntries[srcKey]++;
+            }
+        }
+        bool anySplit = false;
+        for (size_t k = 0; k < splitEntries.size(); k++) {
+            splitEntries[k] = (splitEntries[k] > 1) ? 1 : 0;
+            anySplit |= (splitEntries[k] != 0);
+        }
+        // Nothing was split: leave the map empty so the merger is never entered at all
+        // (it would otherwise sort every query's result list for nothing).
+        if (anySplit == false) {
+            splitEntries.clear();
+        }
+    }
+
     Debug::Progress progress(entryCount);
 
 #pragma omp parallel num_threads(localThreads)
@@ -404,6 +443,17 @@ int offsetalignment(int argc, const char **argv, const Command &command) {
                         updateOffset(data, results, NULL, *tOrfDbr, (isNuclNuclSearch||isTransNucTransNucSearch), isNuclNuclSearch, thread_idx);
                     }else{
                         updateOffset(data, results, &qloc, *tOrfDbr, (isNuclNuclSearch||isTransNucTransNucSearch), isNuclNuclSearch, thread_idx);
+                    }
+                    // Stitch fragments created by a splitsequence'd target. Only when the
+                    // target really was split: otherwise there are no chunk boundaries to
+                    // repair and re-aligning would silently rewrite correct results.
+                    if (splitEntries.empty() == false) {
+                        if (Matcher::fragmentMergerFn merger = Matcher::getFragmentMerger()) {
+                            merger(results, queryKey,
+                                   qSourceDbr ? qSourceDbr->sequenceReader : NULL,
+                                   tSourceDbr ? tSourceDbr->sequenceReader : NULL,
+                                   splitEntries.data(), splitEntries.size(), thread_idx);
+                        }
                     }
                     // do not merge entries
                     if(par.mergeQuery == false){

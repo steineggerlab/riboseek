@@ -191,14 +191,23 @@ struct InfModel {
     int  alignOpts = CM_ALIGN_NONBANDED | CM_ALIGN_CYK;
     // HMM-banded? (alidisplay tau)
     bool alignBanded = false;
+    // minimum window bit score
+    float scanCutoff = 0.0f;
 };
 
 // Load an INFERNAL1/a CM from in-memory text and configure it for scannin non-banded alignment
-InfModel loadModel(const std::string &cmtext, bool useInside, int alignOpts, bool alignBanded, bool useLocal) {
+InfModel loadModel(
+    const std::string &cmtext,
+    bool useInside,
+    int alignOpts,
+    bool alignBanded,
+    bool useLocal,
+    float scanCutoff) {
     InfModel m;
     m.useInside = useInside;
     m.alignOpts = alignOpts;
     m.alignBanded = alignBanded;
+    m.scanCutoff = scanCutoff;
     std::vector<char> buf(cmtext.begin(), cmtext.end());
     buf.push_back('\0');
     char errbuf[eslERRBUFSIZE];
@@ -279,12 +288,12 @@ InfHit scanRegionInfernal(const InfModel &model, CM_t *tcm, const std::string &r
     if (model.useInside) {
         scanStatus = FastIInsideScan(
             tcm, errbuf, tcm->smx, SMX_QDB1_TIGHT, dsq,
-            1, Lwin, 0.0f, th, TRUE /*do_null3*/, 0.0f, NULL, NULL, NULL, &sc
+            1, Lwin, model.scanCutoff, th, TRUE /*do_null3*/, 0.0f, NULL, NULL, NULL, &sc
         );
     } else {
         scanStatus = FastCYKScan(
             tcm, errbuf, tcm->smx, SMX_QDB1_TIGHT, dsq,
-            1, Lwin, 0.0f, th, TRUE /*do_null3*/, 0.0f, NULL, NULL, NULL, &sc
+            1, Lwin, model.scanCutoff, th, TRUE /*do_null3*/, 0.0f, NULL, NULL, NULL, &sc
         );
     }
     if (scanStatus != eslOK || th->N == 0) {
@@ -326,7 +335,8 @@ InfHit scanRegionInfernal(const InfModel &model, CM_t *tcm, const std::string &r
         if (adata != NULL) cm_alndata_Destroy(adata, FALSE);
         esl_sq_Destroy(sq2aln); esl_sq_Destroy(winSq); esl_stopwatch_Destroy(watch);
         cm_tophits_Destroy(th); free(dsq);
-        Debug(Debug::WARNING) << "cmscan: alignment failed, skipping hit\n";
+        Debug(Debug::WARNING) << "cmscan: alignment failed, skipping hit"
+                              << (errbuf[0] != '\0' ? ": " : "") << errbuf << "\n";
         return h;
     }
 
@@ -338,7 +348,8 @@ InfHit scanRegionInfernal(const InfModel &model, CM_t *tcm, const std::string &r
         cm_alndata_Destroy(adata, FALSE);
         esl_sq_Destroy(sq2aln); esl_sq_Destroy(winSq); esl_stopwatch_Destroy(watch);
         cm_tophits_Destroy(th); free(dsq);
-        Debug(Debug::WARNING) << "cmscan: alidisplay failed, skipping hit\n";
+        Debug(Debug::WARNING) << "cmscan: alidisplay failed, skipping hit"
+                              << (errbuf[0] != '\0' ? ": " : "") << errbuf << "\n";
         return h;
     }
 
@@ -746,7 +757,11 @@ int cmscan(int argc, const char **argv, const Command &command) {
         const bool useInside = (par.cmMode == 1);
         int alignOpts = par.cmAlign ? CM_ALIGN_OPTACC : CM_ALIGN_CYK;
         if (par.cmAlignBanded == 0) alignOpts |= CM_ALIGN_NONBANDED;
-        InfModel model = loadModel(cmText, useInside, alignOpts, par.cmAlignBanded != 0, par.cmLocal != 0);
+        InfModel model = loadModel(
+            cmText, useInside, alignOpts,
+            par.cmAlignBanded != 0, par.cmLocal != 0,
+            par.cmScanCutoff
+        );
         if (!model.valid) {
             Debug(Debug::WARNING) << "cmscan: could not load model key " << ref.key << ", skipping\n";
             continue;

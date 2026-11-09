@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <cmath>
+#include <vector>
 #include "LocalParameters.h"
 #include "LocalCommandDeclarations.h"
 #include "Debug.h"
@@ -6,7 +9,7 @@
 #include "IndexReader.h"
 #include "NucleotideMatrix.h"
 #include "SubstitutionMatrix.h"
-#include "EvalueComputation.h"
+#include "RnaEvalueComputation.h"
 #include "QueryMatcher.h"
 #include "FileUtil.h"
 #include "Sequence.h"
@@ -14,6 +17,7 @@
 #include "FastSort.h"
 #include "RnaMatcher.h"
 #include "DinucleotideMapping.h"
+#include "TargetGcStat.h"
 
 #ifdef OPENMP
 #include <omp.h>
@@ -41,15 +45,16 @@ int rnaalign(int argc, const char **argv, const Command &command) {
         NULL, 0);
     par.parseParameters(argc, argv, command, true, 0, MMseqsParameter::COMMAND_ALIGN);
 
-    // RNA always searches both strands
-    const bool bothStrands = true;
+    // the search space covers the query strands searched (--strand 2: both, doubling E)
+    const bool bothStrands = (par.strand == 2);
     const size_t targetDbSize = par.dbSize;
     float covThr = par.covThr;
+    const float canCovThr = par.covThr;
     const int covMode = par.covMode;
     const int seqIdMode = par.seqIdMode;
     const double evalThr = par.evalThr;
-    const double seqIdThr = par.seqIdThr;
-    const int alnLenThr = par.alnLenThr;
+    double seqIdThr = par.seqIdThr;
+    int alnLenThr = par.alnLenThr;
     const bool includeIdentity = par.includeIdentity;
     bool addBacktrace = par.addBacktrace;
     const float scoreBias = par.scoreBias;
@@ -68,10 +73,21 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     const float realignScoreBias = par.realignScoreBias;
     const int realignMaxSeqs = par.realignMaxSeqs;
     float realignCov = 0.0f;
+    double realignSeqIdThr = 0.0;
+    int realignAlnLenThr = 0;
     unsigned int realignSwMode = RnaMatcher::SCORE_COV;
     if (realign) {
         realignCov = covThr;
         covThr = 0.0f;
+        // The first pass is SCORE_ONLY, where seqId is only estimated from the score per column.
+        // Filtering on that estimate discards hits whose true identity clears the threshold, so
+        // defer the check to the realignment, which counts identities in mononucleotide space.
+        realignSeqIdThr = seqIdThr;
+        seqIdThr = 0.0;
+        // Same problem for the alignment length: the first pass reports no start position, so its
+        // alnLength is one larger than the realigned one that actually gets written out.
+        realignAlnLenThr = alnLenThr;
+        alnLenThr = 0;
         if (addBacktrace == false) {
             addBacktrace = true;
         }
@@ -90,6 +106,9 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     // This ensures realignment computes backtrace when needed
     if (realign) {
         unsigned int realignAlnMode = std::max(alignmentMode, (unsigned int)Parameters::ALIGNMENT_MODE_SCORE_COV);
+        if (realignSeqIdThr > 0.0) {
+            realignAlnMode = Parameters::ALIGNMENT_MODE_SCORE_COV_SEQID;
+        }
         switch (realignAlnMode) {
             case Parameters::ALIGNMENT_MODE_SCORE_COV:
                 realignSwMode = RnaMatcher::SCORE_COV;
@@ -192,8 +211,42 @@ int rnaalign(int argc, const char **argv, const Command &command) {
     }
 
     size_t effectiveDbSize = targetDbSize == 0 ? tdbr->getAminoAcidDBSize() : targetDbSize;
-    EvalueComputation evaluer(effectiveDbSize, &subMat, gapOpen, gapExtend,
+    RnaEvalueComputation evaluer(effectiveDbSize, &subMat, gapOpen, gapExtend,
                               bothStrands, /*useRnaCorrection=*/false);
+    const bool profileQuery =
+        Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_HMM_PROFILE)
+        && (DBReader<unsigned int>::getExtendedDbtype(querySeqType)
+            & Parameters::DBTYPE_EXTENDED_SRC_SEQUENCE) == 0;
+    evaluer.setProfileQuery(profileQuery);
+
+    bool precomputed = false;
+    TargetGcStat st = TargetGcStat::forTarget(par.db2, tdbr, (double)effectiveDbSize, precomputed);
+    if (st.empty()) {
+        Debug(Debug::ERROR) << "Cannot compute E-values: the target database has no A/C/G/U residues to "
+                            << "build its GC statistic from (read as " << par.db2 << "). E-values need a "
+                            << "nucleotide target database.\n";
+        EXIT(EXIT_FAILURE);
+    }
+    std::vector<std::pair<double, double> > hist =
+        st.deriveHistogram(4, EvalueModel::R0_TARGET_LEN, (double)effectiveDbSize);
+    evaluer.setTargetGcHistogram(hist);
+    /*
+    Debug(Debug::INFO) << "E-value: per-query " << (profileQuery ? "profile" : "sequence") << " model"
+                       << (profileQuery ? " (free per-profile lambda and mu, no lambda_KA)" : "")
+                       << ", K correction; target GC histogram "
+                       << (precomputed ? "from " : "sampled from ")
+                       << st.nSeq << " of " << tdbr->getSize() << " sequences"
+                       << (precomputed ? " (precomputed)" : "")
+                       << " (weights are residues / " << EvalueModel::R0_TARGET_LEN << "):";
+    for (size_t b = 0; b < hist.size(); b++) {
+        Debug(Debug::INFO) << " [" << hist[b].first << " x " << hist[b].second << "]";
+    }
+    Debug(Debug::INFO) << "\n";
+    */
+    if (precomputed == false && tdbr->getSize() > 200000) {
+        Debug(Debug::WARNING) << "Target GC was sampled, not scanned. Run `riboseek rnagcstat "
+                              << par.db2 << "` once to precompute it.\n";
+    }
 
     Debug(Debug::INFO) << "Query database size: " << qdbr->getSize() << " type: " << Parameters::getDbTypeName(querySeqType) << "\n";
     Debug(Debug::INFO) << "Target database size: " << tdbr->getSize() << " type: " << Parameters::getDbTypeName(targetSeqType) << "\n";
@@ -318,7 +371,7 @@ int rnaalign(int argc, const char **argv, const Command &command) {
                         dinucEncodeReverse(&dbSeq);
                     }
 
-                    if (Util::canBeCovered(covThr, covMode, static_cast<float>(origQueryLen), static_cast<float>(dbSeq.L)) == false) {
+                    if (Util::canBeCovered(canCovThr, covMode, static_cast<float>(origQueryLen), static_cast<float>(dbSeq.L)) == false) {
                         rejected++;
                         continue;
                     }
@@ -434,7 +487,9 @@ int rnaalign(int argc, const char **argv, const Command &command) {
                                                                            realignSwMode, seqIdMode, isIdentity, false, reverse);
 
                         const bool covOK = Util::hasCoverage(realignCov, covMode, res.qcov, res.dbcov);
-                        if (covOK || isIdentity) {
+                        const bool seqIdOK = (res.seqId >= realignSeqIdThr);
+                        const bool alnLenOK = Util::hasAlignmentLength(realignAlnLenThr, res.alnLength);
+                        if ((covOK && seqIdOK && alnLenOK) || isIdentity) {
                             res.score = swResults[result].score;
                             res.eval = swResults[result].eval;
                             swRealignResults.emplace_back(res);

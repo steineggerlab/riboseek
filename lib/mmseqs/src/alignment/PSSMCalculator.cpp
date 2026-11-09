@@ -666,11 +666,7 @@ void PSSMCalculator::computeContextSpecificWeights(float * matchWeight, float *w
         }
 
         // Calculate amino acid frequencies q->f[i][a] from weights wi[k]
-#ifdef RIBOSEEK
-        for (size_t a = 0; a < canonicalSize; ++a)
-#else
-        for (int a = 0; a < 20; ++a)
-#endif
+        for (size_t a = 0; a < Sequence::PROFILE_AA_SIZE; ++a)
             matchWeight[i * Sequence::PROFILE_AA_SIZE + a] = 0.0;
         for (size_t k = 0; k < setSize; ++k)
             matchWeight[i * Sequence::PROFILE_AA_SIZE + (int) X[k][i]] += wi[k];

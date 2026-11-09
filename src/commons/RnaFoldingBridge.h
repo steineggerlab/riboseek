@@ -5,7 +5,7 @@
 #include <vector>
 
 #include <cctype>
-#include <tornadofold.h>
+#include <ribossfold.h>
 
 static inline bool rnaFoldPredictDotBracket(const std::string &rna,
                                             std::string &dotBracket,
@@ -18,7 +18,7 @@ static inline bool rnaFoldPredictDotBracket(const std::string &rna,
         return false;
     }
 
-    tornadofold::TornadoFold folder;
+    ribossfold::RibossFold folder;
     int mfe = folder.fold(rna);
     dotBracket = folder.traceback(mfe);
     if (dotBracket.size() != rna.size()) {
@@ -31,12 +31,13 @@ static inline bool rnaFoldPredictDotBracket(const std::string &rna,
     return true;
 }
 
-// Consensus dot-bracket via single-seq folding of the QUERY sequence (rows[0],
-// ungapped), with the predicted structure mapped back into alignment-column
-// space (gap columns receive '.')
-static inline bool rnaFoldAlifoldDotBracket(const std::vector<std::string> &rows,
-                                            std::string &dotBracket,
-                                            double *scoreOut) {
+// Dot-bracket via single-sequence MFE folding of one aligned row (ungapped),
+// with the predicted structure mapped back into alignment-column space (gap
+// columns receive '.')
+static inline bool rnaFoldMfeDotBracket(const std::string &alignedRow,
+                                        std::string &dotBracket,
+                                        double *scoreOut) {
+    const std::vector<std::string> rows(1, alignedRow);
     dotBracket.clear();
     if (scoreOut != nullptr) *scoreOut = 0.0;
     if (rows.empty()) return false;

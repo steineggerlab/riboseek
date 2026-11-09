@@ -54,6 +54,65 @@ int splitsequence(int argc, const char **argv, const Command& command) {
     headerWriter.open();
 
     size_t sequenceOverlap = par.sequenceOverlap;
+
+    // makepaddedseqdb pads every sequence to a multiple of ALIGN and asserts that each
+    // entry starts on an ALIGN-byte boundary; the GPU (marv) kernels rely on it for
+    // vectorised loads. Splitting such a DB writes entries at offset + split*step, so
+    // the step must preserve that alignment or the kernel faults with
+    // "CUDA error: misaligned address". Round the step DOWN to a multiple of ALIGN,
+    // which only ever widens the requested overlap, never narrows it.
+    const size_t PADDED_DB_ALIGN = 4;  // keep in sync with ALIGN in makepaddedseqdb.cpp
+#ifdef RIBOSEEK
+    const char PADDED_DB_PAD_SYMBOL = 24;
+#else
+    const char PADDED_DB_PAD_SYMBOL = 20;
+#endif
+    const bool isPaddedDb =
+        (DBReader<unsigned int>::getExtendedDbtype(reader.getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU) != 0;
+    size_t splitStep = par.maxSeqLen - sequenceOverlap;
+    if (isPaddedDb) {
+        size_t alignedStep = splitStep & ~(PADDED_DB_ALIGN - 1);
+        if (alignedStep == 0) {
+            Debug(Debug::ERROR) << "--max-seq-len minus --sequence-overlap must be at least "
+                                << PADDED_DB_ALIGN << " for a GPU (padded) database.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (alignedStep != splitStep) {
+            Debug(Debug::INFO) << "GPU database: reducing split step from " << splitStep << " to "
+                               << alignedStep << " to keep entries " << PADDED_DB_ALIGN
+                               << "-byte aligned (effective overlap "
+                               << (par.maxSeqLen - alignedStep) << ").\n";
+        }
+        splitStep = alignedStep;
+    }
+    // A strand-split query keeps the strand in the key's parity (even forward, odd reverse),
+    // so its pieces get keys of the same parity: forward pieces 0, 2, 4, ... and reverse
+    // pieces 1, 3, 5, ... in key order. Dense renumbering would put pieces on the wrong strand.
+    const bool strandSplit =
+        (DBReader<unsigned int>::getExtendedDbtype(reader.getDbtype()) & Parameters::DBTYPE_EXTENDED_STRAND_SPLIT) != 0;
+    // splitstrand stores a sequence's reverse entry as the forward text (it is reversed when
+    // mapped), while a profile's reverse entry is stored already reversed
+    const bool reverseStoredForward = strandSplit
+        && Parameters::isEqualDbtype(reader.getDbtype(), Parameters::DBTYPE_HMM_PROFILE) == false;
+    std::vector<unsigned int> firstPieceKey;
+    if (strandSplit) {
+        std::vector<size_t> byKey(reader.getSize());
+        for (size_t i = 0; i < byKey.size(); i++) {
+            byKey[i] = i;
+        }
+        std::sort(byKey.begin(), byKey.end(), [&reader](size_t a, size_t b) {
+            return reader.getDbKey(a) < reader.getDbKey(b);
+        });
+        firstPieceKey.resize(reader.getSize());
+        unsigned int piecesWithParity[2] = {0, 0};
+        for (size_t j = 0; j < byKey.size(); j++) {
+            const size_t i = byKey[j];
+            const unsigned int parity = reader.getDbKey(i) % 2;
+            firstPieceKey[i] = 2 * piecesWithParity[parity] + parity;
+            piecesWithParity[parity] += (unsigned int) ceilf(static_cast<float>(reader.getSeqLen(i)) / static_cast<float>(splitStep));
+        }
+    }
+
     Debug::Progress progress(reader.getSize());
 #pragma omp parallel
     {
@@ -75,7 +134,11 @@ int splitsequence(int argc, const char **argv, const Command& command) {
             unsigned int key = reader.getDbKey(i);
             const char* data=NULL;
             if (par.sequenceSplitMode == Parameters::SEQUENCE_SPLIT_MODE_HARD) {
-                data = reader.getData(i, thread_idx);
+                // getData() decodes a padded (GPU) database back to letters via
+                // DBReader::getUnpadded(); a hard split must copy the raw encoded bytes
+                // instead, or the result is no longer a valid GPU database.
+                data = isPaddedDb ? reader.getDataUncompressed(i)
+                                  : reader.getData(i, thread_idx);
             }
             size_t seqLen = reader.getSeqLen(i);
             char* header = headerReader.getData(i, thread_idx);
@@ -92,34 +155,59 @@ int splitsequence(int argc, const char **argv, const Command& command) {
                     dbKey = loc.id;
                 }
             }
-            size_t splitCnt = (size_t) ceilf(static_cast<float>(seqLen) / static_cast<float>(par.maxSeqLen - sequenceOverlap));
+            size_t splitCnt = (size_t) ceilf(static_cast<float>(seqLen) / static_cast<float>(splitStep));
 
             for (size_t split = 0; split < splitCnt; split++) {
-                size_t len = std::min(par.maxSeqLen, seqLen - (split * par.maxSeqLen - split*sequenceOverlap));
-                size_t startPos = split * par.maxSeqLen - split*sequenceOverlap;
+                const unsigned int pieceKey = strandSplit ? firstPieceKey[i] + 2 * split : key;
+                size_t startPos = split * splitStep;
+                size_t len = std::min(par.maxSeqLen, seqLen - startPos);
                 if (par.sequenceSplitMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT) {
                     // +2 to emulate the \n\0
-                    sequenceWriter.writeIndexEntry(key, reader.getOffset(i) + startPos, len+2, thread_idx);
+                    sequenceWriter.writeIndexEntry(pieceKey, reader.getOffset(i) + startPos, len+2, thread_idx);
+                } else if (isPaddedDb) {
+                    // A hard split writes entries back to back, which would destroy the
+                    // ALIGN-byte start alignment makepaddedseqdb guarantees and the GPU
+                    // kernels rely on. Mirror makepaddedseqdb: pad the written payload up
+                    // to ALIGN, but record only the logical length (len + \n\0) in the
+                    // index so the padding is never read as sequence.
+                    // makepaddedseqdb stores sequence bytes padded up to ALIGN with the
+                    // pad symbol and NO newline/null; the "+2" in the index length is a
+                    // convention DBReader subtracts back off. Reproduce that exactly.
+                    const size_t padding = (len % PADDED_DB_ALIGN == 0)
+                                         ? 0 : PADDED_DB_ALIGN - (len % PADDED_DB_ALIGN);
+                    std::string chunk;
+                    chunk.reserve(len + padding);
+                    chunk.append(data + startPos, len);
+                    chunk.append(padding, PADDED_DB_PAD_SYMBOL);
+                    sequenceWriter.writeData(chunk.c_str(), chunk.size(), pieceKey, thread_idx, false, false);
+                    sequenceWriter.writeIndexEntry(pieceKey, sequenceWriter.getStart(thread_idx), len + 2, thread_idx);
                 } else {
                     sequenceWriter.writeStart(thread_idx);
                     sequenceWriter.writeAdd(data + startPos, len, thread_idx);
                     char newLine = '\n';
                     sequenceWriter.writeAdd(&newLine, 1, thread_idx);
-                    sequenceWriter.writeEnd(key, thread_idx, true);
+                    sequenceWriter.writeEnd(pieceKey, thread_idx, true);
                 }
 
                 if (par.headerSplitMode == 0) {
                     size_t fromPos = from + startPos;
                     size_t toPos = (from + startPos) + (len - 1);
                     if (loc.id != UINT_MAX && loc.strand == Orf::STRAND_MINUS) {
-                        fromPos = (seqLen - 1) - (from + startPos);
-                        toPos   = fromPos - std::min(fromPos, len);
+                        if (reverseStoredForward) {
+                            // the piece is forward text [from+startPos, from+startPos+len); reversed,
+                            // its first position is the last forward position of that range
+                            fromPos = from + startPos + (len - 1);
+                            toPos   = from + startPos;
+                        } else {
+                            fromPos = (seqLen - 1) - (from + startPos);
+                            toPos   = fromPos - std::min(fromPos, len);
+                        }
                     }
 
                     size_t bufferLen = Orf::writeOrfHeader(buffer, dbKey, fromPos, toPos, 0, 0);
-                    headerWriter.writeData(buffer, bufferLen, key, thread_idx);
+                    headerWriter.writeData(buffer, bufferLen, pieceKey, thread_idx);
                 } else {
-                    headerWriter.writeData(header, headerLen, key, thread_idx);
+                    headerWriter.writeData(header, headerLen, pieceKey, thread_idx);
                 }
             }
         }
@@ -131,7 +219,8 @@ int splitsequence(int argc, const char **argv, const Command& command) {
     if (par.sequenceSplitMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT) {
         DBReader<unsigned int>::softlinkDb(par.db1, par.db2, DBFiles::DATA);
     }
-    // make identifiers stable
+    // make identifiers stable; strand-split pieces already have unique keys of the right parity
+    if (strandSplit == false) {
 #pragma omp parallel
     {
 #pragma omp single
@@ -146,6 +235,7 @@ int splitsequence(int argc, const char **argv, const Command& command) {
                 DBWriter::createRenumberedDB(par.db2, par.db2Index, par.createLookup ? par.db1 : "", par.createLookup ? par.db1Index : "");
             }
         }
+    }
     }
     DBReader<unsigned int>::softlinkDb(par.db1, par.db2, DBFiles::SOURCE);
 

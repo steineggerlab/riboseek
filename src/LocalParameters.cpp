@@ -10,6 +10,10 @@ LocalParameters::LocalParameters() : Parameters(),
         "long/genomic targets, may clip hits near the prefilter edge)\n 0: full target (no windowing)",
         typeid(float), (void *) &cmRegionFlanking,
         "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CM_SCAN_CUTOFF(PARAM_CM_SCAN_CUTOFF_ID, "--cm-scan-cutoff", "CM scan score cutoff",
+        "Minimum bit score a window must reach in the CM scan to be considered for alignment",
+        typeid(float), (void *) &cmScanCutoff,
+        "^-?[0-9]*(\\.[0-9]+)?([eE][-+]?[0-9]+)?$", MMseqsParameter::COMMAND_ALIGN),
     PARAM_CM_MODE(PARAM_CM_MODE_ID, "--cm-mode", "CM scan scoring",
         "CM detection scoring: 0 = CYK (max, faster), 1 = Inside (sum, more sensitive)",
         typeid(int), (void *) &cmMode,
@@ -90,9 +94,28 @@ LocalParameters::LocalParameters() : Parameters(),
         "redkmermatcher: k-mer alphabet built from the nucleotides of the dinucleotide db\n"
         "n4: nucleotides (k nt per k-mer)\nd16: dinucleotides (k + 1 nt)\nd12: dinucleotides, 12 classes (k + 1 nt)\n"
         "d8: dinucleotides, 8 classes (k + 1 nt)",
-        typeid(std::string), (void *) &kmerAlph, "^(n4|d16|d12|d8)$", MMseqsParameter::COMMAND_CLUSTLINEAR)
+        typeid(std::string), (void *) &kmerAlph, "^(n4|d16|d12|d8)$", MMseqsParameter::COMMAND_CLUSTLINEAR),
+    PARAM_CMBUILD_MIN_ROW_COV(PARAM_CMBUILD_MIN_ROW_COV_ID, "--cmbuild-min-row-cov", "cmbuild minimum row coverage",
+        "Drop MSA rows with non-gap coverage below this fraction",
+        typeid(float), (void *) &cmbuildMinRowCov,
+        "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_PROFILE),
+    PARAM_TARGET_SPLIT_DB(PARAM_TARGET_SPLIT_DB_ID, "--target-split-db", "Pre-split target DB",
+        "Pre-computed splitsequence output of the target DB. When given, search reuses it instead of\n"
+        "splitting the target again, which saves the splitsequence pass and its temporary copy.\n"
+        "Build it with something like: riboseek splitsequence <targetDB> <splitDB> --max-seq-len N --sequence-overlap 0\n"
+        "The original target DB must still be passed as the target argument: coordinates are mapped\n"
+        "back through it and fragmented hits are re-aligned against it.\n",
+        typeid(std::string), (void *) &targetSplitDb,
+        "^.*$", MMseqsParameter::COMMAND_PREFILTER),
+    PARAM_REALIGN_QUERY_DB(PARAM_REALIGN_QUERY_DB_ID, "--realign-query-db", "Query DB for fragment re-alignment",
+        "Strand-split query DB of the current search iteration,\n"
+        "set by the search workflow. offsetalignment re-aligns target-split fragments with exactly the\n"
+        "query the aligner used: the sequence in the first iteration, the profile in later ones.",
+        typeid(std::string), (void *) &realignQueryDb,
+        "^.*$", MMseqsParameter::COMMAND_EXPERT)
 {
     cmRegionFlanking = 1.0f;  // 1.0 => pad by full W (prior hardcoded behavior)
+    cmScanCutoff = 0.0f;
     cmMode = 1;
     cmAlign = 0;
     cmAlignBanded = 1;
@@ -115,6 +138,9 @@ LocalParameters::LocalParameters() : Parameters(),
     chainExtend = 0;
     chainExtendEval = 1.0;
     kmerAlph = "n4";
+    cmbuildMinRowCov = 0.30f;
+    targetSplitDb = "";
+    realignQueryDb = "";
 
     // Register dinuc.out as compiled-in matrix and set as default
     scoringMatrixFile = MultiParam<NuclAA<std::string>>(NuclAA<std::string>("dinuc.out", "dinuc.out"));
@@ -125,8 +151,14 @@ LocalParameters::LocalParameters() : Parameters(),
     alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(25, 5));
     maskMode = 0;
 
+    // Search both query strands unless asked otherwise; the E-value covers the strands searched
+    strand = 2;
+    overrideParameterDescription(PARAM_STRAND,
+        "Query strand(s) to search; E-values cover only the strands searched\n0: reverse complement\n1: forward\n2: both");
+
     cmscan = align;
     cmscan.push_back(&PARAM_CM_REGION);
+    cmscan.push_back(&PARAM_CM_SCAN_CUTOFF);
     cmscan.push_back(&PARAM_CM_MODE);
     cmscan.push_back(&PARAM_CM_ALIGN);
     cmscan.push_back(&PARAM_CM_ALIGN_BANDED);
@@ -155,6 +187,10 @@ LocalParameters::LocalParameters() : Parameters(),
     // linclust --kmer-alph: both kmermatcher levels run redkmermatcher (RnaCluster.cpp)
     linclustworkflow.push_back(&PARAM_KMER_ALPH);
     rnaalign.push_back(&PARAM_DB_SIZE);
+    rnaalign.push_back(&PARAM_STRAND);
+
+    rnagcstat.push_back(&PARAM_THREADS);
+    rnagcstat.push_back(&PARAM_V);
 
     splitstrand.push_back(&PARAM_STRAND);
     splitstrand.push_back(&PARAM_THREADS);
@@ -173,6 +209,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuild.push_back(&PARAM_CMBUILD_ERE);
     cmbuild.push_back(&PARAM_CMBUILD_SYMFRAC);
     cmbuild.push_back(&PARAM_CMBUILD_NOSS);
+    cmbuild.push_back(&PARAM_CMBUILD_MIN_ROW_COV);
     cmbuild.push_back(&PARAM_THREADS);
     cmbuild.push_back(&PARAM_COMPRESSED);
     cmbuild.push_back(&PARAM_V);
@@ -185,4 +222,11 @@ LocalParameters::LocalParameters() : Parameters(),
     // result2profile needs --strand so the RNA-corrected E-value gets the
     // both-strands doubling (matches MMseqs2 RNA fork behavior)
     result2profile.push_back(&PARAM_STRAND);
+
+    // Top-level search option only: the sub-modules never see it, so it is not
+    // added to any list that feeds createParameterString for prefilter/align.
+    offsetalignment.push_back(&PARAM_REALIGN_QUERY_DB);
+    // the fragment re-aligner computes E-values for the strands searched
+    offsetalignment.push_back(&PARAM_STRAND);
+    searchworkflow.push_back(&PARAM_TARGET_SPLIT_DB);
 }

@@ -186,6 +186,15 @@ GrowCP9Matrix(CP9_MX *mx, char *errbuf, int N, int M, int *kmin, int *kmax, int 
     ESL_RALLOC(mx->imx_mem,  p, sizeof(int) * ncells_needed);
     ESL_RALLOC(mx->dmx_mem,  p, sizeof(int) * ncells_needed);
     ESL_RALLOC(mx->elmx_mem, p, sizeof(int) * ncells_needed);
+
+    /* cp9_FB2HMMBands() sums posteriors over [ip][k] cells
+     * any cell not filled by FWBW is read as garbage. */
+    esl_vec_ISet(mx->mmx_mem,  ncells_needed, -INFTY);
+    esl_vec_ISet(mx->imx_mem,  ncells_needed, -INFTY);
+    esl_vec_ISet(mx->dmx_mem,  ncells_needed, -INFTY);
+    esl_vec_ISet(mx->elmx_mem, ncells_needed, -INFTY);
+    esl_vec_ISet(mx->erow,     N+1,           -INFTY);
+
     mx->ncells_allocated = ncells_needed;
 
     /* update size */

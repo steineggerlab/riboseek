@@ -444,7 +444,6 @@ bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
     MsaFilter &msaFilter = *ctx.msaFilter;
     Sequence &targetMapper = *ctx.targetMapper;
     const std::vector<int> &qid_vec = ctx.qid_vec;
-    const float alifoldMinCov = ctx.alifoldMinCov;
     const float minColCoverage = ctx.minColCoverage;
     const bool doMsaFilter = ctx.doMsaFilter;
     const bool decodeTargetDinuc = ctx.decodeTargetDinuc;
@@ -463,7 +462,7 @@ bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
             // Render the query row directly from raw nucleotide DB chars.
             // The MSA stored in MultipleAlignment::MSAResult uses the
             // dinucleotide alphabet (24-symbol), so num2aa[]-based decoding
-            // collapses most positions to 'N' — fatal for alifold/Infernal.
+            // collapses most positions to 'N' — fatal for folding/Infernal.
             // Mirror result2dnamsa.cpp instead: emit raw chars from the DB
             // and walk each backtrace in query coordinates.
             const char *querySeq = qDbr.getData(queryId, thread_idx);
@@ -479,15 +478,12 @@ bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
             Matcher::readAlignmentResults(alnResults, resultReader.getData(id, thread_idx), false);
 
             std::vector<AlnSeq> stoSeqs;
-            std::vector<std::string> alifoldRows;
             stoSeqs.reserve(alnResults.size() + 1);
-            alifoldRows.reserve(alnResults.size() + 1);
 
             AlnSeq queryAs;
             queryAs.id = "query_" + std::to_string(queryKey);
             queryAs.aln = queryRow;
             stoSeqs.push_back(queryAs);
-            alifoldRows.push_back(queryRow);
 
             for (size_t i = 0; i < alnResults.size(); i++) {
                 Matcher::result_t res = alnResults[i];
@@ -566,22 +562,17 @@ bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
                 as.id = "t" + std::to_string(res.dbKey);
                 as.aln = std::move(row);
                 if (cov >= minColCoverage) {
-                    if (cov >= alifoldMinCov) alifoldRows.push_back(as.aln);
                     stoSeqs.push_back(std::move(as));
-                } else if (cov >= alifoldMinCov) {
-                    alifoldRows.push_back(std::move(as.aln));
                 }
             }
 
-            // Consensus SS via alifold over high-coverage rows; falls back to
-            // single-seq fold on row 0 if only the query passed the filter.
+            // SS_cons from a single-sequence MFE fold of the query row.
             std::string ssCons;
             double mfe = 0.0;
-            bool ssOk = rnaFoldAlifoldDotBracket(alifoldRows, ssCons, &mfe);
+            bool ssOk = rnaFoldMfeDotBracket(queryRow, ssCons, &mfe);
             (void)mfe;
             if (std::getenv("RIBOSEEK_DEBUG_SSCONS") != nullptr) {
                 Debug(Debug::WARNING) << "[ssCons] q=" << queryKey
-                    << " alifoldRows=" << alifoldRows.size()
                     << " ok=" << (ssOk ? 1 : 0)
                     << " len=" << ssCons.size()
                     << " ss=[" << ssCons << "]\n";
@@ -763,18 +754,10 @@ int cmbuild(int argc, const char **argv, const Command &command) {
 
     Debug::Progress progress(resultReader.getSize());
 
-    // Stockholm rows are filtered: drop any target with non-gap coverage
-    // below this threshold. Infernal's cm_parsetree_Doctor() can fail when
-    // many short fragments dominate the column statistics.
-    const float minColCoverage = 0.30f;
-    // Stricter filter for the alifold input: noisy rows degrade the
-    // covariation signal, so feed only well-covered rows to alifold
-    // (default 0.70, override with RIBOSEEK_ALIFOLD_MINCOV).
-    float alifoldMinCov = 0.70f;
-    if (const char *envCov = std::getenv("RIBOSEEK_ALIFOLD_MINCOV")) {
-        float v = std::atof(envCov);
-        if (v > 0.0f && v <= 1.0f) alifoldMinCov = v;
-    }
+    // Stockholm rows are filtered: drop any target with non-gap coverage below
+    // --cmbuild-min-row-cov. Infernal's cm_parsetree_Doctor() can fail when many
+    // short fragments dominate the column statistics.
+    const float minColCoverage = par.cmbuildMinRowCov;
 
     // Optional rMSA/hhfilter-style row filter on the cmbuild input MSA. Knobs
     // map 1:1 to MMseqs MsaFilter: --cov-msa, --filter-max-seqid, --diff (Ndiff),
@@ -806,7 +789,7 @@ int cmbuild(int argc, const char **argv, const Command &command) {
         CmBuildCtx ctx;
         ctx.qDbr = &qDbr; ctx.tDbr = tDbr; ctx.resultReader = &resultReader;
         ctx.subMat = &subMat; ctx.msaFilter = &msaFilter; ctx.targetMapper = &targetMapper;
-        ctx.qid_vec = qid_vec; ctx.alifoldMinCov = alifoldMinCov; ctx.minColCoverage = minColCoverage;
+        ctx.qid_vec = qid_vec; ctx.minColCoverage = minColCoverage;
         ctx.doMsaFilter = doMsaFilter; ctx.decodeTargetDinuc = decodeTargetDinuc; ctx.targetSeqType = targetSeqType;
         ctx.targetGpuDb = targetGpuDb;
 

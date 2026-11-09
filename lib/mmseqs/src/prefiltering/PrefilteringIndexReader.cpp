@@ -90,6 +90,8 @@ void PrefilteringIndexReader::createIndexFile(const std::string &outDB,
     if (Parameters::isEqualDbtype(srcSeqType, Parameters::DBTYPE_NUCLEOTIDES) && Sequence::getAuxInfo(srcSeqType) != NULL) {
         srcSeqType = DBReader<unsigned int>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, DBReader<unsigned int>::getExtendedDbtype(srcSeqType));
     }
+    seqType = DBReader<unsigned int>::encodedGpuDbtype(seqType);
+    srcSeqType = DBReader<unsigned int>::encodedGpuDbtype(srcSeqType);
 #endif
     int metadata[] = {maxSeqLen, kmerSize, biasCorr, alphabetSize, mask, spacedKmer, kmerThr, seqType, srcSeqType, headers1, headers2, splits};
     char *metadataptr = (char *) &metadata;

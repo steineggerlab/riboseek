@@ -1,0 +1,32 @@
+{
+  "name": "ribossfold-wasm",
+  "version": "0.0.4",
+  "description": "Fast RNA minimum free energy secondary structure prediction",
+  "keywords": [
+    "rna",
+    "secondary-structure",
+    "mfe",
+    "folding",
+    "bioinformatics",
+    "wasm",
+    "webassembly"
+  ],
+  "homepage": "https://github.com/mirditalab/RibossFold",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mirditalab/RibossFold.git",
+    "directory": "npm"
+  },
+  "bugs": "https://github.com/mirditalab/RibossFold/issues",
+  "license": "MIT",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "ribossfold.js",
+    "ribossfold-simd.js"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "test": "node test.js"
+  }
+}

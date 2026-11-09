@@ -11,6 +11,7 @@
 #include "GpuUtil.h"
 #endif
 
+#include <algorithm>
 #include <random>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -46,7 +47,12 @@ int gpuserver(int argc, const char **argv, const Command& command) {
         lengths.emplace_back(dbr->getIndex()[id].length - 2);
     }
     offsets.emplace_back(offsets.back() + lengths.back());
+    // the last entry of a split padded DB can be a short remainder; the one before it is then a
+    // full chunk, which is the longest
     int32_t maxTargetLength = lengths.back();
+    if (lengths.size() > 1) {
+        maxTargetLength = std::max(maxTargetLength, lengths[lengths.size() - 2]);
+    }
 
     BaseMatrix *subMat;
     if (Parameters::isEqualDbtype(dbrIdx.sequenceReader->getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {

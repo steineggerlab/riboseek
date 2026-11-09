@@ -147,7 +147,13 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
            Debug(Debug::ERROR) << "Invalid GPU database\n";
            EXIT(EXIT_FAILURE);
        }
+        // makepaddedseqdb sorts by length, but splitsequence replaces each long entry by its
+        // chunks in place, so the last entry can be a short remainder; the one before it is then
+        // a full chunk, which is the longest
         int32_t maxTargetLength = lengths.back();
+        if (lengths.size() > 1) {
+            maxTargetLength = std::max(maxTargetLength, lengths[lengths.size() - 2]);
+        }
         Marv::AlignmentType type = (par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) ?
                 Marv::AlignmentType::GAPLESS_SMITH_WATERMAN : Marv::AlignmentType::GAPLESS;
         // marv = new Marv(tdbr->getSize(), subMat->alphabetSize, maxTargetLength,
@@ -562,7 +568,11 @@ void runFilterOnCpu(Parameters & par, BaseMatrix * subMat, int8_t * tinySubMat,
     std::vector<hit_t> shortResults;
     shortResults.reserve(tdbr->getSize()/2);
     Debug::Progress progress(qdbr->getSize());
+#ifdef RIBOSEEK
+    const int targetSeqType = DBReader<unsigned int>::encodedGpuDbtype(tdbr->getDbtype());
+#else
     const int targetSeqType = tdbr->getDbtype();
+#endif
     const int querySeqType = qdbr->getDbtype();
 #ifdef OPENMP
     omp_set_nested(1);

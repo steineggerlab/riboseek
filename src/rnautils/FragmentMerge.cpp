@@ -1,0 +1,205 @@
+#include "FragmentMerge.h"
+#include "RnaRealign.h"
+
+#include "Matcher.h"
+#include "DBReader.h"
+#include "LocalParameters.h"
+#include "Debug.h"
+#include "Util.h"
+#include "Orf.h"
+
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <vector>
+
+// Splitting a long target with `splitsequence` makes every chunk its own target, so an
+// alignment that straddles a chunk boundary is reported as two (or more) colinear
+// fragments. Once offsetalignment has mapped the coordinates back onto the original
+// sequence those fragments become adjacent, and the whole alignment can be recovered by
+// re-running Smith-Waterman once over a bounded window of the ORIGINAL target -- a window
+// that spans the former boundary, so nothing is cut any more.
+//
+// Groups that are already a single, well-covered alignment are passed through untouched,
+// so the cost is one windowed SW per genuinely fragmented locus.
+
+namespace {
+
+// Two fragments belong to the same alignment when they are adjacent (or slightly
+// overlapping) in BOTH query and target coordinates. The tolerance absorbs the few bases
+// each chunk's own local alignment trims at its edge.
+// TODO: these two parameters need tuning
+const int JOIN_TOLERANCE = 50;
+// A lone hit covering less than this fraction of the query may have been cut by a boundary.
+const float FULL_COVERAGE = 0.95f;
+
+// The iteration's strand-split query DB (--realign-query-db, set by the search workflow): the exact query rnaalign aligned
+DBReader<unsigned int> *strandQueries = NULL;
+// Key of each strand's entry in it, at 2 * original query key + (reverse ? 1 : 0); UINT_MAX if absent.
+// splitstrand renumbers its output to consecutive keys, so an entry's key is 2 * the query's POSITION
+// in the query DB (+1 for the reverse strand), which is 2 * its key only when the query DB's keys run
+// 0..N-1 -- not for a subset index or a createsubdb DB, and not with a single strand. The ORF
+// header of every entry still names the original key and the strand, so the lookup is built from those.
+std::vector<unsigned int> strandEntryKeys;
+std::once_flag strandQueriesOnce;
+DBReader<unsigned int> *openStrandQueries() {
+    std::call_once(strandQueriesOnce, []() {
+        LocalParameters &par = LocalParameters::getLocalInstance();
+        if (par.realignQueryDb.empty()) {
+            return;
+        }
+        strandQueries = new DBReader<unsigned int>(par.realignQueryDb.c_str(), (par.realignQueryDb + ".index").c_str(),
+                                                   par.threads, DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
+        strandQueries->open(DBReader<unsigned int>::NOSORT);
+
+        const std::string headerDb = par.realignQueryDb + "_h";
+        DBReader<unsigned int> headers(headerDb.c_str(), (headerDb + ".index").c_str(), 1,
+                                       DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
+        headers.open(DBReader<unsigned int>::NOSORT);
+        for (size_t i = 0; i < headers.getSize(); ++i) {
+            const unsigned int entryKey = headers.getDbKey(i);
+            const Orf::SequenceLocation loc = Orf::parseOrfHeader(headers.getData(i, 0));
+            // splitstrand writes forward as 0..len-1 and reverse as len-1..0; a 1-nt query has
+            // from == to on both, and then its key's parity is the strand (as everywhere else)
+            const bool reverse = loc.from > loc.to || (loc.from == loc.to && entryKey % 2 == 1);
+            const size_t slot = 2 * static_cast<size_t>(loc.id) + (reverse ? 1 : 0);
+            if (slot >= strandEntryKeys.size()) {
+                strandEntryKeys.resize(slot + 1, UINT_MAX);
+            }
+            strandEntryKeys[slot] = entryKey;
+        }
+        headers.close();
+    });
+    return strandQueries;
+}
+
+unsigned int strandEntryKey(unsigned int queryKey, bool reverse) {
+    const size_t slot = 2 * static_cast<size_t>(queryKey) + (reverse ? 1 : 0);
+    return slot < strandEntryKeys.size() ? strandEntryKeys[slot] : UINT_MAX;
+}
+
+void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryKey,
+                    DBReader<unsigned int> *qSource, DBReader<unsigned int> *tSource,
+                    const unsigned char *splitEntries, size_t splitEntriesSize,
+                    int threadIdx) {
+    if (qSource == NULL || tSource == NULL || results.size() == 0 || splitEntries == NULL) {
+        return;
+    }
+    // Only entries that splitsequence actually divided can carry a chunk boundary.
+    const auto entryWasSplit = [&](unsigned int dbKey) {
+        return (size_t)dbKey < splitEntriesSize && splitEntries[dbKey] != 0;
+    };
+
+    std::stable_sort(results.begin(), results.end(),
+                     [](const Matcher::result_t &a, const Matcher::result_t &b) {
+        if (a.dbKey != b.dbKey) return a.dbKey < b.dbKey;
+        const bool ar = a.qStartPos > a.qEndPos, br = b.qStartPos > b.qEndPos;
+        if (ar != br) return ar < br;
+        return std::min(a.dbStartPos, a.dbEndPos) < std::min(b.dbStartPos, b.dbEndPos);
+    });
+
+    std::vector<Matcher::result_t> out;
+    out.reserve(results.size());
+
+    size_t i = 0;
+    while (i < results.size()) {
+        const bool reverse = results[i].qStartPos > results[i].qEndPos;
+        int tLo = std::min(results[i].dbStartPos, results[i].dbEndPos);
+        int tHi = std::max(results[i].dbStartPos, results[i].dbEndPos);
+        int qLo = std::min(results[i].qStartPos, results[i].qEndPos);
+        int qHi = std::max(results[i].qStartPos, results[i].qEndPos);
+        size_t j = i + 1;
+        while (j < results.size()
+               && results[j].dbKey == results[i].dbKey
+               && (results[j].qStartPos > results[j].qEndPos) == reverse
+               && std::min(results[j].dbStartPos, results[j].dbEndPos) <= tHi + JOIN_TOLERANCE
+               && std::min(results[j].qStartPos, results[j].qEndPos) <= qHi + JOIN_TOLERANCE) {
+            tLo = std::min(tLo, std::min(results[j].dbStartPos, results[j].dbEndPos));
+            tHi = std::max(tHi, std::max(results[j].dbStartPos, results[j].dbEndPos));
+            qLo = std::min(qLo, std::min(results[j].qStartPos, results[j].qEndPos));
+            qHi = std::max(qHi, std::max(results[j].qStartPos, results[j].qEndPos));
+            j++;
+        }
+
+        const unsigned int qLen = results[i].qLen;
+        const float qcov = qLen ? static_cast<float>(qHi - qLo + 1) / static_cast<float>(qLen) : 1.0f;
+        const bool looksFragmented = entryWasSplit(results[i].dbKey)
+                                     && (((j - i) > 1) || (qcov < FULL_COVERAGE));
+
+        bool replaced = false;
+        if (looksFragmented) {
+            const size_t tId = tSource->getId(results[i].dbKey);
+            // the query exactly as rnaalign aligned it in this iteration, if the workflow passed it
+            DBReader<unsigned int> *sq = openStrandQueries();
+            const unsigned int entryKey = (sq != NULL) ? strandEntryKey(queryKey, reverse) : 2 * queryKey + (reverse ? 1 : 0);
+            DBReader<unsigned int> *qDb = (sq != NULL) ? sq : qSource;
+            const size_t qId = (sq != NULL && entryKey == UINT_MAX) ? UINT_MAX : qDb->getId(sq != NULL ? entryKey : queryKey);
+            if (sq != NULL && qId == UINT_MAX) {
+                Debug(Debug::ERROR) << "Query " << queryKey << " has no " << (reverse ? "reverse" : "forward")
+                                    << "-strand entry in " << sq->getDataFileName()
+                                    << ", the query DB the fragments must be re-aligned with.\n";
+                EXIT(EXIT_FAILURE);
+            }
+            if (tId != UINT_MAX && qId != UINT_MAX) {
+                const char *tData = tSource->getData(tId, threadIdx);
+                const int tLen = static_cast<int>(tSource->getSeqLen(tId));
+                const char *qData = qDb->getData(qId, threadIdx);
+                const unsigned int qDataLen = qDb->getSeqLen(qId);
+                // window the ORIGINAL target so the realignment can cross the old boundary
+                const int pad = static_cast<int>(qDataLen);
+                const int wStart = std::max(0, tLo - pad);
+                const int wEnd = std::min(tLen, tHi + pad + 1);
+                const int wLen = wEnd - wStart;
+                if (wLen > 0 && (unsigned int)wLen <= rnaRealignMaxWindow()) {
+                    RnaRealignHit hit;
+                    std::string backtrace;
+                    if (rnaRealignWindow(qData, qDataLen, sq != NULL ? sq->getDbtype() : -1, entryKey, reverse,
+                                         tData + wStart, wLen,
+                                         queryKey, results[i].dbKey,
+                                         tSource, threadIdx, hit, backtrace)) {
+                        // The realignment scores the query the same way the align module
+                        // does and its evaluer carries the same dinucleotide calibration,
+                        // so score and E-value are on one scale with every other hit and
+                        // can be adopted directly.
+                        Matcher::result_t m = results[i];   // keep orf position fields
+                        m.score = hit.score;
+                        m.eval = hit.eval;
+                        m.qcov = hit.qcov;
+                        m.dbcov = hit.dbcov;
+                        m.seqId = hit.seqId;
+                        m.alnLength = hit.alnLength;
+                        m.qStartPos = hit.qStartPos;
+                        m.qEndPos = hit.qEndPos;
+                        m.dbStartPos = hit.dbStartPos + wStart;
+                        m.dbEndPos = hit.dbEndPos + wStart;
+                        m.qLen = qDataLen;
+                        m.dbLen = tLen;
+                        // offsetalignment writes with compress=false, so the backtrace it
+                        // hands on must already be in run-length form ("1542M"); convertalis
+                        // parses those counts and would otherwise compute alnLen 0.
+                        m.backtrace = Matcher::compressAlignment(backtrace);
+                        out.push_back(m);
+                        replaced = true;
+                    }
+                }
+            }
+        }
+        if (replaced == false) {
+            for (size_t k = i; k < j; k++) {
+                out.push_back(results[k]);
+            }
+        }
+        i = j;
+    }
+    // Grouping needed position order; the rest of the pipeline expects hits ordered by
+    // significance. Restore it here rather than relying on offsetalignment's mergeQuery
+    // path to re-sort, which does not run when --merge-query 0.
+    std::stable_sort(out.begin(), out.end(), Matcher::compareHits);
+    results.swap(out);
+}
+
+}  // namespace
+
+void registerFragmentMerger() {
+    Matcher::registerFragmentMerger(mergeFragments);
+}

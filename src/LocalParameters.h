@@ -23,6 +23,7 @@ public:
     static const int CM_MODE_INSIDE = 1;
 
     float cmRegionFlanking;
+    float cmScanCutoff;
     int cmMode;
     int cmAlign;
     int cmAlignBanded;
@@ -45,8 +46,12 @@ public:
     int chainExtend;
     double chainExtendEval;
     std::string kmerAlph;
+    float cmbuildMinRowCov;
+    std::string targetSplitDb;
+    std::string realignQueryDb;
 
     PARAMETER(PARAM_CM_REGION)
+    PARAMETER(PARAM_CM_SCAN_CUTOFF)
     PARAMETER(PARAM_CM_MODE)
     PARAMETER(PARAM_CM_ALIGN)
     PARAMETER(PARAM_CM_ALIGN_BANDED)
@@ -69,8 +74,12 @@ public:
     PARAMETER(PARAM_CHAIN_EXTEND)
     PARAMETER(PARAM_CHAIN_EXTEND_EVAL)
     PARAMETER(PARAM_KMER_ALPH)
+    PARAMETER(PARAM_CMBUILD_MIN_ROW_COV)
+    PARAMETER(PARAM_TARGET_SPLIT_DB)
+    PARAMETER(PARAM_REALIGN_QUERY_DB)
 
     std::vector<MMseqsParameter*> splitstrand;
+    std::vector<MMseqsParameter*> rnagcstat;
     std::vector<MMseqsParameter*> rnaalign;
     std::vector<MMseqsParameter*> cmbuild;
     std::vector<MMseqsParameter*> cmscan;

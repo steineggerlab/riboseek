@@ -26,6 +26,9 @@ int prefilter(int argc, const char **argv, const Command& command) {
         targetDbType = data.seqType;
         dbr.close();
     }
+#ifdef RIBOSEEK
+    targetDbType = DBReader<unsigned int>::encodedGpuDbtype(targetDbType);
+#endif
     if (queryDbType == -1 || targetDbType == -1) {
         Debug(Debug::ERROR) << "Please recreate your database or add a .dbtype file to your sequence/profile database.\n";
         return EXIT_FAILURE;

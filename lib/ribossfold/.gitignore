@@ -1,0 +1,32 @@
+# compiled binaries
+/ribossfold
+/ribossfold_noneon
+/ribossfold_omp
+/ribossfold_v2
+/verify
+/kbench
+*.o
+*.dSYM/
+
+# stray tool outputs
+*.ps
+
+# benchmark data (fetched) and generated inputs / logs
+bench/archiveII/
+bench/archiveII.tar.gz
+bench/*.fa
+bench/*.log
+
+# WebAssembly build artifacts (built in CI, deployed to Pages)
+/web/ribossfold.js
+/web/ribossfold.wasm
+/web/ribossfold-simd.js
+/web/ribossfold-simd.wasm
+
+# npm package artifacts
+/npm/ribossfold.js
+/npm/ribossfold-simd.js
+/npm/LICENSE
+/npm/README.md
+/npm/*.tgz
+/npm/node_modules/

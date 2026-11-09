@@ -372,7 +372,11 @@ namespace uint8x4{
         __builtin_assume(blockDim.x == blocksize);
         __builtin_assume(blockDim.x % group_size == 0);
 
+        #ifdef RIBOSEEK
+        constexpr int numRowsPSSM = 25;
+        #else
         constexpr int numRowsPSSM = 21;
+        #endif
         #ifdef USE_IMPROVED_SMEM_INT8
         constexpr int numColumnsPSSM = std::max(group_size,8) * numRegs;
         #else
@@ -405,7 +409,11 @@ namespace uint8x4{
         State state(shared_strided_PSSM, group, substitutionScoreBias);
 
         auto load_PSSM_single = [&]() {
+            #ifdef RIBOSEEK
+            for (int i=threadIdx.x; i<25*group_size*numRegs; i+=blockDim.x) {
+            #else
             for (int i=threadIdx.x; i<21*group_size*numRegs; i+=blockDim.x) {
+            #endif
                 const int letter = i/(group_size*numRegs);
                 const int col = i%(group_size*numRegs);
                 shared_strided_PSSM.data[letter][col] = strided_PSSM[letter][col];
@@ -414,7 +422,11 @@ namespace uint8x4{
         };
 
         auto load_PSSM_double = [&]() {
+            #ifdef RIBOSEEK
+            for (int i=threadIdx.x; i<25*group_size*numRegs; i+=blockDim.x) {
+            #else
             for (int i=threadIdx.x; i<21*group_size*numRegs; i+=blockDim.x) {
+            #endif
                 const int letter = i/(group_size*numRegs);
                 const int col = i%(group_size*numRegs);
                 auto value = strided_PSSM[letter][col];
@@ -598,7 +610,11 @@ namespace uint8x4{
         // std::cout << "blocksize " << blocksize << ", group_size " << group_size 
         //     << ", alignmentsPerBlock " << alignmentsPerBlock << ", numSelected " << numSelected << "\n";
 
+        #ifdef RIBOSEEK
+        constexpr int numRowsPSSM = 25;
+        #else
         constexpr int numRowsPSSM = 21;
+        #endif
         #ifdef USE_IMPROVED_SMEM_INT8
         constexpr int numColumnsPSSM = std::max(group_size,8) * numRegs;
         #else
@@ -734,7 +750,11 @@ namespace uint8x4{
         __builtin_assume(blockDim.x % group_size == 0);
 
         extern  __shared__ char externalSmem[];
+        #ifdef RIBOSEEK
+        constexpr int numRowsPSSM = 25;
+        #else
         constexpr int numRowsPSSM = 21;
+        #endif
         #ifdef USE_IMPROVED_SMEM_INT8
         constexpr int numColumnsPSSM = std::max(group_size,8) * numRegs;
         #else
@@ -778,7 +798,11 @@ namespace uint8x4{
             const int columnOffset = tileNr * group_size * numRegs;
             __syncthreads(); //wait for all groups before overwriting pssm
 
+            #ifdef RIBOSEEK
+            for (int i=threadIdx.x; i<25*group_size*numRegs; i+=blockDim.x) {
+            #else
             for (int i=threadIdx.x; i<21*group_size*numRegs; i+=blockDim.x) {
+            #endif
                 int letter = i/(group_size*numRegs);
                 int col = i%(group_size*numRegs);
                 //shared_strided_PSSM.data[letter][col] = strided_PSSM_1d[i];
@@ -792,7 +816,11 @@ namespace uint8x4{
             const int columnOffset = tileNr * group_size * numRegs;
             __syncthreads(); //wait for all groups before overwriting pssm
 
+            #ifdef RIBOSEEK
+            for (int i=threadIdx.x; i<25*group_size*numRegs; i+=blockDim.x) {
+            #else
             for (int i=threadIdx.x; i<21*group_size*numRegs; i+=blockDim.x) {
+            #endif
                 const int letter = i/(group_size*numRegs);
                 const int col = i%(group_size*numRegs);
                 auto value = strided_PSSM[letter][columnOffset + col];
@@ -1098,7 +1126,11 @@ namespace uint8x4{
             substitutionScoreBias
         );
 
+        #ifdef RIBOSEEK
+        constexpr int numRowsPSSM = 25;
+        #else
         constexpr int numRowsPSSM = 21;
+        #endif
         #ifdef USE_IMPROVED_SMEM_INT8
         constexpr int numColumnsPSSM = std::max(group_size,8) * numRegs;
         #else

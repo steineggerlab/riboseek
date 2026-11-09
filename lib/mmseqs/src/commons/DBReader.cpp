@@ -474,6 +474,8 @@ template <typename T> char* DBReader<T>::mmapData(FILE * file, size_t *dataSize)
                 Debug(Debug::ERROR) << "Failed to mmap memory dataSize=" << *dataSize <<" File=" << dataFileName << ". Error " << errsv << ".\n";
                 EXIT(EXIT_FAILURE);
             }
+            // if this mapping reads the file first, the page cache keeps it in huge pages
+            Util::adviseHugePages(ret, *dataSize);
         } else {
             ret = static_cast<char*>(malloc(*dataSize));
             Util::checkAllocation(ret, "Not enough system memory to read in the whole data file.");
@@ -1357,7 +1359,9 @@ void DBReader<T>::decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize,
             sumCharsAssignedToCurrRank = 0;
             currentRank++;
         }
-        sumCharsAssignedToCurrRank += index[i].length;
+        // Add the sequence length at position i (after any sorting)
+        // This is identical to index[i].length when the reader is unsorted
+        sumCharsAssignedToCurrRank += getEntryLen(i);
         entriesPerWorker[currentRank] += 1;
     }
 

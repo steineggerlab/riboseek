@@ -72,6 +72,11 @@ int result2msa(int argc, const char **argv, const Command &command) {
         queryHeaderReader = targetHeaderReader;
     }
     const unsigned int maxSequenceLength = std::max(tDbr->getMaxSeqLen(), qDbr->getMaxSeqLen());
+    // Without deletions the MSA spans the query only, so the per-thread buffers need the longest
+    // query, not the longest target: a target database with whole chromosomes would otherwise cost
+    // hundreds of bytes per base of its longest entry in every thread. Targets are mapped into
+    // buffers that grow on demand, and each hit keeps only its aligned window.
+    const unsigned int msaLength = par.allowDeletion ? maxSequenceLength : std::max(qDbr->getMaxSeqLen(), 2u);
 
     DBConcat *seqConcat = NULL;
     DBReader<unsigned int> *refReader = NULL;
@@ -155,20 +160,20 @@ int result2msa(int argc, const char **argv, const Command &command) {
         thread_idx = (unsigned int) omp_get_thread_num();
 #endif
 
-        Matcher matcher(qDbr->getDbtype(), maxSequenceLength, &subMat, &evalueComputation, par.compBiasCorrection,
-                        par.compBiasCorrectionScale, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
-        MultipleAlignment aligner(maxSequenceLength, &subMat);
+        // only needed to realign hits without a backtrace, so only built then
+        Matcher *matcher = NULL;
+        MultipleAlignment aligner(msaLength, &subMat);
         PSSMCalculator calculator(
-            &subMat, maxSequenceLength, maxSetSize, par.pcmode, par.pca, par.pcb
+            &subMat, msaLength, maxSetSize, par.pcmode, par.pca, par.pcb
 #ifdef GAP_POS_SCORING
             , par.gapOpen.values.aminoacid()
             , par.gapPseudoCount
 #endif
         );
-        MsaFilter filter(maxSequenceLength, maxSetSize, &subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid());
+        MsaFilter filter(msaLength, maxSetSize, &subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid());
         UniprotHeaderSummarizer summarizer;
-        Sequence centerSequence(maxSequenceLength, qDbr->getDbtype(), &subMat, 0, false, par.compBiasCorrection);
-        Sequence edgeSequence(maxSequenceLength, tDbr->getDbtype(), &subMat, 0, false, false);
+        Sequence centerSequence(msaLength, qDbr->getDbtype(), &subMat, 0, false, par.compBiasCorrection);
+        Sequence edgeSequence(msaLength, tDbr->getDbtype(), &subMat, 0, false, false);
 
         // which sequences where kept after filtering
         bool *kept = new bool[maxSetSize];
@@ -191,6 +196,10 @@ int result2msa(int argc, const char **argv, const Command &command) {
 
         std::vector<unsigned int> seqKeys;
         seqKeys.reserve(300);
+
+        // where each kept window starts in its target
+        std::vector<int> seqOffsets;
+        seqOffsets.reserve(300);
 
         std::string result;
         result.reserve(300 * 1024);
@@ -244,11 +253,15 @@ int result2msa(int argc, const char **argv, const Command &command) {
                     alnResults.emplace_back(Matcher::parseAlignmentRecord(data));
                 } else {
                     // Recompute if not all the backtraces are present
+                    if (matcher == NULL) {
+                        matcher = new Matcher(qDbr->getDbtype(), maxSequenceLength, &subMat, &evalueComputation, par.compBiasCorrection,
+                                              par.compBiasCorrectionScale, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
+                    }
                     if (isQueryInit == false) {
-                        matcher.initQuery(&centerSequence);
+                        matcher->initQuery(&centerSequence);
                         isQueryInit = true;
                     }
-                    alnResults.emplace_back(matcher.getSWResult(&edgeSequence, INT_MAX, false, 0, 0.0, FLT_MAX, Matcher::SCORE_COV_SEQID, 0, false));
+                    alnResults.emplace_back(matcher->getSWResult(&edgeSequence, INT_MAX, false, 0, 0.0, FLT_MAX, Matcher::SCORE_COV_SEQID, 0, false));
                 }
                 bool isReverse = hasReverseMap && (alnResults.back().qStartPos > alnResults.back().qEndPos);
 
@@ -317,13 +330,32 @@ int result2msa(int argc, const char **argv, const Command &command) {
                     }
                 }
                 #endif
-                seqSet.emplace_back(std::vector<unsigned char>(edgeSequence.numSequence, edgeSequence.numSequence + edgeSequence.L));
+                // Local alignment: only [min(dbStartPos, dbEndPos), max(...)] of the target is read
+                // (by computeMSA and the A3M writer), so keep that window and shift the hit onto it
+                // until the MSA is built. A hit without an alignment (dbStartPos -1) keeps nothing.
+                Matcher::result_t &aln = alnResults.back();
+                int lo = 0, hi = -1;
+                if (aln.dbStartPos >= 0 && aln.dbEndPos >= 0) {
+                    lo = std::min(aln.dbStartPos, aln.dbEndPos);
+                    hi = std::min(std::max(aln.dbStartPos, aln.dbEndPos), edgeSequence.L - 1);
+                    aln.dbStartPos -= lo;
+                    aln.dbEndPos -= lo;
+                }
+                seqSet.emplace_back(std::vector<unsigned char>(edgeSequence.numSequence + lo, edgeSequence.numSequence + hi + 1));
+                seqOffsets.emplace_back(lo);
                 seqKeys.emplace_back(key);
 
                 data = Util::skipLine(data);
             }
 
             MultipleAlignment::MSAResult res = aligner.computeMSA(&centerSequence, seqSet, alnResults, !par.allowDeletion);
+            // back to target coordinates for everything written out
+            for (size_t i = 0; i < alnResults.size(); i++) {
+                if (alnResults[i].dbStartPos >= 0 && alnResults[i].dbEndPos >= 0) {
+                    alnResults[i].dbStartPos += seqOffsets[i];
+                    alnResults[i].dbEndPos += seqOffsets[i];
+                }
+            }
             //MultipleAlignment::print(res, &subMat);
 
             // Remap internal encoding to output encoding (e.g. dinucleotide -> nucleotide)
@@ -520,7 +552,7 @@ int result2msa(int argc, const char **argv, const Command &command) {
                         result.append(1, '\n');
                     }else{
                         const std::vector<unsigned char> & seq = seqSet[i-1];
-                        int seqStartPos = alnResults[i-1].dbStartPos;
+                        int seqStartPos = alnResults[i-1].dbStartPos - seqOffsets[i-1];
                         size_t seqPos = 0;
                         const std::string & bt = alnResults[i-1].backtrace;
                         size_t btPos = 0;
@@ -602,10 +634,12 @@ int result2msa(int argc, const char **argv, const Command &command) {
             MultipleAlignment::deleteMSA(&res);
             seqSet.clear();
             seqKeys.clear();
+            seqOffsets.clear();
             alnResults.clear();
         }
 
         delete[] kept;
+        delete matcher;
     }
     resultWriter.close(true);
     if (shouldWriteNullByte == false) {

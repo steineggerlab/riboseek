@@ -29,6 +29,35 @@ std::vector<Command> riboseekCommands = {
             "<i:queryDB> <o:strandDB>",
             CITATION_MMSEQS2, {{"queryDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                       {"strandDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::sequenceDb }}},
+    {"createdb", riboseekCreatedb, &localPar.createdb, COMMAND_DATABASE_CREATION,
+            "Convert FASTA/Q file(s) to a sequence DB (and, for nucleotides, its GC statistic)",
+            "# Create a sequence database from multiple FASTA files\n"
+            "riboseek createdb file1.fa file2.fa.gz file3.fa sequenceDB\n\n"
+            "# Create a seqDB from stdin\n"
+            "cat seq.fasta | riboseek createdb stdin sequenceDB\n\n"
+            "# A nucleotide DB also gets sequenceDB.gcstat (as `riboseek rnagcstat sequenceDB`),\n"
+            "# which search uses instead of sampling the target at every run.\n"
+            "# `riboseek base:createdb` runs plain MMseqs createdb without it.\n",
+            "Martin Steinegger <martin.steinegger@snu.ac.kr>",
+            "<i:fastaFile1[.gz|.bz2]> ... <i:fastaFileN[.gz|.bz2]>|<i:stdin> <o:sequenceDB>",
+            CITATION_MMSEQS2, {{"fast[a|q]File[.gz|bz2]|stdin", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA | DbType::VARIADIC, &DbValidator::flatfileStdinAndGeneric },
+                                      {"sequenceDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfile }}},
+    {"makepaddedseqdb", riboseekMakepaddedseqdb, &localPar.makepaddedseqdb, COMMAND_HIDDEN,
+            "Generate a padded sequence DB (and copy its GC statistic)",
+            "Generate a padded sequence DB for GPU search; sequenceIndexDB.gcstat is copied from\n"
+            "sequenceDB.gcstat, or computed from sequenceDB when it has none.\n"
+            "`riboseek base:makepaddedseqdb` runs the plain MMseqs module.\n",
+            "Milot Mirdita <milot@mirdita.de> & Martin Steinegger <martin.steinegger@snu.ac.kr>",
+            "<i:sequenceDB> <o:sequenceDB>",
+            CITATION_GPU, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA|DbType::NEED_HEADER, &DbValidator::sequenceDb },
+                                      {"sequenceIndexDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::sequenceDb }}},
+    {"rnagcstat", rnagcstat, &localPar.rnagcstat, COMMAND_SEQUENCE,
+            "Precompute a target database's GC statistic for E-value calibration",
+            "# Pay the database scan once, instead of sampling it on every search\n"
+            "riboseek rnagcstat targetDB\n",
+            "Sukhwan Park <sukhwan.park@snu.ac.kr>",
+            "<i:targetDB>",
+            CITATION_MMSEQS2, {{"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb }}},
     {"rnaalign", rnaalign, &localPar.rnaalign, COMMAND_ALIGNMENT,
             "RNA-aware gapped local alignment with dinucleotide scoring",
             NULL,
