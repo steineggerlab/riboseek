@@ -237,9 +237,12 @@ int rnaalign(int argc, const char **argv, const Command &command) {
             alnResultsOutString.reserve(1024 * 1024);
             char buffer[1024 + 32768 * 4];
 
-            Sequence qSeq(maxSeqLen, querySeqType, &subMat, 0, false, compBiasCorrection);
-            Sequence dbSeq(maxSeqLen, targetSeqType, &subMat, 0, false, compBiasCorrection);
             const size_t maxMatcherSeqLen = std::max(tdbr->getMaxSeqLen(), qdbr->getMaxSeqLen());
+            // sized to the longest entry: a query mapped from nucleotides (splitstrand of a sequence db) gets its
+            // dinucleotide profile built in place without growing the buffers, so a query longer than --max-seq-len
+            // overflowed them (heap corruption on units > 65,535 nt)
+            Sequence qSeq(std::max(maxSeqLen, maxMatcherSeqLen), querySeqType, &subMat, 0, false, compBiasCorrection);
+            Sequence dbSeq(std::max(maxSeqLen, maxMatcherSeqLen), targetSeqType, &subMat, 0, false, compBiasCorrection);
 
             std::vector<RnaMatcher::result_t> swResults;
             swResults.reserve(300);

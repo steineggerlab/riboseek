@@ -446,6 +446,8 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_SUB_MAT);
     align2clust.push_back(&PARAM_ADD_BACKTRACE);
     align2clust.push_back(&PARAM_ALIGNMENT_MODE);
+    align2clust.push_back(&PARAM_GAP_OPEN);
+    align2clust.push_back(&PARAM_GAP_EXTEND);
     align2clust.push_back(&PARAM_MIN_SEQ_ID);
     align2clust.push_back(&PARAM_MIN_ALN_LEN);
     align2clust.push_back(&PARAM_SEQ_ID_MODE);

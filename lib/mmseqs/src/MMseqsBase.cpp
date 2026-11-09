@@ -717,6 +717,17 @@ std::vector<Command> baseCommands = {
                 CITATION_MMSEQS2, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                                            {"alignmentDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::alignmentDb },
                                                            {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}},
+        {"gpupairfilter",       gpupairfilter,         &par.align,                COMMAND_ALIGNMENT,
+                "Keep the prefilter pairs whose GPU Smith-Waterman score could pass the align E-value",
+                "Scores every (query, target) pair of a prefilter result with int32 Smith-Waterman on the GPU (align's\n"
+                "query profile, composition bias and gap costs) and writes the pairs with E-value <= 10 x -e and the\n"
+                "identities; align on the result equals align on all pairs (amino-acid / dinucleotide dbs only)",
+                "riboseek",
+                "<i:queryDB> <i:targetDB> <i:prefilterDB> <o:prefilterDB>",
+                CITATION_MMSEQS2, {{"queryDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                          {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                          {"prefilterDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::prefilterDb },
+                                          {"prefilterDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::prefilterDb }}},
         {"rescorediagonal",     rescorediagonal,       &par.rescorediagonal,      COMMAND_ALIGNMENT,
                 "Compute sequence identity for diagonal",
                 NULL,

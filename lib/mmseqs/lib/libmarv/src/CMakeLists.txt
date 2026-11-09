@@ -48,7 +48,7 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.2")
     set(INT8_GAPLESS_DEFINITION CUDASW_INT8_GAPLESS)
 endif()
 
-add_library(marv ${ALIGN_SOURCES} marv.cu marv.h ${INT8_GAPLESS_OBJECTS})
+add_library(marv ${ALIGN_SOURCES} marv.cu marv.h pairsw.cu pairsw.h ${INT8_GAPLESS_OBJECTS})
 target_compile_options(marv PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${NVCC_FLAGS}>)
 set_target_properties(marv
     PROPERTIES

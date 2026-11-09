@@ -10,6 +10,19 @@
 #include <omp.h>
 #endif
 
+#ifdef RIBOSEEK
+// riboseek: cluster dbs of align2clust on single-stranded nucleotide input carry a strand column ("key\t1": reverse
+// complement of the representative). Members keep it in bit 31 of their id here; a cluster merged into a later step's
+// cluster flips its members when its representative is reverse there, and the column is written when any input had it.
+static const unsigned int MERGE_REV = 0x80000000u;
+static bool lineStrand(const char *data, bool &hasColumn) {
+    while (*data != '\0' && *data != '\t' && *data != '\n') data++;
+    if (*data != '\t') return false;
+    hasColumn = true;
+    return data[1] == '1';
+}
+#endif
+
 int mergeclusters(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, true, 0);
@@ -26,6 +39,9 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
     // init the structure for cluster merging
     // it has the size of all possible cluster (sequence amount)
     std::list<unsigned int> *mergedClustering = new std::list<unsigned int>[dbr.getSize()];
+#ifdef RIBOSEEK
+    bool strandColumn = false;
+#endif
 
     // read the clustering from the first clustering step
     std::string firstClu = clusterings.front();
@@ -45,6 +61,9 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
 #endif
 
         char keyBuffer[255];
+#ifdef RIBOSEEK
+        bool threadColumn = false;
+#endif
 #pragma omp for schedule(dynamic, 100)
         for (size_t i = 0; i < cluDb.getSize(); i++) {
             progress.updateProgress();
@@ -56,10 +75,21 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
                 Util::parseKey(data, keyBuffer);
                 unsigned int key = Util::fast_atoi<unsigned int>(keyBuffer);
                 size_t seqId = dbr.getId(key);
+#ifdef RIBOSEEK
+                if (lineStrand(data, threadColumn)) {
+                    seqId |= MERGE_REV;
+                }
+#endif
                 mergedClustering[cluId].push_back(seqId);
                 data = Util::skipLine(data);
             }
         }
+#ifdef RIBOSEEK
+        if (threadColumn) {
+#pragma omp atomic write
+            strandColumn = true;
+        }
+#endif
     }
     cluDb.close();
 
@@ -84,6 +114,9 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
             thread_idx = omp_get_thread_num();
 #endif
             char keyBuffer[255];
+#ifdef RIBOSEEK
+            bool threadColumn = false;
+#endif
 #pragma omp for schedule(dynamic, 100)
             for (size_t i = 0; i < cluDb.getSize(); i++) {
                 progress.updateProgress();
@@ -95,12 +128,26 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
                     Util::parseKey(data, keyBuffer);
                     unsigned int key = Util::fast_atoi<unsigned int>(keyBuffer);
                     size_t seqId = dbr.getId(key);
+#ifdef RIBOSEEK
+                    // members of a cluster whose representative is reverse here change strand with it
+                    if (lineStrand(data, threadColumn) && seqId != cluId) {
+                        for (std::list<unsigned int>::iterator it = mergedClustering[seqId].begin(); it != mergedClustering[seqId].end(); ++it) {
+                            *it ^= MERGE_REV;
+                        }
+                    }
+#endif
                     if (seqId != cluId) { // to avoid copies of the same cluster list
                         mergedClustering[cluId].splice(mergedClustering[cluId].end(), mergedClustering[seqId]);
                     }
                     data = Util::skipLine(data);
                 }
             }
+#ifdef RIBOSEEK
+            if (threadColumn) {
+#pragma omp atomic write
+                strandColumn = true;
+            }
+#endif
         }
         cluDb.close();
         cnt++;
@@ -134,9 +181,19 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
             // representative
             unsigned int dbKey = dbr.getDbKey(i);
             for (std::list<unsigned int>::iterator it = mergedClustering[i].begin(); it != mergedClustering[i].end(); ++it) {
+#ifdef RIBOSEEK
+                char *tmpBuff = Itoa::u32toa_sse2(dbr.getDbKey(*it & ~MERGE_REV), buffer);
+#else
                 char *tmpBuff = Itoa::u32toa_sse2(dbr.getDbKey(*it), buffer);
+#endif
                 size_t length = tmpBuff - buffer - 1;
                 res.append(buffer, length);
+#ifdef RIBOSEEK
+                if (strandColumn) {
+                    res.push_back('\t');
+                    res.push_back((*it & MERGE_REV) ? '1' : '0');
+                }
+#endif
                 res.push_back('\n');
             }
 

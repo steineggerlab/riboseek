@@ -52,6 +52,16 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
             || fail "kmermatcher died"
     fi
     RESULTDB="${TMP_PATH}/pref"
+    # riboseek: RIBOSEEK_GPU_PAIRFILTER=1 scores the k-mer pairs with Smith-Waterman on the GPU (gpupairfilter, CUDA
+    # build) and passes on only the pairs align2clust could accept (upper-bound score, E <= 10 x -e)
+    if [ -n "$RIBOSEEK_GPU_PAIRFILTER" ]; then
+        if notExists "${TMP_PATH}/pref_gpu.dbtype"; then
+            # shellcheck disable=SC2086
+            GPUPAIRFILTER_BIAS=upper $RUNNER "$MMSEQS" gpupairfilter "$INPUT" "$INPUT" "${TMP_PATH}/pref" "${TMP_PATH}/pref_gpu" ${GPUPAIR_PAR} \
+                || fail "gpupairfilter died"
+        fi
+        RESULTDB="${TMP_PATH}/pref_gpu"
+    fi
 
     # 2. Alignment + clustering (ungapped / gapped banded-block aligner)
     if notExists "${TMP_PATH}/clu.dbtype"; then
@@ -86,9 +96,18 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
             || fail "kmermatcher (representatives) died"
     fi
 
+    PREF_REP="${TMP_PATH}/pref_rep"
+    if [ -n "$RIBOSEEK_GPU_PAIRFILTER" ]; then
+        if notExists "${TMP_PATH}/pref_rep_gpu.dbtype"; then
+            # shellcheck disable=SC2086
+            GPUPAIRFILTER_BIAS=upper $RUNNER "$MMSEQS" gpupairfilter "${TMP_PATH}/input_rep" "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" "${TMP_PATH}/pref_rep_gpu" ${GPUPAIR_PAR} \
+                || fail "gpupairfilter (representatives) died"
+        fi
+        PREF_REP="${TMP_PATH}/pref_rep_gpu"
+    fi
     if notExists "${TMP_PATH}/clu_rep.dbtype"; then
         # shellcheck disable=SC2086
-        $RUNNER "$MMSEQS" align2clust "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" "${TMP_PATH}/clu_rep" \
+        $RUNNER "$MMSEQS" align2clust "${TMP_PATH}/input_rep" "$PREF_REP" "${TMP_PATH}/clu_rep" \
             ${ALIGN2CLUST_PAR} \
             --filter-cludb-file "$CLUDB" \
             --filter-seqdb-file "$SOURCE" \

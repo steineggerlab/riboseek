@@ -2,6 +2,7 @@
 #include "LocalCommandDeclarations.h"
 #include "BaseMatrix.h"
 #include "CommandCaller.h"
+#include "DBReader.h"
 #include "Debug.h"
 #include "FileUtil.h"
 #include "Util.h"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 
 // Dinucleotide k-mers are indexed positionally in base (alphabetSize - 1) = 24, so
 // 24^k has to fit into a size_t: k = 14 spans 15 nucleotides and is the maximum,
@@ -27,7 +29,7 @@ static bool contains(const std::vector<MMseqsParameter*> &list, const MMseqsPara
 
 // Parameters riboseek resolves itself for dinucleotide space. An explicit user setting
 // always wins, everything else keeps the MMseqs2 protein defaults.
-static std::string dinucParameterString(LocalParameters &par, bool linear,
+static std::string dinucParameterString(LocalParameters &par, bool linear, bool onTheFly,
                                         const std::vector<MMseqsParameter*> &workflow) {
     std::vector<MMseqsParameter*> owned;
 
@@ -67,9 +69,15 @@ static std::string dinucParameterString(LocalParameters &par, bool linear,
         // k is only used by kmermatcher here; the cascaded workflow needs it unset so
         // that prefilter can pick its own (much smaller) k-mer size
         if (par.PARAM_K.wasSet == false) {
-            par.kmerSize = DINUC_KMER_SIZE;
+            // on-the-fly input: redkmermatcher picks k in nucleotides (MMseqs2's nucleotide rule, >= 17)
+            par.kmerSize = onTheFly ? 0 : DINUC_KMER_SIZE;
         }
-        if (par.kmerSize > DINUC_KMER_SIZE && par.alphabetSize.values.aminoacid() >= 21) {
+        // --kmer-alph: the k-mers come from redkmermatcher (k in its letters, words wider than 63 bits hashed)
+        if (par.PARAM_KMER_ALPH.wasSet) {
+            setenv("RIBOSEEK_KMER_ALPH", par.kmerAlph.c_str(), 1);
+        } else if (onTheFly) {
+            // kmermatcher runs as redkmermatcher on the flagged db (RedKmerMatcher.cpp), n4 k-mers
+        } else if (par.kmerSize > DINUC_KMER_SIZE && par.alphabetSize.values.aminoacid() >= 21) {
             Debug(Debug::WARNING) << "k-mer size " << par.kmerSize << " overflows the dinucleotide k-mer index, using "
                                   << DINUC_KMER_SIZE << " instead\n";
             par.kmerSize = DINUC_KMER_SIZE;
@@ -98,8 +106,14 @@ static int rnaClusterWorkflow(int argc, const char **argv, const Command &comman
     // nucleotide input gets encoded into the dinucleotide alphabet first; an amino acid
     // input is already dinucleotide encoded (cascaded clustering calls linclust on the
     // converted database)
-    const bool convert = Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_NUCLEOTIDES);
-    if (convert == false && Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_AMINO_ACIDS) == false) {
+    // A nucleotide db flagged DBTYPE_EXTENDED_DINUCLEOTIDE (one entry per sequence) goes to linclust as is:
+    // kmermatcher runs as redkmermatcher (n4 k-mers over both strands, -k in nucleotides), align2clust encodes each
+    // sequence into dinucleotide letters as it reads it and reverse complements opposite-strand members, and the
+    // cluster db carries each member's strand (second column). cluster still converts it with dinucdb.
+    const bool onTheFly = linear && Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_NUCLEOTIDES)
+                          && (DBReader<unsigned int>::getExtendedDbtype(dbType) & LocalParameters::DBTYPE_EXTENDED_DINUCLEOTIDE) != 0;
+    const bool convert = onTheFly == false && Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_NUCLEOTIDES);
+    if (convert == false && onTheFly == false && Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_AMINO_ACIDS) == false) {
         Debug(Debug::ERROR) << "Input " << par.db1 << " is not a sequence database\n";
         return EXIT_FAILURE;
     }
@@ -123,7 +137,7 @@ static int rnaClusterWorkflow(int argc, const char **argv, const Command &comman
     par.filenames.pop_back();
     par.filenames.push_back(tmpDir);
 
-    const std::string clustPar = dinucParameterString(par, linear, workflow);
+    const std::string clustPar = dinucParameterString(par, linear, onTheFly, workflow);
     if (convert) {
         Debug(Debug::INFO) << "Clustering in dinucleotide space ("
                            << BaseMatrix::unserializeName(par.scoringMatrixFile.values.aminoacid().c_str())

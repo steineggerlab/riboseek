@@ -36,6 +36,71 @@ static int countNucIdentitiesUngapped(const char *qSeq, const char *tSeq, int qS
     return ids;
 }
 #endif
+
+#ifdef RIBOSEEK
+// riboseek: a nucleotide db flagged DBTYPE_EXTENDED_DINUCLEOTIDE is encoded into dinucleotide letters on the fly, per
+// sequence as it is read (encodeDinuc, the encoding of igrtool encode / riboseek dinucdb), since BlockAligner and the
+// identity counts score the raw characters; its sequences are single-stranded, so a member found on the opposite
+// strand (prefilter score < 0 in a DBTYPE_PREFILTER_REV_RES db) is reverse complemented before it is encoded. memberIds carry that strand in bit 31, it is
+// kept per assigned member and written as a second column of the cluster db (0 same strand, 1 reverse complement
+// of the representative).
+static const unsigned int MEMBER_REV = 0x80000000u;
+static unsigned char *assignedReverse = nullptr;
+#define MEMBER_ID(m) ((m) & ~MEMBER_REV)
+#define ASSIGN_MEMBER(m, rep) do { assignedCluster[MEMBER_ID(m)] = (rep); \
+    if (assignedReverse != nullptr) { assignedReverse[MEMBER_ID(m)] = ((m) & MEMBER_REV) != 0; } } while (0)
+
+static void reverseComplementRaw(const char *seq, size_t len, std::string &out) {
+    static unsigned char comp[256];
+    static bool init = false;
+    if (init == false) {
+        for (int i = 0; i < 256; i++) comp[i] = (unsigned char) i;
+        const char *from = "ACGTUacgtuRYKMrykmBDHVbdhv";
+        const char *to   = "TGCAAtgcaaYRMKyrmkVHDBvhdb";
+        for (int i = 0; from[i] != '\0'; i++) comp[(unsigned char) from[i]] = (unsigned char) to[i];
+        init = true;
+    }
+    out.resize(len);
+    for (size_t i = 0; i < len; i++) out[i] = (char) comp[(unsigned char) seq[len - 1 - i]];
+}
+
+// dinucleotide letter of nucleotides i, i + 1 (A C G U order); first only: HEAD, second only: TAIL, neither: X;
+// lowercase when either nucleotide is (soft mask)
+static void encodeDinuc(const char *seq, size_t len, std::string &out) {
+    static const char DI[4][4] = {{'C', 'G', 'L', 'Q'}, {'D', 'F', 'R', 'K'}, {'M', 'A', 'P', 'I'}, {'E', 'N', 'H', 'S'}};
+    static const char HEAD[4] = {'T', 'V', 'W', 'Y'}, TAIL[4] = {'B', 'J', 'O', 'U'};
+    static signed char can[256];
+    static bool init = false;
+    if (init == false) {
+        for (int i = 0; i < 256; i++) can[i] = -1;
+        can[(unsigned char) 'A'] = can[(unsigned char) 'a'] = 0;
+        can[(unsigned char) 'C'] = can[(unsigned char) 'c'] = 1;
+        can[(unsigned char) 'G'] = can[(unsigned char) 'g'] = 2;
+        can[(unsigned char) 'T'] = can[(unsigned char) 't'] = 3;
+        can[(unsigned char) 'U'] = can[(unsigned char) 'u'] = 3;
+        init = true;
+    }
+    out.resize(len);
+    for (size_t i = 0; i < len; i++) {
+        const int a = can[(unsigned char) seq[i]];
+        const int b = (i + 1 < len) ? can[(unsigned char) seq[i + 1]] : -1;
+        char x = (a >= 0 && b >= 0) ? DI[a][b] : (a >= 0 ? HEAD[a] : (b >= 0 ? TAIL[b] : 'X'));
+        if (islower((unsigned char) seq[i]) || (i + 1 < len && islower((unsigned char) seq[i + 1]))) {
+            x = (char) tolower(x);
+        }
+        out[i] = x;
+    }
+}
+
+// strand column of a cluster db line ("key\t1": reverse complement of the representative)
+static bool lineIsReverse(const char *line) {
+    while (*line != '\0' && *line != '\t' && *line != '\n') line++;
+    return *line == '\t' && line[1] == '1';
+}
+#else
+#define MEMBER_ID(m) (m)
+#define ASSIGN_MEMBER(m, rep) (assignedCluster[(m)] = (rep))
+#endif
 #include <condition_variable>
 #include <queue>
 
@@ -163,13 +228,28 @@ static void writeData(DBWriter *dbWriter, const std::pair<unsigned int, unsigned
             resultString.clear();
             char *outPos = Itoa::u32toa_sse2(currentRepresentativeKey, buffer);
             resultString.append(buffer, (outPos - buffer - 1));
+#ifdef RIBOSEEK
+            if (assignedReverse != nullptr) {
+                resultString.append("\t0");
+            }
+#endif
             resultString.push_back('\n');
         }
         
         unsigned int memberKey = results[i].second;
+#ifdef RIBOSEEK
+        const bool memberRev = (memberKey & MEMBER_REV) != 0;
+        memberKey &= ~MEMBER_REV;
+#endif
         if (memberKey != currentRepresentativeKey) {
             char *outPos = Itoa::u32toa_sse2(memberKey, buffer);
             resultString.append(buffer, (outPos - buffer - 1));
+#ifdef RIBOSEEK
+            if (assignedReverse != nullptr) {
+                resultString.push_back('\t');
+                resultString.push_back(memberRev ? '1' : '0');
+            }
+#endif
             resultString.push_back('\n');
         }
         
@@ -225,7 +305,7 @@ void clusterThreadFuncSetcover(unsigned int* assignedCluster) {
             size_t originalSize = res.memberIds.size();
             
             for (unsigned int mem : res.memberIds) {
-                if (assignedCluster[mem] == UINT_MAX) {
+                if (assignedCluster[MEMBER_ID(mem)] == UINT_MAX) {
                     valid.push_back(mem);
                 }
             }
@@ -241,7 +321,7 @@ void clusterThreadFuncSetcover(unsigned int* assignedCluster) {
             }
             
             for (unsigned int mem : res.memberIds) {
-                assignedCluster[mem] = res.representativeId;
+                ASSIGN_MEMBER(mem, res.representativeId);
             }
         }
         
@@ -280,7 +360,7 @@ void clusterThreadFuncGreedy(unsigned int* assignedCluster) {
             std::vector<unsigned int> validMemberIds;
             validMemberIds.reserve(result.memberIds.size());
             for (unsigned int memberId : result.memberIds) {
-                if (assignedCluster[memberId] == UINT_MAX) {
+                if (assignedCluster[MEMBER_ID(memberId)] == UINT_MAX) {
                     validMemberIds.push_back(memberId);
                 }
             }
@@ -290,7 +370,7 @@ void clusterThreadFuncGreedy(unsigned int* assignedCluster) {
             }
             
             for (unsigned int memberId : validMemberIds) {
-                assignedCluster[memberId] = result.representativeId;
+                ASSIGN_MEMBER(memberId, result.representativeId);
             }
         }
     }
@@ -327,6 +407,20 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
 
 
     const size_t dbSize = seqDbr->getSize();
+    const int seqType = Parameters::DBTYPE_AMINO_ACIDS;
+#ifdef RIBOSEEK
+    const bool onTheFly = Parameters::isEqualDbtype(seqDbr->getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)
+                          && (DBReader<unsigned int>::getExtendedDbtype(seqDbr->getDbtype()) & Parameters::DBTYPE_EXTENDED_DINUCLEOTIDE) != 0;
+    const bool reversePref = Parameters::isEqualDbtype(alnDbr.getDbtype(), Parameters::DBTYPE_PREFILTER_REV_RES);
+    if (onTheFly) {
+        if (dbSize >= MEMBER_REV || seqDbr->getLastKey() >= MEMBER_REV) {
+            Debug(Debug::ERROR) << "align2clust: too many sequences for the strand bit\n";
+            EXIT(EXIT_FAILURE);
+        }
+        assignedReverse = new unsigned char[dbSize]();
+        Debug(Debug::INFO) << "Nucleotide input: dinucleotide letters on the fly, both strands\n";
+    }
+#endif
 
     BaseMatrix *subMat = new SubstitutionMatrix(
         par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, 0.0
@@ -413,15 +507,19 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                        par.compBiasCorrection, par.compBiasCorrectionScale, 
                        par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 
                        0.0, par.zdrop);
-        Sequence query(db_maxseqlen, Parameters::DBTYPE_AMINO_ACIDS, subMat, 0, false, par.compBiasCorrection);
-        Sequence target(db_maxseqlen, Parameters::DBTYPE_AMINO_ACIDS, subMat, 0, false, par.compBiasCorrection);
-        Sequence element(db_maxseqlen, Parameters::DBTYPE_AMINO_ACIDS, subMat, 0, false, par.compBiasCorrection);
+        Sequence query(db_maxseqlen, seqType, subMat, 0, false, par.compBiasCorrection);
+        Sequence target(db_maxseqlen, seqType, subMat, 0, false, par.compBiasCorrection);
+        Sequence element(db_maxseqlen, seqType, subMat, 0, false, par.compBiasCorrection);
         BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, db_maxseqlen, subMat, &fastMatrix, 
                                  &evaluer, par.compBiasCorrection, par.compBiasCorrectionScale, 
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
         char buffer[1024 + 32768 * 4];
         std::vector<std::pair<unsigned int, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
+#ifdef RIBOSEEK
+        std::vector<char> targetsReverse;
+        std::string rcTarget, rcElement, encQuery, encTarget, encElement;
+#endif
 
 #pragma omp for schedule(dynamic, 1) nowait
         for (size_t i = 0; i < endRange; i++) {
@@ -429,6 +527,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
             ClusterResult clusterResult;
             clusterResult.sequenceIdx = i;
             targetsWithDiagonal.clear();
+#ifdef RIBOSEEK
+            targetsReverse.clear();
+#endif
             
             size_t representativeId;
             unsigned int queryKey;
@@ -447,6 +548,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
             size_t queryId = representativeId;
             char *querySequence = seqDbr->getData(queryId, threadIdx);
             size_t queryLength = seqDbr->getSeqLen(queryId);
+#ifdef RIBOSEEK
+            if (onTheFly) {
+                encodeDinuc(querySequence, queryLength, encQuery);
+                querySequence = &encQuery[0];
+            }
+#endif
             query.mapSequence(queryId, queryKey, querySequence, queryLength);
             blockAligner.initQuery(&query);
             matcher.initQuery(&query);
@@ -465,6 +572,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                 const size_t targetId = seqDbr->getId(hit.seqId);
                 if (assignedCluster[targetId] == UINT_MAX) { 
                         targetsWithDiagonal.push_back(std::make_pair(hit.seqId, hit.diagonal));
+#ifdef RIBOSEEK
+                        targetsReverse.push_back(reversePref && hit.prefScore < 0);
+#endif
                 }
                 alignmentData = Util::skipLine(alignmentData);
                 prefSize++;
@@ -484,6 +594,18 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                 
                 char *targetSequence = seqDbr->getData(targetId, threadIdx);
                 size_t targetLength = seqDbr->getSeqLen(targetId);
+#ifdef RIBOSEEK
+                const bool targetRev = targetsReverse[targetIdx] != 0;
+                const unsigned int memberStrand = targetRev ? MEMBER_REV : 0;
+                if (targetRev) {
+                    reverseComplementRaw(targetSequence, targetLength, rcTarget);
+                    targetSequence = &rcTarget[0];
+                }
+                if (onTheFly) {
+                    encodeDinuc(targetSequence, targetLength, encTarget);
+                    targetSequence = &encTarget[0];
+                }
+#endif
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
 
                 if (Util::canBeCovered(par.covThr, par.covMode, query.L, target.L) == false) {
@@ -562,6 +684,17 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                                 const size_t elementId = cluSeqDbr->getId(elementKey);
                                 char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
                                 size_t elementLength = cluSeqDbr->getSeqLen(elementId);
+#ifdef RIBOSEEK
+                                // the element's strand to the query: its strand to the target (level-1 column) and the target's to the query
+                                if (lineIsReverse(cluData) != targetRev) {
+                                    reverseComplementRaw(elementSequence, elementLength, rcElement);
+                                    elementSequence = &rcElement[0];
+                                }
+                                if (onTheFly) {
+                                    encodeDinuc(elementSequence, elementLength, encElement);
+                                    elementSequence = &encElement[0];
+                                }
+#endif
                                 short concatedDiagonal = diagonal;
                                 
                                 // 1. ungapped alignment
@@ -611,7 +744,11 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                             continue;
                         }
                     }
+#ifdef RIBOSEEK
+                    clusterResult.memberIds.push_back(targetId | memberStrand);
+#else
                     clusterResult.memberIds.push_back(targetId);
+#endif
                     continue;
                 }
                 
@@ -697,6 +834,17 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                                     const size_t elementId = cluSeqDbr->getId(elementKey);
                                     char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
                                     size_t elementLength = cluSeqDbr->getSeqLen(elementId);
+#ifdef RIBOSEEK
+                                    // the element's strand to the query: its strand to the target (level-1 column) and the target's to the query
+                                    if (lineIsReverse(cluData) != targetRev) {
+                                        reverseComplementRaw(elementSequence, elementLength, rcElement);
+                                        elementSequence = &rcElement[0];
+                                    }
+                                    if (onTheFly) {
+                                        encodeDinuc(elementSequence, elementLength, encElement);
+                                        elementSequence = &encElement[0];
+                                    }
+#endif
                                     // short concatedDiagonal = diagonal;
                                     short concatedDiagonal = 0;
                                     
@@ -747,7 +895,11 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
                                 continue;
                             }
                         }
+#ifdef RIBOSEEK
+                        clusterResult.memberIds.push_back(targetId | memberStrand);
+#else
                         clusterResult.memberIds.push_back(targetId);
+#endif
                     }
                 }
             }
@@ -797,6 +949,11 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
 
             assignment[i].first = seqDbr->getDbKey(assignedCluster[i]);
             assignment[i].second = seqDbr->getDbKey(i);
+#ifdef RIBOSEEK
+            if (assignedReverse != nullptr && assignedReverse[i] != 0) {
+                assignment[i].second |= MEMBER_REV;
+            }
+#endif
         }
     }
     
@@ -814,6 +971,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<unsigned int
     
     delete[] assignedCluster;
     delete[] assignment;
+#ifdef RIBOSEEK
+    delete[] assignedReverse;
+    assignedReverse = nullptr;
+#endif
     if (prefRepSizePair != nullptr) {
         delete[] prefRepSizePair;
     }

@@ -48,7 +48,49 @@ LocalParameters::LocalParameters() : Parameters(),
     PARAM_CMBUILD_NOSS(PARAM_CMBUILD_NOSS_ID, "--cmbuild-noss", "cmbuild without secondary structure",
         "cmbuild:\n0: use SS_cons base pairs\n1: build a sequence-only CM (ignore/require-no structure).",
         typeid(int), (void *) &cmbuildNoss,
-        "^[0-1]$", MMseqsParameter::COMMAND_PROFILE)
+        "^[0-1]$", MMseqsParameter::COMMAND_PROFILE),
+    PARAM_LOCAL_MIN(PARAM_LOCAL_MIN_ID, "--local-min", "Whole-target length",
+        "envalign: targets of at most this many residues are aligned whole, longer ones inside envelopes",
+        typeid(int), (void *) &localMin, "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CHAIN_BAND(PARAM_CHAIN_BAND_ID, "--chain-band", "Chain diagonal band",
+        "envalign: window hits whose diagonals differ by at most this much join one chain (indel tolerance)",
+        typeid(int), (void *) &chainBand, "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CHAIN_GAP(PARAM_CHAIN_GAP_ID, "--chain-gap", "Chain query gap",
+        "envalign: largest query gap between two window hits of one chain",
+        typeid(int), (void *) &chainGap, "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_ENV_MARGIN(PARAM_ENV_MARGIN_ID, "--env-margin", "Envelope margin",
+        "envalign: residues added on each side of a chain before alignment; doubled while the alignment reaches a "
+        "clipped envelope edge",
+        typeid(int), (void *) &envMargin, "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_ENV_MAX_ITER(PARAM_ENV_MAX_ITER_ID, "--env-max-iter", "Envelope widenings",
+        "envalign: most margin doublings per envelope",
+        typeid(int), (void *) &envMaxIter, "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CHAIN_WORD(PARAM_CHAIN_WORD_ID, "--chain-word", "Chain word length",
+        "chainalign: exact word hits of this many letters seed the ungapped HSPs (1-12)",
+        typeid(int), (void *) &chainWord, "^([1-9]|1[0-2])$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CHAIN_XDROP(PARAM_CHAIN_XDROP_ID, "--chain-xdrop", "Chain ungapped X-drop",
+        "chainalign: an HSP extension stops when its raw score falls this far below its best",
+        typeid(int), (void *) &chainXdrop, "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CHAIN_MIN_HSP(PARAM_CHAIN_MIN_HSP_ID, "--chain-min-hsp", "Chain HSP score",
+        "chainalign: HSPs below this raw score are dropped",
+        typeid(int), (void *) &chainMinHsp, "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CHAIN_BRIDGE(PARAM_CHAIN_BRIDGE_ID, "--chain-bridge", "Chain bridge length",
+        "chainalign: longest space (letters, either sequence) between two chained HSPs",
+        typeid(int), (void *) &chainBridge, "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CHAIN_MAX_HSP(PARAM_CHAIN_MAX_HSP_ID, "--chain-max-hsp", "Chain HSPs per pair",
+        "chainalign: the best this many HSPs of a pair are chained",
+        typeid(int), (void *) &chainMaxHsp, "^[1-9][0-9]*$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CHAIN_EXTEND(PARAM_CHAIN_EXTEND_ID, "--chain-extend", "Chain end extension X-drop",
+        "chainalign: gapped X-drop extension (raw score) from both chain ends, as xdropalign; 0: no extension",
+        typeid(int), (void *) &chainExtend, "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_CHAIN_EXTEND_EVAL(PARAM_CHAIN_EXTEND_EVAL_ID, "--chain-extend-eval", "Chain extension E-value",
+        "chainalign: only chains with an E-value at most this before extension are extended",
+        typeid(double), (void *) &chainExtendEval, "^([0-9eE+.-]+|[iI][nN][fF])$", MMseqsParameter::COMMAND_ALIGN),
+    PARAM_KMER_ALPH(PARAM_KMER_ALPH_ID, "--kmer-alph", "Reduced k-mer alphabet",
+        "redkmermatcher: k-mer alphabet built from the nucleotides of the dinucleotide db\n"
+        "n4: nucleotides (k nt per k-mer)\nd16: dinucleotides (k + 1 nt)\nd12: dinucleotides, 12 classes (k + 1 nt)\n"
+        "d8: dinucleotides, 8 classes (k + 1 nt)",
+        typeid(std::string), (void *) &kmerAlph, "^(n4|d16|d12|d8)$", MMseqsParameter::COMMAND_CLUSTLINEAR)
 {
     cmRegionFlanking = 1.0f;  // 1.0 => pad by full W (prior hardcoded behavior)
     cmMode = 1;
@@ -60,6 +102,19 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuildEre = -1.0;      // <0 => Infernal default target rel-entropy
     cmbuildSymfrac = -1.0;  // <0 => keep all columns (current default)
     cmbuildNoss = 0;        // use SS_cons (current default)
+    localMin = 5000;
+    chainBand = 100;
+    chainGap = 1000;
+    envMargin = 200;
+    envMaxIter = 8;
+    chainWord = 8;
+    chainXdrop = 30;
+    chainMinHsp = 0;
+    chainBridge = 500;
+    chainMaxHsp = 500;
+    chainExtend = 0;
+    chainExtendEval = 1.0;
+    kmerAlph = "n4";
 
     // Register dinuc.out as compiled-in matrix and set as default
     scoringMatrixFile = MultiParam<NuclAA<std::string>>(NuclAA<std::string>("dinuc.out", "dinuc.out"));
@@ -78,6 +133,27 @@ LocalParameters::LocalParameters() : Parameters(),
     cmscan.push_back(&PARAM_CM_LOCAL);
 
     rnaalign = align;
+
+    envalign = align;
+    envalign.push_back(&PARAM_LOCAL_MIN);
+    envalign.push_back(&PARAM_CHAIN_BAND);
+    envalign.push_back(&PARAM_CHAIN_GAP);
+    envalign.push_back(&PARAM_ENV_MARGIN);
+    envalign.push_back(&PARAM_ENV_MAX_ITER);
+
+    chainalign = align;
+    chainalign.push_back(&PARAM_CHAIN_WORD);
+    chainalign.push_back(&PARAM_CHAIN_XDROP);
+    chainalign.push_back(&PARAM_CHAIN_MIN_HSP);
+    chainalign.push_back(&PARAM_CHAIN_BRIDGE);
+    chainalign.push_back(&PARAM_CHAIN_MAX_HSP);
+    chainalign.push_back(&PARAM_CHAIN_EXTEND);
+    chainalign.push_back(&PARAM_CHAIN_EXTEND_EVAL);
+
+    redkmermatcher = kmermatcher;
+    redkmermatcher.push_back(&PARAM_KMER_ALPH);
+    // linclust --kmer-alph: both kmermatcher levels run redkmermatcher (RnaCluster.cpp)
+    linclustworkflow.push_back(&PARAM_KMER_ALPH);
     rnaalign.push_back(&PARAM_DB_SIZE);
 
     splitstrand.push_back(&PARAM_STRAND);

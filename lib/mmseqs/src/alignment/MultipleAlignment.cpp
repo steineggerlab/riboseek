@@ -204,6 +204,24 @@ void MultipleAlignment::updateGapsInSequenceSet(char **msaSequence, size_t cente
                 }
             }
         }
+#ifdef RIBOSEEK
+        // a dinucleotide match also aligns the second nucleotide of the last matched pair: query position
+        // queryPos (= qEndPos + 1) against target position targetPos (= dbEndPos + 1), whose dinucleotide starts
+        // with that nucleotide. Without this the last nucleotide of every alignment ending in M is lost.
+        if (reverse == false && bt.empty() == false && bt.back() == 'M' && targetPos < edgeSeq.size()) {
+            size_t gaps = (noDeletionMSA == false) ? queryGaps[queryPos] : 0;
+            if (bufferPos + gaps < centerSeqSize) {
+                for (size_t gapIdx = 0; gapIdx < gaps; gapIdx++) {
+                    edgeSeqMSA[bufferPos] = '-';
+                    bufferPos++;
+                }
+                edgeSeqMSA[bufferPos] = subMat->num2aa[edgeSeq[targetPos]];
+                bufferPos++;
+                queryPos++;
+                targetPos++;
+            }
+        }
+#endif
         // fill up rest with gaps
         for(size_t pos = bufferPos; pos < centerSeqSize; pos++){
             edgeSeqMSA[bufferPos] = '-';

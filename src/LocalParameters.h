@@ -32,6 +32,19 @@ public:
     double cmbuildEre;
     double cmbuildSymfrac;
     int cmbuildNoss;
+    int localMin;
+    int chainBand;
+    int chainGap;
+    int envMargin;
+    int envMaxIter;
+    int chainWord;
+    int chainXdrop;
+    int chainMinHsp;
+    int chainBridge;
+    int chainMaxHsp;
+    int chainExtend;
+    double chainExtendEval;
+    std::string kmerAlph;
 
     PARAMETER(PARAM_CM_REGION)
     PARAMETER(PARAM_CM_MODE)
@@ -43,12 +56,28 @@ public:
     PARAMETER(PARAM_CMBUILD_ERE)
     PARAMETER(PARAM_CMBUILD_SYMFRAC)
     PARAMETER(PARAM_CMBUILD_NOSS)
+    PARAMETER(PARAM_LOCAL_MIN)
+    PARAMETER(PARAM_CHAIN_BAND)
+    PARAMETER(PARAM_CHAIN_GAP)
+    PARAMETER(PARAM_ENV_MARGIN)
+    PARAMETER(PARAM_ENV_MAX_ITER)
+    PARAMETER(PARAM_CHAIN_WORD)
+    PARAMETER(PARAM_CHAIN_XDROP)
+    PARAMETER(PARAM_CHAIN_MIN_HSP)
+    PARAMETER(PARAM_CHAIN_BRIDGE)
+    PARAMETER(PARAM_CHAIN_MAX_HSP)
+    PARAMETER(PARAM_CHAIN_EXTEND)
+    PARAMETER(PARAM_CHAIN_EXTEND_EVAL)
+    PARAMETER(PARAM_KMER_ALPH)
 
     std::vector<MMseqsParameter*> splitstrand;
     std::vector<MMseqsParameter*> rnaalign;
     std::vector<MMseqsParameter*> cmbuild;
     std::vector<MMseqsParameter*> cmscan;
     std::vector<MMseqsParameter*> dinucdb;
+    std::vector<MMseqsParameter*> envalign;
+    std::vector<MMseqsParameter*> chainalign;
+    std::vector<MMseqsParameter*> redkmermatcher;
 };
 
 #endif

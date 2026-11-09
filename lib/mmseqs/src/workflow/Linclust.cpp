@@ -164,6 +164,8 @@ int linclust(int argc, const char **argv, const Command& command) {
         
         cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
         cmd.addVariable("ALIGN2CLUST_PAR", par.createParameterString(par.align2clust).c_str());
+        // riboseek: parameters of the optional GPU pair filter (RIBOSEEK_GPU_PAIRFILTER, linclust.sh)
+        cmd.addVariable("GPUPAIR_PAR", par.createParameterString(par.align).c_str());
         cmd.addVariable("CLUSTER_PAR", par.createParameterString(par.clust).c_str());
         
         par.spacedKmer = true;

@@ -29,5 +29,6 @@ set(alignment_source_files
         alignment/DistanceCalculator.cpp
         alignment/rescorediagonal.cpp
         alignment/Fwbw.cpp
+        alignment/GpuPairFilter.cpp
         PARENT_SCOPE
         )
