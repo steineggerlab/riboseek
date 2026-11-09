@@ -141,7 +141,6 @@ void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryK
                 EXIT(EXIT_FAILURE);
             }
             if (tId != UINT_MAX && qId != UINT_MAX) {
-                const char *tData = tSource->getData(tId, threadIdx);
                 const int tLen = static_cast<int>(tSource->getSeqLen(tId));
                 const char *qData = qDb->getData(qId, threadIdx);
                 const unsigned int qDataLen = qDb->getSeqLen(qId);
@@ -151,10 +150,11 @@ void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryK
                 const int wEnd = std::min(tLen, tHi + pad + 1);
                 const int wLen = wEnd - wStart;
                 if (wLen > 0 && (unsigned int)wLen <= rnaRealignMaxWindow()) {
+                    const char *tWindow = tSource->getDataRange(tId, threadIdx, wStart, wLen);
                     RnaRealignHit hit;
                     std::string backtrace;
                     if (rnaRealignWindow(qData, qDataLen, sq != NULL ? sq->getDbtype() : -1, entryKey, reverse,
-                                         tData + wStart, wLen,
+                                         tWindow, wLen,
                                          queryKey, results[i].dbKey,
                                          tSource, threadIdx, hit, backtrace)) {
                         // The realignment scores the query the same way the align module

@@ -214,6 +214,8 @@ public:
 
     char* getUnpadded(size_t id, int thrIdx);
 
+    char* getDataRange(size_t id, int thrIdx, size_t start, size_t len);
+
     char* getDataUncompressed(size_t id);
 
     void touchData(size_t id);
