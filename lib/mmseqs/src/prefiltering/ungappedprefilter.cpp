@@ -605,7 +605,7 @@ void runFilterOnCpu(Parameters & par, BaseMatrix * subMat, int8_t * tinySubMat,
             }else{
                 aligner.ssw_init(&qSeq, tinySubMat, subMat);
             }
-#pragma omp for schedule(static) nowait
+#pragma omp for schedule(dynamic, 1024) nowait
             for (size_t tId = 0; tId < tdbr->getSize(); tId++) {
                 unsigned int targetKey = tdbr->getDbKey(tId);
                 if(taxonomyHook != NULL){
@@ -677,6 +677,13 @@ void runFilterOnCpu(Parameters & par, BaseMatrix * subMat, int8_t * tinySubMat,
                     hit.diagonal = 0;
                     threadShortResults.emplace_back(hit);
                 }
+            }
+            // only the top --max-seqs survive the merge; keep one more so the tie check below still sees it
+            const size_t keepPerThread = par.maxResListLen + 1;
+            if (threadShortResults.size() > keepPerThread) {
+                std::nth_element(threadShortResults.begin(), threadShortResults.begin() + keepPerThread,
+                                 threadShortResults.end(), hit_t::compareHitsByScoreAndId);
+                threadShortResults.resize(keepPerThread);
             }
 #pragma omp critical
             {
