@@ -6,6 +6,7 @@
 #include "RnaEvalueComputation.h"
 #include "Sequence.h"
 #include "RnaMatcher.h"
+#include "DinucleotideMapping.h"
 #include "TargetGcStat.h"
 #include "EvalueModel.h"
 #include "Debug.h"
@@ -187,10 +188,14 @@ bool rnaRealignWindow(const char *queryData, unsigned int queryLen, int queryDbT
         tl.qSeq->mapSequence(0, 0, qUse, queryLen);
     }
     tl.wSeq->mapSequence(0, targetKey, targetWindow, windowLen);
+    const bool reverseDinuc = reverse && ctx->strandDb;
+    if (reverseDinuc) {
+        dinucEncodeReverse(tl.wSeq);
+    }
     tl.matcher->initQuery(tl.qSeq);
     RnaMatcher::result_t r = tl.matcher->getSWResult(tl.wSeq, 0, false, ctx->covMode, ctx->covThr,
                                                      ctx->evalThr, RnaMatcher::SCORE_COV_SEQID,
-                                                     ctx->seqIdMode, false, false, false);
+                                                     ctx->seqIdMode, false, false, reverseDinuc);
     if (r.dbStartPos < 0 || r.qStartPos < 0) {
         return false;
     }
