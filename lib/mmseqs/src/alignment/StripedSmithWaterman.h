@@ -258,6 +258,11 @@ private:
     // target variables
     int segSize;
 
+    // ungapped_alignment: signed striped profile (raw scores) and its score column, as simd_int
+    int8_t *profileSigned;
+    int8_t *hSigned;
+    int32_t signedSegLen;
+
     // needed for type checking query and target databases
     bool isQueryProfile;
 
