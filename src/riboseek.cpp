@@ -34,9 +34,6 @@ void init() {
     registerCommands(&riboseekCommands);
     registerDinucleotideMapping();
     registerFragmentMerger();
-    #ifdef HAVE_CUDA
-    registerDinucleotideFilterConfig();
-    #endif
 }
 void (*initCommands)(void) = init;
 void initParameterSingleton() { new LocalParameters; }

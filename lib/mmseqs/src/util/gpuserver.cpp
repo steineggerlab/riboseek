@@ -25,7 +25,10 @@ void intHandler(int) {
 int gpuserver(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
-#ifdef HAVE_CUDA
+#ifdef HAVE_METAL
+    Debug(Debug::ERROR) << "gpuserver is not supported with Metal\n";
+    EXIT(EXIT_FAILURE);
+#elif defined(HAVE_CUDA)
     bool touch = (par.preloadMode != Parameters::PRELOAD_MODE_MMAP);
     IndexReader dbrIdx(par.db1, par.threads, IndexReader::SEQUENCES, (touch) ? (IndexReader::PRELOAD_INDEX | IndexReader::PRELOAD_DATA) : 0 );
     DBReader<unsigned int>* dbr = dbrIdx.sequenceReader;
@@ -47,12 +50,6 @@ int gpuserver(int argc, const char **argv, const Command& command) {
         lengths.emplace_back(dbr->getIndex()[id].length - 2);
     }
     offsets.emplace_back(offsets.back() + lengths.back());
-    // the last entry of a split padded DB can be a short remainder; the one before it is then a
-    // full chunk, which is the longest
-    int32_t maxTargetLength = lengths.back();
-    if (lengths.size() > 1) {
-        maxTargetLength = std::max(maxTargetLength, lengths[lengths.size() - 2]);
-    }
 
     BaseMatrix *subMat;
     if (Parameters::isEqualDbtype(dbrIdx.sequenceReader->getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
@@ -61,9 +58,8 @@ int gpuserver(int argc, const char **argv, const Command& command) {
         subMat = new SubstitutionMatrix(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, 0.0);
     }
 
-    Marv::AlignmentType type =  (par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) ?
-                                Marv::AlignmentType::GAPLESS_SMITH_WATERMAN : Marv::AlignmentType::GAPLESS;
-    Marv marv(dbr->getSize(), subMat->alphabetSize, maxTargetLength, par.maxResListLen, type);
+    const bool gapped = par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED;
+    Marv marv(dbr->getSize(), subMat->alphabetSize);
     void* h1 = marv.loadDb(
             dbr->getDataForFile(0), offsets.data(), lengths.data(), dbr->getDataSizeForFile(0)
     );
@@ -85,7 +81,8 @@ int gpuserver(int argc, const char **argv, const Command& command) {
         if (layout->state.load(std::memory_order_acquire) == GPUSharedMemory::READY) {
             std::atomic_thread_fence(std::memory_order_acquire);
 
-            Marv::Stats stats = marv.scan(reinterpret_cast<const char *>(layout->getQueryPtr()), layout->queryLen, layout->getProfilePtr(), layout->getResultsPtr());
+            Marv::Stats stats = marvSearch(marv, gapped, reinterpret_cast<const char *>(layout->getQueryPtr()), layout->queryLen,
+                                           layout->getProfilePtr(), par.maxResListLen, layout->getResultsPtr());
             layout->resultLen = stats.results;
 
             std::atomic_thread_fence(std::memory_order_release);

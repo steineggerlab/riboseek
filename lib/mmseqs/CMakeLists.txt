@@ -20,7 +20,12 @@ set(NATIVE_ARCH 1 CACHE BOOL "Assume native architecture for SIMD. Use one of th
 set(USE_SYSTEM_ZSTD 0 CACHE BOOL "Use zstd provided by system instead of bundled version")
 set(IGNORE_RUST_VERSION 0 CACHE BOOL "Ignore Rust version check")
 set(ENABLE_CUDA 0 CACHE BOOL "Enable CUDA")
+set(ENABLE_METAL 0 CACHE BOOL "Enable Metal (macOS, Apple GPUs) for the ungapped prefilter")
 set(FORCE_STATIC_DEPS 0 CACHE BOOL "Force static linking of deps")
+
+if(ENABLE_METAL AND ENABLE_CUDA)
+    message(FATAL_ERROR "ENABLE_METAL cannot be combined with ENABLE_CUDA")
+endif()
 
 if(FORCE_STATIC_DEPS)
     if(ENABLE_CUDA)
@@ -295,7 +300,7 @@ if (NOT DISABLE_IPS4O)
 endif ()
 
 # libmarv
-if (ENABLE_CUDA)
+if (ENABLE_CUDA OR ENABLE_METAL)
     set(LIBRARY_ONLY 1 CACHE INTERNAL "" FORCE)
     include_directories(lib/libmarv/src)
     add_subdirectory(lib/libmarv/src EXCLUDE_FROM_ALL)

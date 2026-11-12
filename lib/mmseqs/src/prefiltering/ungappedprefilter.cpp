@@ -30,6 +30,8 @@
 #include "Alignment.h"
 #include <signal.h>
 #include <algorithm>
+#ifndef HAVE_METAL
+#endif
 #include <cuda_runtime.h>
 #endif
 
@@ -48,8 +50,14 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
     const int querySeqType = qdbr->getDbtype();
     Sequence qSeq(par.maxSeqLen, querySeqType, subMat, 0, false, par.compBiasCorrection);
 
-    std::vector<Marv::Result> results;
-    results.reserve(par.maxResListLen);
+#ifdef HAVE_METAL
+    if (par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) {
+        Debug(Debug::ERROR) << "Ungapped and gapped prefilter mode is not supported with Metal\n";
+        EXIT(EXIT_FAILURE);
+    }
+#endif
+    const bool gapped = par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED;
+    std::vector<Marv::Result> results(par.maxResListLen, Marv::Result(0, 0, -1, -1));
     std::vector<hit_t> shortResults;
     std::vector<Matcher::result_t> resultsAln;
 
@@ -147,17 +155,7 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
            Debug(Debug::ERROR) << "Invalid GPU database\n";
            EXIT(EXIT_FAILURE);
        }
-        // makepaddedseqdb sorts by length, but splitsequence replaces each long entry by its
-        // chunks in place, so the last entry can be a short remainder; the one before it is then
-        // a full chunk, which is the longest
-        int32_t maxTargetLength = lengths.back();
-        if (lengths.size() > 1) {
-            maxTargetLength = std::max(maxTargetLength, lengths[lengths.size() - 2]);
-        }
-        Marv::AlignmentType type = (par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) ?
-                Marv::AlignmentType::GAPLESS_SMITH_WATERMAN : Marv::AlignmentType::GAPLESS;
-        // marv = new Marv(tdbr->getSize(), subMat->alphabetSize, maxTargetLength,
-        //                 par.maxResListLen, type);
+        // marv = new Marv(tdbr->getSize(), subMat->alphabetSize);
         // void* h = marv->loadDb(
         //     tdbr->getDataForFile(0), offsetData, lengthData, tdbr->getDataSizeForFile(0)
         // );
@@ -166,6 +164,7 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
         std::vector<int> deviceIds = Marv::getDeviceIds();
         size_t totalGpuMem = 0;
         size_t totalFreeMem = 0;
+#ifndef HAVE_METAL
         for (int deviceId : deviceIds) {
             cudaSetDevice(deviceId);
             size_t freeMem = 0, totalMem = 0;
@@ -174,6 +173,10 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             totalFreeMem += freeMem;
         }
         cudaSetDevice(deviceIds[0]); // Reset to first device
+#else
+        // Apple GPUs share system memory, and libmarv streams a database that does not fit in batches
+        totalFreeMem = SIZE_MAX / 2;
+#endif
         
         // Estimate database size (sequence data + overhead for GPU structures)
         size_t dbDataSize = tdbr->getDataSizeForFile(0);
@@ -208,8 +211,7 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
         // Load database
         if (numChunks == 1) {
             // Single chunk - create Marv and load entire database
-            marv = new Marv(tdbr->getSize(), subMat->alphabetSize, maxTargetLength,
-                            par.maxResListLen, type);
+            marv = new Marv(tdbr->getSize(), subMat->alphabetSize);
             void* h = marv->loadDb(
                 tdbr->getDataForFile(0), offsetData, lengthData, tdbr->getDataSizeForFile(0)
             );
@@ -270,15 +272,11 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             }
             chunkOffsets[chunkSize] = offsets[chunkEnd] - baseOffset;
             
-            // Calculate chunk data size and find max length for this chunk
+            // Calculate chunk data size
             size_t chunkDataSize = chunkOffsets[chunkSize];
-            int32_t chunkMaxLength = *std::max_element(chunkLengths.begin(), chunkLengths.end());
             
             // Create Marv instance for this chunk
-            Marv::AlignmentType type = (par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) ?
-                    Marv::AlignmentType::GAPLESS_SMITH_WATERMAN : Marv::AlignmentType::GAPLESS;
-            currentMarv = new Marv(chunkSize, subMat->alphabetSize, chunkMaxLength,
-                                   par.maxResListLen, type);
+            currentMarv = new Marv(chunkSize, subMat->alphabetSize);
             
             // Load chunk database
             void* chunkHandle = currentMarv->loadDb(
@@ -327,7 +325,8 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             Marv::Stats stats;
             stats.results = 0;
             if (serverMode == 0) {
-                stats = currentMarv->scan(reinterpret_cast<const char *>(qSeq.numSequence), qSeq.L, profile, results.data());
+                stats = marvSearch(*currentMarv, gapped, reinterpret_cast<const char *>(qSeq.numSequence), qSeq.L, profile,
+                                   par.maxResListLen, results.data());
                 if (numChunks > 1) {
                     for (size_t i = 0; i < stats.results; i++) {
                         Marv::Result res = results[i];

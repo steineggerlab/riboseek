@@ -622,35 +622,3 @@ void registerDinucleotideMapping() {
         dinucToNucTbl
     );
 }
-
-#ifdef HAVE_CUDA
-
-#include "marv.h"
-
-#ifndef SDIV
-#define SDIV(a, b) (((a) + (b) - 1) / (b))
-#endif
-
-inline
-size_t calculateGaplessSharedMemory(int groupsize, int numRegs, int scoreTypeSize = 4){
-    constexpr int numRowsPSSM = 25;
-    int numColumnsPSSM = std::max(groupsize, 8) * numRegs;
-    int numPaddedColumns = SDIV(numColumnsPSSM, 16/scoreTypeSize) * (16/scoreTypeSize);
-    return static_cast<size_t>(numRowsPSSM) * numPaddedColumns * scoreTypeSize;
-}
-
-std::vector<cudasw4::GaplessKernelConfig> dinucFilterConfig(std::vector<cudasw4::GaplessKernelConfig>& configs, int maxSharedMemoryPerBlock) {
-    std::vector<cudasw4::GaplessKernelConfig> filteredConfigs;
-    for (const auto& config : configs) {
-        size_t required_Smem = calculateGaplessSharedMemory(config.groupsize, config.numRegs);
-        if (required_Smem <= static_cast<size_t>(maxSharedMemoryPerBlock)) {
-            filteredConfigs.push_back(config);
-        }
-    }
-    return filteredConfigs;
-}
-
-void registerDinucleotideFilterConfig() {
-    registerGaplessFilterConfig(dinucFilterConfig);
-}
-#endif

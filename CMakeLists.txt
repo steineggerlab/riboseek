@@ -13,16 +13,11 @@ endif()
 
 set(FRAMEWORK_ONLY 1 CACHE INTERNAL "" FORCE)
 include(MMseqsSetupDerivedTarget)
+# libmarv's GPU kernels hold the query PSSM in shared memory with a row count fixed at build time:
+# riboseek's 25-letter dinucleotide alphabet instead of the 21-row protein default
+set(MARV_PSSM_ROWS 25)
 add_subdirectory(lib/mmseqs EXCLUDE_FROM_ALL)
 target_compile_definitions(mmseqs-framework PUBLIC RIBOSEEK=1)
-# libmarv is linked privately, so RIBOSEEK does not reach it through mmseqs-framework;
-# without it the GPU kernels keep the 21-row protein PSSM instead of the 25-letter alphabet
-if(TARGET marv)
-    target_compile_definitions(marv PRIVATE RIBOSEEK=1)
-endif()
-if(TARGET pssmkernels_gapless_int8_obj)
-    target_compile_definitions(pssmkernels_gapless_int8_obj PRIVATE RIBOSEEK=1)
-endif()
 
 # Hack: apply static linker flags until the scope is fixed in mmseqs
 if(FORCE_STATIC_DEPS)

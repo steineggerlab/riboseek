@@ -1,9 +1,13 @@
 #ifndef MATH_OPS_CUH
 #define MATH_OPS_CUH
 
-#include <cuda_fp16.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#if defined(__HIPCC__)
+    #include <hip/hip_fp16.h>
+    #include <hip/hip_cooperative_groups.h>
+#endif
+// #include <cooperative_groups/reduce.h>
+
+#include "cuda_hip_compatibility.cuh"
 
 #include "ptx_wrappers.cuh"
 #include "custom_score_types.cuh"
@@ -13,7 +17,8 @@
 #define CUDART_ZERO_FP16 __ushort_as_half((unsigned short)0x0000U)
 #endif
 
-namespace cudasw4{
+#include "namespace.hpp"
+LIBMARV_NAMESPACE_WITH_NESTING_BEGIN
 
     template<class T>
     struct MathOps{};
@@ -42,7 +47,7 @@ namespace cudasw4{
         //max(a,b)
         __device__
         static VecType max(const VecType& a, const VecType& b){
-            return __hmax2(a, b);
+            return compatibility::hmax2(a, b);
         }
 
         //max(a,b)
@@ -86,13 +91,13 @@ namespace cudasw4{
         //max(a,b,c)
         __device__
         static VecType max3(const VecType& a, const VecType& b, const VecType& c){
-            return __hmax2(a, __hmax2(b,c));
+            return compatibility::hmax2(a, compatibility::hmax2(b,c));
         }
 
         //max(a+b,c)
         __device__
         static VecType add_max(const VecType& a, const VecType& b, const VecType& c){
-            return __hmax2(__hadd2(a,b), c);
+            return compatibility::hmax2(__hadd2(a,b), c);
         }
 
         //max(a+b,c)
@@ -123,11 +128,15 @@ namespace cudasw4{
         template<class Group>
         __device__
         static VecType reduce_max(Group& group, VecType val){
-            return cooperative_groups::reduce(group, val, [](const auto& l, const auto& r){return __hmax2(l,r);});
+            //return cooperative_groups::reduce(group, val, [](const auto& l, const auto& r){return __hmax2(l,r);});
+
+            return compatibility::group_reduce_max(
+                group, val);
             //return cooperative_groups::reduce(group, val, cooperative_groups::greater<VecType>{});
         }
     };
 
+#if defined(__CUDACC__)
     template<>
     struct MathOps<short2>{
         using Type = short;
@@ -172,7 +181,16 @@ namespace cudasw4{
         //max(a,b)
         __device__
         static VecType max(const VecType& a, const VecType& b, bool* a_xIsMax, bool* a_yIsMax){
-            return  asVec(__vibmax_u16x2(asUint(a), asUint(b), a_xIsMax, a_yIsMax));
+            //unsigned int __vibmax_s16x2(const unsigned int a, const unsigned int b, bool *const pred_hi, bool *const pred_lo)
+
+            // NOTE: the x component of short2 is the lower part -> pred_lo
+            return  asVec(__vibmax_s16x2(asUint(a), asUint(b), a_yIsMax, a_xIsMax));
+
+            // VecType maximum = asVec(__vmaxs2(asUint(a), asUint(b)));
+            // unsigned int cmpflags = __vcmpges2(asUint(a), asUint(b));
+            // *a_yIsMax = (cmpflags & 0xFFFF0000) > 0;
+            // *a_xIsMax = (cmpflags & 0x0000FFFF) > 0;
+            // return maximum;
         }
 
         //max(a,b,c)
@@ -215,10 +233,12 @@ namespace cudasw4{
         template<class Group>
         __device__
         static VecType reduce_max(Group& group, VecType val){
-            return asVec(cooperative_groups::reduce(group, asUint(val), [](const auto& l, const auto& r){return __vmaxs2(l,r);}));
+            return asVec(
+                compatibility::group_reduce(group, asUint(val), [](const auto& l, const auto& r){return __vmaxs2(l,r);}));
             //return cooperative_groups::reduce(group, val, cooperative_groups::greater<VecType>{});
         }
     };
+#endif
 
 
     template<>
@@ -278,6 +298,15 @@ namespace cudasw4{
             return add_max(a,b,0.0f);
         }
 
+        __device__
+        static Type add_relu(const Type& a, const half& b){
+            #if __CUDA_ARCH__ >= 1000
+            return max(ptx_add_f32_f16(a,b), 0.0f);
+            #else
+            return add_relu(a, float(b));
+            #endif
+        }
+
         //max(max(a + b, c), 0)
         __device__
         static Type add_max_relu(const Type& a, const Type& b, const Type& c){
@@ -287,7 +316,8 @@ namespace cudasw4{
         template<class Group>
         __device__
         static Type reduce_max(Group& group, Type val){
-            return cooperative_groups::reduce(group, val, cooperative_groups::greater<Type>{});
+            //return compatibility::group_reduce(group, val, cooperative_groups::greater<Type>{});
+            return compatibility::group_reduce_max(group, val);
         }
     };
 
@@ -307,28 +337,47 @@ namespace cudasw4{
             return ::max(a,b);
         }
 
+
         //max(a,b)
         __device__
         static Type max(const Type& a, const Type& b, bool* firstIsMax){
+            #if defined(__CUDACC__)
             return __vibmax_s32(a, b, firstIsMax);
+            #else
+            if(a >= b){
+                *firstIsMax = true;
+                return a;
+            }else{
+                *firstIsMax = false;
+                return b;
+            }
+            #endif
         } 
 
         //max(a,b,c)
         __device__
         static Type max3(const Type& a, const Type& b, const Type& c){
+            #if defined(__CUDACC__)
             return __vimax3_s32(a,b,c);
+            #else
+            return max(a, max(b,c));
+            #endif
         }
 
         //max(a+b,c)
         __device__
         static Type add_max(const Type& a, const Type& b, const Type& c){
+            #if defined(__CUDACC__)
             return __viaddmax_s32(a,b,c);
+            #else
+            return max(a+b,c);
+            #endif
         }
 
         //max(a+b,c)
         __device__
         static Type add_max(const Type& a, const Type& b, const Type& c, bool* firstIsMax){
-            return __vibmax_s32(a+b, c, firstIsMax);
+            return max(a+b, c, firstIsMax);
         }
 
         //max(a+b,0)
@@ -340,13 +389,17 @@ namespace cudasw4{
         //max(max(a + b, c), 0)
         __device__
         static Type add_max_relu(const Type& a, const Type& b, const Type& c){
+            #if defined(__CUDACC__)
             return __viaddmax_s32_relu(a,b,c);
+            #else
+            return max(add_max(a,b,c), 0);
+            #endif
         }    
 
         template<class Group>
         __device__
         static Type reduce_max(Group& group, Type val){
-            return cooperative_groups::reduce(group, val, cooperative_groups::greater<Type>{});
+            return compatibility::group_reduce_max(group, val);
         }
     };
 
@@ -387,7 +440,7 @@ namespace cudasw4{
         template<class Group>
         __device__
         static Type reduce_max(Group& group, Type val){
-            return cooperative_groups::reduce(group, val, cooperative_groups::greater<Type>{});
+            return compatibility::group_reduce_max(group, val);
         }
     };
 
@@ -428,11 +481,12 @@ namespace cudasw4{
         template<class Group>
         __device__
         static Type reduce_max(Group& group, Type val){
-            return cooperative_groups::reduce(group, val, cooperative_groups::greater<Type>{});
+            return compatibility::group_reduce_max(group, val);
         }
     };
 
 
+#if defined(__CUDACC__)
     template<>
     struct MathOps<ScoreType_u8x4>{
         using Type = cuda::std::uint8_t;
@@ -451,6 +505,18 @@ namespace cudasw4{
             #else
             return __vmaxu4(a,b);
             #endif
+        }
+
+        //max(a,b), sets a_xIsMax = a.x >= b.x , and so on
+        __device__
+        static VecType max(const VecType& a, const VecType& b, bool* a_xIsMax, bool* a_yIsMax, bool* a_zIsMax, bool* a_wIsMax){
+            auto maximum = max(a,b);
+            unsigned int cmpflags = __vcmpgeu4(a,b);
+            *a_wIsMax = (cmpflags & 0xFF000000) > 0;
+            *a_zIsMax = (cmpflags & 0x00FF0000) > 0;
+            *a_yIsMax = (cmpflags & 0x0000FF00) > 0;
+            *a_xIsMax = (cmpflags & 0x000000FF) > 0;
+            return maximum;
         }
 
         //max(a,b,c)
@@ -514,8 +580,9 @@ namespace cudasw4{
             #endif
         }
     };
+#endif // defined(__CUDACC__)
 
 
-} //namespace cudasw4
+LIBMARV_NAMESPACE_WITH_NESTING_END
 
 #endif
