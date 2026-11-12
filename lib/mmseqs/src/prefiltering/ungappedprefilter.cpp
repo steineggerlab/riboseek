@@ -31,13 +31,26 @@
 #include <signal.h>
 #include <algorithm>
 #ifndef HAVE_METAL
-#endif
 #include <cuda_runtime.h>
+#endif
 #endif
 
 #ifdef HAVE_CUDA
 
 volatile sig_atomic_t keepRunningClient = 1;
+
+// reads [begin, end) into the page cache by touching every page (MADV_WILLNEED alone only reads
+// one readahead window); blocks about as long as the read
+static void prefetchRange(const char *begin, const char *end) {
+    const uintptr_t pageSize = sysconf(_SC_PAGESIZE);
+    const volatile char *p = (const volatile char *)((uintptr_t)begin & ~(pageSize - 1));
+    char sink = 0;
+    for (; p < (const volatile char *)end && keepRunningClient; p += pageSize) {
+        sink ^= *p;
+    }
+    (void)sink;
+}
+
 void intHandlerClient(int) {
     keepRunningClient = 0;
 }
@@ -244,6 +257,22 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
         }
     }
 
+    // On devices that read host memory in place, the GPU searches the chunk straight from the page
+    // cache, and a chunk takes most of the memory, so reading the next one would evict the current one
+    bool prefetchChunks = (numChunks > 1);
+#ifndef HAVE_METAL
+    if (numChunks > 1) {
+        for (int deviceId : Marv::getDeviceIds()) {
+            int usesHostPageTables = 0;
+            cudaDeviceGetAttribute(&usesHostPageTables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, deviceId);
+            if (usesHostPageTables == 1) {
+                prefetchChunks = false;
+            }
+        }
+    }
+#endif
+    std::thread prefetcher;
+
     // Outer loop: iterate through database chunks
     for (size_t chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
         if (!keepRunningClient) {
@@ -286,6 +315,16 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
                 chunkDataSize
             );
             currentMarv->setDb(chunkHandle);
+
+            // the chunk is on the GPU now; read the next one from disk while its queries run
+            if (prefetcher.joinable()) {
+                prefetcher.join();
+            }
+            if (prefetchChunks && chunkIdx + 1 < numChunks) {
+                const std::pair<size_t, size_t> &next = dbChunks[chunkIdx + 1];
+                const char *data = tdbr->getDataForFile(0);
+                prefetcher = std::thread(prefetchRange, data + offsets[next.first], data + offsets[next.second]);
+            }
         }
 
         // Inner loop: iterate through all queries for this chunk
@@ -461,6 +500,9 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             delete currentMarv;
         }
     } // end chunk loop
+    if (prefetcher.joinable()) {
+        prefetcher.join();
+    }
     
     // For multi-chunk mode: merge results from all chunks and write output
     if (numChunks > 1 && serverMode == 0) {
@@ -472,11 +514,11 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             size_t queryKey = qdbr->getDbKey(id);
             unsigned int querySeqLen = qdbr->getSeqLen(id);
             
-            // Sort accumulated results by score (descending)
+            // Sort accumulated results by score (descending), ties by target, as in a single chunk
             std::vector<Marv::Result>& queryResults = allQueryResults[id];
             std::sort(queryResults.begin(), queryResults.end(), 
                 [](const Marv::Result& a, const Marv::Result& b) {
-                    return a.score > b.score;
+                    return a.score > b.score || (a.score == b.score && a.id < b.id);
                 });
             
             // Keep top N results
