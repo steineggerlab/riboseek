@@ -315,6 +315,9 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
                 chunkDataSize
             );
             currentMarv->setDb(chunkHandle);
+            // setDb only plans the batches; upload the chunk to all GPUs now, so that the page cache
+            // no longer needs it while the next one is read
+            currentMarv->prefetch();
 
             // the chunk is on the GPU now; read the next one from disk while its queries run
             if (prefetcher.joinable()) {
