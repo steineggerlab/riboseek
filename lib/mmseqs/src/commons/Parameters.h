@@ -416,6 +416,7 @@ public:
     int    verbosity;                    // log level
     int    gpu;                          // use GPU
     int    gpuServer;                    // use the gpu server
+    std::string gpuServerNamespace;      // distinguish independent GPU servers
     int    gpuServerWaitTimeout;         // wait for this many seconds until GPU server is ready
     int    threads;                      // Amounts of threads
     int    compressed;                   // compressed writer
@@ -886,6 +887,7 @@ public:
     // gpu
     PARAMETER(PARAM_GPU)
     PARAMETER(PARAM_GPU_SERVER)
+    PARAMETER(PARAM_GPU_SERVER_NAMESPACE)
     PARAMETER(PARAM_GPU_SERVER_WAIT_TIMEOUT)
     // format alignment
     PARAMETER(PARAM_FORMAT_MODE)

@@ -72,7 +72,7 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
 
     std::string hash = "";
     if (par.gpuServer != 0) {
-        hash = GPUSharedMemory::getShmHash(par.db2);
+        hash = GPUSharedMemory::getShmHash(par.db2, par.gpuServerNamespace);
         std::string path = "/dev/shm/" + hash;
         // Debug(Debug::WARNING) << path << "\n";
         int waitTimeout = par.gpuServerWaitTimeout;

@@ -37,7 +37,7 @@ struct GPUSharedMemory {
                sizeof(int8_t) * 21 * maxSeqLen;        // Size for profile data
     }
 
-    static std::string getShmHash(const std::string& db);
+    static std::string getShmHash(const std::string& db, const std::string& nameSpace = "");
 
     // Allocate and initialize shared memory
     static GPUSharedMemory* alloc(const std::string& name, unsigned int maxSeqLen, unsigned int maxResListLen);

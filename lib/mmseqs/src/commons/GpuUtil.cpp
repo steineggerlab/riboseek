@@ -5,6 +5,7 @@
 #include "FileUtil.h"
 #include "PrefilteringIndexReader.h"
 
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -15,13 +16,19 @@
 
 extern const char* version;
 
-std::string GPUSharedMemory::getShmHash(const std::string& db) {
+std::string GPUSharedMemory::getShmHash(const std::string& db, const std::string& nameSpace) {
     std::string dbpath = FileUtil::getRealPathFromSymLink(PrefilteringIndexReader::dbPathWithoutIndex(db));
     char* visibleDevices = getenv("CUDA_VISIBLE_DEVICES");
     if (visibleDevices) {
         dbpath.append(visibleDevices);
     }
     dbpath.append(version);
+    if (nameSpace.empty() == false) {
+        // Preserve the legacy key when no namespace is supplied. The separator
+        // prevents namespace text from being confused with the version suffix.
+        dbpath.push_back('\0');
+        dbpath.append(nameSpace);
+    }
     size_t hash = Util::hash(dbpath.c_str(), dbpath.length());
     return SSTR(hash);
 }
@@ -29,20 +36,32 @@ std::string GPUSharedMemory::getShmHash(const std::string& db) {
 // Allocate and initialize shared memory
 GPUSharedMemory* GPUSharedMemory::alloc(const std::string& name, unsigned int maxSeqLen, unsigned int maxResListLen) {
     size_t shm_size = calculateSize(maxSeqLen, maxResListLen);
-    int fd = shm_open(name.c_str(), O_CREAT | O_RDWR, 0666);
+    int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd == -1) {
-        Debug(Debug::ERROR) << "Failed to open shared memory\n";
+        if (errno == EEXIST) {
+            Debug(Debug::ERROR)
+                << "GPU server shared memory " << name << " already exists.\n"
+                << "Another gpuserver may own the same database, CUDA devices, and namespace.\n"
+                << "Use a distinct --gpu-server-namespace for independent servers, or remove "
+                << "/dev/shm/" << name << " if no server owns the stale segment.\n";
+        } else {
+            Debug(Debug::ERROR) << "Failed to create shared memory: " << strerror(errno) << "\n";
+        }
         EXIT(EXIT_FAILURE);
     }
     if (ftruncate(fd, shm_size) == -1) {
+        int error = errno;
         close(fd);
-        Debug(Debug::ERROR) << "Failed to size shared memory\n";
+        shm_unlink(name.c_str());
+        Debug(Debug::ERROR) << "Failed to size shared memory: " << strerror(error) << "\n";
         EXIT(EXIT_FAILURE);
     }
     void* ptr = mmap(0, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    int mapError = errno;
     close(fd);  // Close the file descriptor early as it's no longer needed after mmap
     if (ptr == MAP_FAILED) {
-        Debug(Debug::ERROR) << "Failed to map shared memory\n";
+        shm_unlink(name.c_str());
+        Debug(Debug::ERROR) << "Failed to map shared memory: " << strerror(mapError) << "\n";
         EXIT(EXIT_FAILURE);
     }
 
@@ -79,7 +98,7 @@ void GPUSharedMemory::unmap(GPUSharedMemory* layout) {
 
 // Function to open and map existing shared memory and automatically determine sizes
 GPUSharedMemory* GPUSharedMemory::openSharedMemory(const std::string& name) {
-    int fd = shm_open(name.c_str(), O_RDWR, 0666);
+    int fd = shm_open(name.c_str(), O_RDWR, 0);
     if (fd == -1) {
         Debug(Debug::ERROR) << "Failed to open shared memory\n";
         EXIT(EXIT_FAILURE);
