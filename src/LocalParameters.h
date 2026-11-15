@@ -28,7 +28,7 @@ public:
     int cmAlign;
     int cmAlignBanded;
     int cmLocal;
-    size_t dbSize;
+    std::string dbSize;  // string: the parser reads size_t options with atoi, which wraps above 2^32
     double cmliteMsaEvalThr;
     double cmbuildEre;
     double cmbuildSymfrac;

@@ -47,7 +47,8 @@ int rnaalign(int argc, const char **argv, const Command &command) {
 
     // the search space covers the query strands searched (--strand 2: both, doubling E)
     const bool bothStrands = (par.strand == 2);
-    const size_t targetDbSize = par.dbSize;
+    // the parser checked --db-size against ^[0-9]{1,19}$, so it fits in 64 bits
+    const size_t targetDbSize = strtoull(par.dbSize.c_str(), NULL, 10);
     float covThr = par.covThr;
     const float canCovThr = par.covThr;
     const int covMode = par.covMode;

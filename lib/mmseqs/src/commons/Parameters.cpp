@@ -2026,6 +2026,18 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
                         if (Util::startWith("b64:", val)) {
                             val = base64_decode(val.c_str() + 4, val.size() - 4);
                         }
+                        // check the regex like the other types; an empty value still clears the option
+                        if (val.empty() == false && par[parIdx]->regex != NULL && par[parIdx]->regex[0] != '\0') {
+                            regex_t regex;
+                            compileRegex(&regex, par[parIdx]->regex);
+                            int nomatch = regexec(&regex, val.c_str(), 0, NULL, 0);
+                            regfree(&regex);
+                            if (nomatch) {
+                                printUsageMessage(command, 0xFFFFFFFF);
+                                Debug(Debug::ERROR) << "Error in argument " << par[parIdx]->name << "\n";
+                                EXIT(EXIT_FAILURE);
+                            }
+                        }
                         std::string* currVal = (std::string*)par[parIdx]->value;
                         currVal->assign(val);
                         par[parIdx]->wasSet = true;

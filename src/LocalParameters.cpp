@@ -33,8 +33,8 @@ LocalParameters::LocalParameters() : Parameters(),
         "^[0-1]$", MMseqsParameter::COMMAND_ALIGN),
     PARAM_DB_SIZE(PARAM_DB_SIZE_ID, "--db-size", "Database size",
         "Effective database size (0: use actual size)",
-        typeid(size_t), (void *) &dbSize,
-        "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+        typeid(std::string), (void *) &dbSize,
+        "^[0-9]{1,19}$", MMseqsParameter::COMMAND_ALIGN),
     PARAM_CMLITE_MSA_EVAL(PARAM_CMLITE_MSA_EVAL_ID, "--cmlite-msa-eval", "CmLite MSA E-value",
         "Include only hits with <= this E-value when building the cmbuild seed CM.\n"
         "All hits from resultDB are still searched afterward; this only filters the CM-building subset.",
@@ -78,7 +78,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmAlign = 0;
     cmAlignBanded = 1;
     cmLocal = 0;        // config: glocal (current shipped default)
-    dbSize = 0;
+    dbSize = "0";
     cmliteMsaEvalThr = DBL_MAX;
     cmbuildEre = -1.0;      // <0 => Infernal default target rel-entropy
     cmbuildSymfrac = -1.0;  // <0 => keep all columns (current default)
