@@ -411,6 +411,19 @@ int offsetalignment(int argc, const char **argv, const Command &command) {
         std::string newBacktrace;
         newBacktrace.reserve(300);
 
+        // Stitch fragments created by a splitsequence'd target. Only when the
+        // target really was split: otherwise there are no chunk boundaries to
+        // repair and re-aligning would silently rewrite correct results.
+        Matcher::fragmentMergerFn merger = splitEntries.empty() ? NULL : Matcher::getFragmentMerger();
+        const auto mergeFragments = [&](unsigned int queryKey) {
+            if (merger != NULL) {
+                merger(results, queryKey,
+                       qSourceDbr ? qSourceDbr->sequenceReader : NULL,
+                       tSourceDbr ? tSourceDbr->sequenceReader : NULL,
+                       splitEntries.data(), splitEntries.size(), thread_idx);
+            }
+        };
+
 #pragma omp for schedule(dynamic, 10)
         for (size_t i = 0; i < entryCount; ++i) {
             progress.updateProgress();
@@ -444,19 +457,9 @@ int offsetalignment(int argc, const char **argv, const Command &command) {
                     }else{
                         updateOffset(data, results, &qloc, *tOrfDbr, (isNuclNuclSearch||isTransNucTransNucSearch), isNuclNuclSearch, thread_idx);
                     }
-                    // Stitch fragments created by a splitsequence'd target. Only when the
-                    // target really was split: otherwise there are no chunk boundaries to
-                    // repair and re-aligning would silently rewrite correct results.
-                    if (splitEntries.empty() == false) {
-                        if (Matcher::fragmentMergerFn merger = Matcher::getFragmentMerger()) {
-                            merger(results, queryKey,
-                                   qSourceDbr ? qSourceDbr->sequenceReader : NULL,
-                                   tSourceDbr ? tSourceDbr->sequenceReader : NULL,
-                                   splitEntries.data(), splitEntries.size(), thread_idx);
-                        }
-                    }
                     // do not merge entries
                     if(par.mergeQuery == false){
+                        mergeFragments(queryKey);
                         for(size_t i = 0; i < results.size(); i++) {
                             Matcher::result_t &res = results[i];
                             bool hasBacktrace = (res.backtrace.size() > 0);
@@ -474,6 +477,10 @@ int offsetalignment(int argc, const char **argv, const Command &command) {
                         ss.clear();
                         tmp.clear();
                     }
+                }
+                // with --merge-query the hits of all the query's pieces are collected first: merge them once
+                if (par.mergeQuery == true) {
+                    mergeFragments(queryKey);
                 }
             } else if (Parameters::isEqualDbtype(targetDbType, Parameters::DBTYPE_NUCLEOTIDES)) {
                 queryKey = alnDbr.getDbKey(i);

@@ -30,7 +30,8 @@ namespace {
 // each chunk's own local alignment trims at its edge.
 // TODO: these two parameters need tuning
 const int JOIN_TOLERANCE = 50;
-// A lone hit covering less than this fraction of the query may have been cut by a boundary.
+// A lone hit covering less than this fraction of the query may have been cut by a boundary,
+// if a chunk boundary is close enough for the rest of the query to reach it.
 const float FULL_COVERAGE = 0.95f;
 
 // The iteration's strand-split query DB (--realign-query-db, set by the search workflow): the exact query rnaalign aligned
@@ -89,6 +90,31 @@ void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryK
     const auto entryWasSplit = [&](unsigned int dbKey) {
         return (size_t)dbKey < splitEntriesSize && splitEntries[dbKey] != 0;
     };
+    // updateOffset leaves the hit's chunk range (original coordinates) in the ORF position fields.
+    // A chunk edge is a boundary unless it is an end of the original sequence. The alignment can
+    // only have been cut there if the unaligned rest of the query on that side could reach it;
+    // a boundary farther away was inside the chunk's reach. Without a chunk range, assume a cut.
+    const auto mayReachChunkBoundary = [&](const Matcher::result_t &r) {
+        if (r.dbOrfStartPos < 0 || r.dbOrfEndPos < 0) {
+            return true;
+        }
+        const int chunkLo = std::min(r.dbOrfStartPos, r.dbOrfEndPos);
+        const int chunkHi = std::max(r.dbOrfStartPos, r.dbOrfEndPos);
+        const int lo = std::min(r.dbStartPos, r.dbEndPos);
+        const int hi = std::max(r.dbStartPos, r.dbEndPos);
+        const int qLo = std::min(r.qStartPos, r.qEndPos);
+        const int qHi = std::max(r.qStartPos, r.qEndPos);
+        const int qBefore = qLo;
+        const int qAfter = static_cast<int>(r.qLen) - 1 - qHi;
+        // a reverse hit runs along the target in the opposite direction of the query
+        const bool reverse = r.qStartPos > r.qEndPos;
+        const int roomLo = (reverse ? qAfter : qBefore) + JOIN_TOLERANCE;
+        const int roomHi = (reverse ? qBefore : qAfter) + JOIN_TOLERANCE;
+        const size_t tId = tSource->getId(r.dbKey);
+        const int tLen = (tId == UINT_MAX) ? INT_MAX : static_cast<int>(tSource->getSeqLen(tId));
+        return (chunkLo > 0 && lo - chunkLo <= roomLo)
+               || (chunkHi < tLen - 1 && chunkHi - hi <= roomHi);
+    };
 
     std::stable_sort(results.begin(), results.end(),
                      [](const Matcher::result_t &a, const Matcher::result_t &b) {
@@ -124,7 +150,7 @@ void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryK
         const unsigned int qLen = results[i].qLen;
         const float qcov = qLen ? static_cast<float>(qHi - qLo + 1) / static_cast<float>(qLen) : 1.0f;
         const bool looksFragmented = entryWasSplit(results[i].dbKey)
-                                     && (((j - i) > 1) || (qcov < FULL_COVERAGE));
+                                     && (((j - i) > 1) || (qcov < FULL_COVERAGE && mayReachChunkBoundary(results[i])));
 
         bool replaced = false;
         if (looksFragmented) {
@@ -195,6 +221,30 @@ void mergeFragments(std::vector<Matcher::result_t> &results, unsigned int queryK
     // significance. Restore it here rather than relying on offsetalignment's mergeQuery
     // path to re-sort, which does not run when --merge-query 0.
     std::stable_sort(out.begin(), out.end(), Matcher::compareHits);
+    // Pieces of one alignment that were too far apart to group are each re-aligned across the
+    // boundary and come back as the same alignment: keep it once
+    const auto sameAlignment = [](const Matcher::result_t &a, const Matcher::result_t &b) {
+        return a.dbKey == b.dbKey && a.qStartPos == b.qStartPos && a.qEndPos == b.qEndPos
+               && a.dbStartPos == b.dbStartPos && a.dbEndPos == b.dbEndPos && a.score == b.score;
+    };
+    size_t kept = 0;
+    for (size_t k = 0; k < out.size(); k++) {
+        bool duplicate = false;
+        // equal alignments have equal E-values, so they are neighbours after the sort
+        for (size_t p = kept; p > 0 && out[p - 1].eval == out[k].eval; p--) {
+            if (sameAlignment(out[p - 1], out[k])) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate == false) {
+            if (kept != k) {
+                out[kept] = std::move(out[k]);
+            }
+            kept++;
+        }
+    }
+    out.resize(kept);
     results.swap(out);
 }
 
