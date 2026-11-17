@@ -204,8 +204,10 @@ int riboseekSearch(int argc, const char **argv, const Command &command) {
     }
 
     // rnaalign scales its E-values by the number of query strands searched
+    // and, if --db-size is given, by that database size
     std::vector<MMseqsParameter*> alignWithStrand = par.align;
     alignWithStrand.push_back(&par.PARAM_STRAND);
+    alignWithStrand.push_back(&par.PARAM_DB_SIZE);
 
     for (int i = 0; i < par.numIterations; i++) {
         // Match old MMseqs2 nucl-nucl iterative search: realign disabled across

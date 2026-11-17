@@ -147,5 +147,8 @@ LocalParameters::LocalParameters() : Parameters(),
     offsetalignment.push_back(&PARAM_REALIGN_QUERY_DB);
     // the fragment re-aligner computes E-values for the strands searched
     offsetalignment.push_back(&PARAM_STRAND);
+    // the fragment re-aligner's E-values use the same database size as rnaalign
+    offsetalignment.push_back(&PARAM_DB_SIZE);
     searchworkflow.push_back(&PARAM_TARGET_SPLIT_DB);
+    searchworkflow.push_back(&PARAM_DB_SIZE);
 }

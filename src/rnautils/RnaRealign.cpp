@@ -64,7 +64,9 @@ void ensureContext(DBReader<unsigned int> *targetDb, int queryDbType, int thread
     ctx->subMat = new SubstitutionMatrix(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, par.scoreBias);
     ctx->gapOpen = par.gapOpen.values.aminoacid();
     ctx->gapExtend = par.gapExtend.values.aminoacid();
-    const size_t targetTotalResidues = targetDb->getAminoAcidDBSize();
+    // --db-size overrides the target size as in rnaalign; the parser checked it against ^[0-9]{1,19}$
+    const size_t givenDbSize = strtoull(par.dbSize.c_str(), NULL, 10);
+    const size_t targetTotalResidues = givenDbSize == 0 ? targetDb->getAminoAcidDBSize() : givenDbSize;
     ctx->evaluer = new RnaEvalueComputation(targetTotalResidues ? targetTotalResidues : 1,
                                          ctx->subMat, ctx->gapOpen, ctx->gapExtend, par.strand == 2, false);
     // The query is the one rnaalign aligned in this iteration: a genuine profile (strand-split
