@@ -1,6 +1,7 @@
 #include <iomanip>
 #include <itoa.h>
 #include "RnaMatcher.h"
+#include "DinucleotideMapping.h"
 #include "Util.h"
 #include "Parameters.h"
 #include "RnaSmithWaterman.h"
@@ -8,7 +9,7 @@
 #include <cfloat>
 
 
-RnaMatcher::RnaMatcher(int, int maxSeqLen, BaseMatrix *m, EvalueComputation * evaluer,
+RnaMatcher::RnaMatcher(int, int maxSeqLen, BaseMatrix *m, RnaEvalueComputation * evaluer,
                  bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend, float correlationScoreWeight, int)
                  : gapOpen(gapOpen), gapExtend(gapExtend), correlationScoreWeight(correlationScoreWeight), m(m), evaluer(evaluer), tinySubMat(NULL) {
     // RNA always uses dinucleotide SSW alignment (not raw nucleotide banded aligner)
@@ -77,15 +78,62 @@ RnaMatcher::result_t RnaMatcher::getSWResult(Sequence* dbSeq, const int, bool is
     float dbcov = 0.0;
     float seqId = 0.0;
 
-    const unsigned int qStartPos = alignment.qStartPos1;
-    const unsigned int dbStartPos = alignment.dbStartPos1;
-    const unsigned int qEndPos = alignment.qEndPos1;
-    const unsigned int dbEndPos = alignment.dbEndPos1;
+    int qStartPos = alignment.qStartPos1;
+    int dbStartPos = alignment.dbStartPos1;
+    int qEndPos = alignment.qEndPos1;
+    int dbEndPos = alignment.dbEndPos1;
+    unsigned int identicalNt = alignment.identicalAACnt;
+
+    // Since the match scores of the sentinals are usually negative,
+    // There are cases where the alignment is one position shorter.
+    // So dealing with this problem post hoc
+    if (isIdentity == false && qStartPos >= 0 && dbStartPos >= 0) {
+        const unsigned char *dinucToSecondNuc = getDinucToSecondNucTable();
+        const unsigned char *revcomp = m->num2revcompnum;
+        const unsigned char *qNum = currentQuery->numSequence;
+        const unsigned char *tNum = dbSeq->numSequence;
+        // di-mer codes 0..15 are the canonical pairs; 16+ are half-known or unknown
+        // sentinels whose missing half must never be treated as an aligned base.
+        const unsigned char CANONICAL = 16;
+
+        const int qBoundary  = reverse ? qStartPos  : qEndPos;
+        const int dbBoundary = reverse ? dbStartPos : dbEndPos;
+        const bool inRange = reverse ? (qStartPos > 0 && dbStartPos > 0)
+                                     : (qEndPos + 1 < currentQuery->L && dbEndPos + 1 < dbSeq->L);
+
+        if (inRange && qNum[qBoundary] < CANONICAL && tNum[dbBoundary] < CANONICAL) {
+            const unsigned char qBase = dinucToSecondNuc[qNum[qBoundary]];
+            // reverse-strand hits are scored against the complemented target di-mer,
+            // matching what computerBacktrace does for the columns it counts
+            const unsigned char tBase = reverse ? dinucToSecondNuc[revcomp[tNum[dbBoundary]]]
+                                                : dinucToSecondNuc[tNum[dbBoundary]];
+            if (qBase == tBase) {
+                if (reverse) {
+                    qStartPos--;
+                    dbStartPos--;
+                    backtrace.insert(backtrace.begin(), 'M');
+                } else {
+                    qEndPos++;
+                    dbEndPos++;
+                    backtrace.push_back('M');
+                }
+                identicalNt++;
+            }
+        }
+    }
+
     // normalize score
 //    alignment->score1 = alignment->score1 - log2(dbSeq->L);
     if(alignmentMode == RnaMatcher::SCORE_COV || alignmentMode == RnaMatcher::SCORE_COV_SEQID) {
-        qcov  = alignment.qCov;
-        dbcov = alignment.tCov;
+        if (qStartPos >= 0 && dbStartPos >= 0) {
+            // recompute from the nucleotide-space span; the aligner's qCov/tCov
+            // divide an edge count by a base count and are short by 1/L
+            qcov  = RnaSmithWaterman::computeCov(qStartPos, qEndPos, origQueryLen);
+            dbcov = RnaSmithWaterman::computeCov(dbStartPos, dbEndPos, dbSeq->L);
+        } else {
+            qcov  = alignment.qCov;
+            dbcov = alignment.tCov;
+        }
     }
 
     unsigned int alnLength = RnaMatcher::computeAlnLength(qStartPos, qEndPos, dbStartPos, dbEndPos);
@@ -96,17 +144,17 @@ RnaMatcher::result_t RnaMatcher::getSWResult(Sequence* dbSeq, const int, bool is
             // OVERWRITE alnLength with gapped value
             alnLength = backtrace.size();
         }
-        seqId = Util::computeSeqId(seqIdMode, alignment.identicalAACnt, origQueryLen, dbSeq->L, alnLength);
+        seqId = Util::computeSeqId(seqIdMode, identicalNt, origQueryLen, dbSeq->L, alnLength);
     }else if( alignmentMode == RnaMatcher::SCORE_COV){
         // "20%   30%   40%   50%   60%   70%   80%   90%   99%"
         // "0.52  1.12  1.73  2.33  2.93  3.53  4.14  4.74  5.28"
-        unsigned int qAlnLen = std::max(qEndPos - qStartPos, static_cast<unsigned int>(1));
-        unsigned int dbAlnLen = std::max(dbEndPos - dbStartPos, static_cast<unsigned int>(1));
+        unsigned int qAlnLen = std::max(qEndPos - qStartPos, 1);
+        unsigned int dbAlnLen = std::max(dbEndPos - dbStartPos, 1);
         //seqId = (alignment.score1 / static_cast<float>(std::max(qAlnLength, dbAlnLength)))  * 0.1656 + 0.1141;
         seqId = estimateSeqIdByScorePerCol(alignment.score1, qAlnLen, dbAlnLen);
     }else if ( alignmentMode == RnaMatcher::SCORE_ONLY){
-        unsigned int qAlnLen = std::max(qEndPos, static_cast<unsigned int>(1));
-        unsigned int dbAlnLen = std::max(dbEndPos, static_cast<unsigned int>(1));
+        unsigned int qAlnLen = std::max(qEndPos, 1);
+        unsigned int dbAlnLen = std::max(dbEndPos, 1);
         //seqId = (alignment.score1 / static_cast<float>(std::max(dbAlnLen, qAlnLen)))  * 0.1656 + 0.1141;
         seqId = estimateSeqIdByScorePerCol(alignment.score1, qAlnLen, dbAlnLen);
     }
@@ -310,76 +358,6 @@ size_t RnaMatcher::resultToBuffer(char * buff1, const result_t &result, bool add
     *(tmpBuff-1) = '\n';
     *(tmpBuff) = '\0';
     return tmpBuff - basePos;
-}
-
-void RnaMatcher::updateResultByRescoringBacktrace(const char *querySeq, const char *targetSeq, const char **subMat, EvalueComputation &evaluer,
-                                                int gapOpen, int gapExtend, result_t &result) {
-    int maxScore = 0;
-    int maxBtEndPos = 0;
-    int maxBtStartPos = 0;
-    int maxQueryEndPos = 0;
-    int maxQueryStartPos = 0;
-    int maxTargetStartPos = 0;
-    int maxTargetEndPos = 0;
-    int minPos = -1;
-    int minQueryPos = result.qStartPos-1;
-    int minTargetPos = result.dbStartPos-1;
-    int score = 0;
-    int identicalAAs = 0;
-    int maxIdAaCnt = 0;
-    int queryPos = result.qStartPos;
-    int targetPos = result.dbStartPos;
-    bool isGapOpen = false;
-
-    for(unsigned int pos = 0; pos < result.backtrace.size(); pos++){
-        char letter = result.backtrace[pos];
-        int curr;
-        if (letter == 'M') {
-            curr = subMat[static_cast<int>(querySeq[queryPos])][static_cast<int>(targetSeq[targetPos])];
-            identicalAAs += (querySeq[queryPos] == targetSeq[targetPos]);
-            isGapOpen = false;
-        } else {
-            curr = (isGapOpen) ? -gapExtend : -gapOpen;
-            isGapOpen = (isGapOpen == false) ? true : isGapOpen;
-        }
-        score = curr + score;
-        // minimum
-        const bool isMinScore = (score <= 0);
-        score = (isMinScore) ? 0 : score;
-        identicalAAs = (isMinScore) ? 0 : identicalAAs;
-        if(isMinScore){
-            minPos = pos;
-            minQueryPos = (letter == 'D') ? queryPos - 1 : queryPos;
-            minTargetPos = (letter == 'I') ? targetPos - 1 : targetPos;
-        }
-        // new max
-        const bool isNewMaxScore = (score > maxScore);
-        if(isNewMaxScore){
-            maxBtEndPos = pos;
-            maxQueryEndPos = queryPos;
-            maxTargetEndPos = targetPos;
-            maxBtStartPos = minPos + 1;
-            maxQueryStartPos = minQueryPos + 1;
-            maxTargetStartPos = minTargetPos + 1;
-            maxScore = score;
-            maxIdAaCnt = identicalAAs;
-        }
-        queryPos += (letter == 'M' || letter == 'I') ? 1 : 0;
-        targetPos += (letter == 'M' || letter == 'D') ? 1 : 0;
-    }
-
-    result.qStartPos = maxQueryStartPos;
-    result.qEndPos = maxQueryEndPos;
-    result.dbStartPos = maxTargetStartPos;
-    result.dbEndPos = maxTargetEndPos;
-    double bitScore = evaluer.computeBitScore(maxScore);
-    double evalue = rnaEvalueCorrection(evaluer.computeEvalue(maxScore, result.qLen));
-    result.score = bitScore;
-    result.eval = evalue;
-    result.alnLength = (maxBtEndPos - maxBtStartPos) + 1;
-    result.seqId = static_cast<float>(maxIdAaCnt) / static_cast<float>(result.alnLength);
-    result.backtrace = result.backtrace.substr(maxBtStartPos, result.alnLength);
-
 }
 
 

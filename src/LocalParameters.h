@@ -28,12 +28,14 @@ public:
     int cmAlign;
     int cmAlignBanded;
     int cmLocal;
-    size_t dbSize;
+    std::string dbSize;  // string: the parser reads size_t options with atoi, which wraps above 2^32
     double cmliteMsaEvalThr;
     double cmbuildEre;
     double cmbuildSymfrac;
     int cmbuildNoss;
     float cmbuildMinRowCov;
+    std::string targetSplitDb;
+    std::string realignQueryDb;
 
     PARAMETER(PARAM_CM_REGION)
     PARAMETER(PARAM_CM_SCAN_CUTOFF)
@@ -47,8 +49,11 @@ public:
     PARAMETER(PARAM_CMBUILD_SYMFRAC)
     PARAMETER(PARAM_CMBUILD_NOSS)
     PARAMETER(PARAM_CMBUILD_MIN_ROW_COV)
+    PARAMETER(PARAM_TARGET_SPLIT_DB)
+    PARAMETER(PARAM_REALIGN_QUERY_DB)
 
     std::vector<MMseqsParameter*> splitstrand;
+    std::vector<MMseqsParameter*> rnagcstat;
     std::vector<MMseqsParameter*> rnaalign;
     std::vector<MMseqsParameter*> cmbuild;
     std::vector<MMseqsParameter*> cmscan;

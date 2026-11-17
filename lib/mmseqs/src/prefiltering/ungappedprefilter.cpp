@@ -30,12 +30,27 @@
 #include "Alignment.h"
 #include <signal.h>
 #include <algorithm>
+#ifndef HAVE_METAL
 #include <cuda_runtime.h>
+#endif
 #endif
 
 #ifdef HAVE_CUDA
 
 volatile sig_atomic_t keepRunningClient = 1;
+
+// reads [begin, end) into the page cache by touching every page (MADV_WILLNEED alone only reads
+// one readahead window); blocks about as long as the read
+static void prefetchRange(const char *begin, const char *end) {
+    const uintptr_t pageSize = sysconf(_SC_PAGESIZE);
+    const volatile char *p = (const volatile char *)((uintptr_t)begin & ~(pageSize - 1));
+    char sink = 0;
+    for (; p < (const volatile char *)end && keepRunningClient; p += pageSize) {
+        sink ^= *p;
+    }
+    (void)sink;
+}
+
 void intHandlerClient(int) {
     keepRunningClient = 0;
 }
@@ -48,8 +63,14 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
     const int querySeqType = qdbr->getDbtype();
     Sequence qSeq(par.maxSeqLen, querySeqType, subMat, 0, false, par.compBiasCorrection);
 
-    std::vector<Marv::Result> results;
-    results.reserve(par.maxResListLen);
+#ifdef HAVE_METAL
+    if (par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) {
+        Debug(Debug::ERROR) << "Ungapped and gapped prefilter mode is not supported with Metal\n";
+        EXIT(EXIT_FAILURE);
+    }
+#endif
+    const bool gapped = par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED;
+    std::vector<Marv::Result> results(par.maxResListLen, Marv::Result(0, 0, -1, -1));
     std::vector<hit_t> shortResults;
     std::vector<Matcher::result_t> resultsAln;
 
@@ -147,11 +168,7 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
            Debug(Debug::ERROR) << "Invalid GPU database\n";
            EXIT(EXIT_FAILURE);
        }
-        int32_t maxTargetLength = lengths.back();
-        Marv::AlignmentType type = (par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) ?
-                Marv::AlignmentType::GAPLESS_SMITH_WATERMAN : Marv::AlignmentType::GAPLESS;
-        // marv = new Marv(tdbr->getSize(), subMat->alphabetSize, maxTargetLength,
-        //                 par.maxResListLen, type);
+        // marv = new Marv(tdbr->getSize(), subMat->alphabetSize);
         // void* h = marv->loadDb(
         //     tdbr->getDataForFile(0), offsetData, lengthData, tdbr->getDataSizeForFile(0)
         // );
@@ -160,6 +177,7 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
         std::vector<int> deviceIds = Marv::getDeviceIds();
         size_t totalGpuMem = 0;
         size_t totalFreeMem = 0;
+#ifndef HAVE_METAL
         for (int deviceId : deviceIds) {
             cudaSetDevice(deviceId);
             size_t freeMem = 0, totalMem = 0;
@@ -168,6 +186,10 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             totalFreeMem += freeMem;
         }
         cudaSetDevice(deviceIds[0]); // Reset to first device
+#else
+        // Apple GPUs share system memory, and libmarv streams a database that does not fit in batches
+        totalFreeMem = SIZE_MAX / 2;
+#endif
         
         // Estimate database size (sequence data + overhead for GPU structures)
         size_t dbDataSize = tdbr->getDataSizeForFile(0);
@@ -202,8 +224,7 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
         // Load database
         if (numChunks == 1) {
             // Single chunk - create Marv and load entire database
-            marv = new Marv(tdbr->getSize(), subMat->alphabetSize, maxTargetLength,
-                            par.maxResListLen, type);
+            marv = new Marv(tdbr->getSize(), subMat->alphabetSize);
             void* h = marv->loadDb(
                 tdbr->getDataForFile(0), offsetData, lengthData, tdbr->getDataSizeForFile(0)
             );
@@ -236,6 +257,22 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
         }
     }
 
+    // On devices that read host memory in place, the GPU searches the chunk straight from the page
+    // cache, and a chunk takes most of the memory, so reading the next one would evict the current one
+    bool prefetchChunks = (numChunks > 1);
+#ifndef HAVE_METAL
+    if (numChunks > 1) {
+        for (int deviceId : Marv::getDeviceIds()) {
+            int usesHostPageTables = 0;
+            cudaDeviceGetAttribute(&usesHostPageTables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, deviceId);
+            if (usesHostPageTables == 1) {
+                prefetchChunks = false;
+            }
+        }
+    }
+#endif
+    std::thread prefetcher;
+
     // Outer loop: iterate through database chunks
     for (size_t chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
         if (!keepRunningClient) {
@@ -264,15 +301,11 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             }
             chunkOffsets[chunkSize] = offsets[chunkEnd] - baseOffset;
             
-            // Calculate chunk data size and find max length for this chunk
+            // Calculate chunk data size
             size_t chunkDataSize = chunkOffsets[chunkSize];
-            int32_t chunkMaxLength = *std::max_element(chunkLengths.begin(), chunkLengths.end());
             
             // Create Marv instance for this chunk
-            Marv::AlignmentType type = (par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) ?
-                    Marv::AlignmentType::GAPLESS_SMITH_WATERMAN : Marv::AlignmentType::GAPLESS;
-            currentMarv = new Marv(chunkSize, subMat->alphabetSize, chunkMaxLength,
-                                   par.maxResListLen, type);
+            currentMarv = new Marv(chunkSize, subMat->alphabetSize);
             
             // Load chunk database
             void* chunkHandle = currentMarv->loadDb(
@@ -282,6 +315,19 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
                 chunkDataSize
             );
             currentMarv->setDb(chunkHandle);
+            // setDb only plans the batches; upload the chunk to all GPUs now, so that the page cache
+            // no longer needs it while the next one is read
+            currentMarv->prefetch();
+
+            // the chunk is on the GPU now; read the next one from disk while its queries run
+            if (prefetcher.joinable()) {
+                prefetcher.join();
+            }
+            if (prefetchChunks && chunkIdx + 1 < numChunks) {
+                const std::pair<size_t, size_t> &next = dbChunks[chunkIdx + 1];
+                const char *data = tdbr->getDataForFile(0);
+                prefetcher = std::thread(prefetchRange, data + offsets[next.first], data + offsets[next.second]);
+            }
         }
 
         // Inner loop: iterate through all queries for this chunk
@@ -321,7 +367,8 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             Marv::Stats stats;
             stats.results = 0;
             if (serverMode == 0) {
-                stats = currentMarv->scan(reinterpret_cast<const char *>(qSeq.numSequence), qSeq.L, profile, results.data());
+                stats = marvSearch(*currentMarv, gapped, reinterpret_cast<const char *>(qSeq.numSequence), qSeq.L, profile,
+                                   par.maxResListLen, results.data());
                 if (numChunks > 1) {
                     for (size_t i = 0; i < stats.results; i++) {
                         Marv::Result res = results[i];
@@ -456,6 +503,9 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             delete currentMarv;
         }
     } // end chunk loop
+    if (prefetcher.joinable()) {
+        prefetcher.join();
+    }
     
     // For multi-chunk mode: merge results from all chunks and write output
     if (numChunks > 1 && serverMode == 0) {
@@ -467,11 +517,11 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
             size_t queryKey = qdbr->getDbKey(id);
             unsigned int querySeqLen = qdbr->getSeqLen(id);
             
-            // Sort accumulated results by score (descending)
+            // Sort accumulated results by score (descending), ties by target, as in a single chunk
             std::vector<Marv::Result>& queryResults = allQueryResults[id];
             std::sort(queryResults.begin(), queryResults.end(), 
                 [](const Marv::Result& a, const Marv::Result& b) {
-                    return a.score > b.score;
+                    return a.score > b.score || (a.score == b.score && a.id < b.id);
                 });
             
             // Keep top N results
@@ -562,7 +612,11 @@ void runFilterOnCpu(Parameters & par, BaseMatrix * subMat, int8_t * tinySubMat,
     std::vector<hit_t> shortResults;
     shortResults.reserve(tdbr->getSize()/2);
     Debug::Progress progress(qdbr->getSize());
+#ifdef RIBOSEEK
+    const int targetSeqType = DBReader<unsigned int>::encodedGpuDbtype(tdbr->getDbtype());
+#else
     const int targetSeqType = tdbr->getDbtype();
+#endif
     const int querySeqType = qdbr->getDbtype();
 #ifdef OPENMP
     omp_set_nested(1);
@@ -595,7 +649,7 @@ void runFilterOnCpu(Parameters & par, BaseMatrix * subMat, int8_t * tinySubMat,
             }else{
                 aligner.ssw_init(&qSeq, tinySubMat, subMat);
             }
-#pragma omp for schedule(static) nowait
+#pragma omp for schedule(dynamic, 1024) nowait
             for (size_t tId = 0; tId < tdbr->getSize(); tId++) {
                 unsigned int targetKey = tdbr->getDbKey(tId);
                 if(taxonomyHook != NULL){
@@ -667,6 +721,13 @@ void runFilterOnCpu(Parameters & par, BaseMatrix * subMat, int8_t * tinySubMat,
                     hit.diagonal = 0;
                     threadShortResults.emplace_back(hit);
                 }
+            }
+            // only the top --max-seqs survive the merge; keep one more so the tie check below still sees it
+            const size_t keepPerThread = par.maxResListLen + 1;
+            if (threadShortResults.size() > keepPerThread) {
+                std::nth_element(threadShortResults.begin(), threadShortResults.begin() + keepPerThread,
+                                 threadShortResults.end(), hit_t::compareHitsByScoreAndId);
+                threadShortResults.resize(keepPerThread);
             }
 #pragma omp critical
             {

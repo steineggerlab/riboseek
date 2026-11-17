@@ -15,12 +15,7 @@
 #include "Sequence.h"
 #include "BaseMatrix.h"
 #include "RnaSmithWaterman.h"
-#include "EvalueComputation.h"
-
-// RNA-calibrated E-value correction applied on top of standard ALP E-value
-inline double rnaEvalueCorrection(double evalue) {
-    return 0.0382461572658595 * pow(evalue * 2, 0.8283631544068919);
-}
+#include "RnaEvalueComputation.h"
 
 class RnaMatcher{
 
@@ -94,30 +89,6 @@ public:
 
         result_t(){};
 
-        static void swapResult(result_t & res, EvalueComputation &evaluer, bool hasBacktrace){
-            double rawScore = evaluer.computeRawScoreFromBitScore(res.score);
-            res.eval = rnaEvalueCorrection(evaluer.computeEvalue(rawScore, res.dbLen));
-
-            unsigned int qstart = res.qStartPos;
-            unsigned int qend = res.qEndPos;
-            unsigned int qLen = res.qLen;
-            res.qStartPos = res.dbStartPos;
-            res.qEndPos = res.dbEndPos;
-            res.qLen = res.dbLen;
-            res.dbStartPos = qstart;
-            res.dbEndPos = qend;
-            res.dbLen = qLen;
-            if (hasBacktrace) {
-                for (size_t j = 0; j < res.backtrace.size(); j++) {
-                    if (res.backtrace.at(j) == 'I') {
-                        res.backtrace.at(j) = 'D';
-                    } else if (res.backtrace.at(j) == 'D') {
-                        res.backtrace.at(j) = 'I';
-                    }
-                }
-            }
-        }
-
         static void protein2nucl(std::string & backtrace, std::string &newBacktrace) {
             char buffer[256];
             for (size_t pos = 0; pos < backtrace.size(); pos++) {
@@ -147,7 +118,7 @@ public:
     };
 
     RnaMatcher(int querySeqType, int maxSeqLen, BaseMatrix *m,
-            EvalueComputation * evaluer, bool aaBiasCorrection, float aaBiasCorrectionScale,
+            RnaEvalueComputation * evaluer, bool aaBiasCorrection, float aaBiasCorrectionScale,
             int gapOpen, int gapExtend, float correlationScoreWeight,
             int zdrop);
 
@@ -224,9 +195,6 @@ public:
 
     static int computeAlnLength(int anEnd, int start, int dbEnd, int dbStart);
 
-    static void updateResultByRescoringBacktrace(const char *querySeq, const char *targetSeq, const char **subMat, EvalueComputation &evaluer,
-                                                    int gapOpen, int gapExtend, result_t &result);
-
 private:
 
     // costs to open a gap
@@ -245,7 +213,7 @@ private:
     // substitution matrix
     BaseMatrix* m;
     // evalue
-    EvalueComputation * evaluer;
+    RnaEvalueComputation * evaluer;
     // byte version of substitution matrix
     int8_t * tinySubMat;
     // set substituion matrix

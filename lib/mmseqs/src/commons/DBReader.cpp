@@ -474,6 +474,8 @@ template <typename T> char* DBReader<T>::mmapData(FILE * file, size_t *dataSize)
                 Debug(Debug::ERROR) << "Failed to mmap memory dataSize=" << *dataSize <<" File=" << dataFileName << ". Error " << errsv << ".\n";
                 EXIT(EXIT_FAILURE);
             }
+            // if this mapping reads the file first, the page cache keeps it in huge pages
+            Util::adviseHugePages(ret, *dataSize);
         } else {
             ret = static_cast<char*>(malloc(*dataSize));
             Util::checkAllocation(ret, "Not enough system memory to read in the whole data file.");
@@ -555,10 +557,8 @@ template <typename T> size_t DBReader<T>::bsearch(const Index * index, size_t N,
 }
 
 
-template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
-    char *data = getDataUncompressed(id);
-    size_t seqLen = getSeqLen(id);
-
+// decodes n residues of a padded (GPU) database back to letters
+static void unpadResidues(const char *src, size_t n, char *dst) {
     static const char CODE_TO_CHAR[32] = {
             'A', /*  0 */ 'C', /*  1 */ 'D', /*  2 */
             'E', /*  3 */ 'F', /*  4 */ 'G', /*  5 */
@@ -576,15 +576,31 @@ template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
 #endif
     };
 
-    for(size_t i = 0; i < seqLen; i++){
-        unsigned char code = static_cast<unsigned char>(data[i]);
+    for(size_t i = 0; i < n; i++){
+        unsigned char code = static_cast<unsigned char>(src[i]);
         unsigned char baseCode = (code >= 32) ? code - 32 : code;
         // restore masked characters as lowercase with bit twiddling
-        compressedBuffers[thrIdx][i] = (code >= 32) ? (CODE_TO_CHAR[baseCode] | ' ') : CODE_TO_CHAR[baseCode];
+        dst[i] = (code >= 32) ? (CODE_TO_CHAR[baseCode] | ' ') : CODE_TO_CHAR[baseCode];
     }
-    compressedBuffers[thrIdx][seqLen + 0] = '\n';
-    compressedBuffers[thrIdx][seqLen + 1] = '\0';
+    dst[n + 0] = '\n';
+    dst[n + 1] = '\0';
+}
+
+template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
+    unpadResidues(getDataUncompressed(id), getSeqLen(id), compressedBuffers[thrIdx]);
     return compressedBuffers[thrIdx];
+}
+
+template <typename T> char* DBReader<T>::getDataRange(size_t id, int thrIdx, size_t start, size_t len) {
+    if (compression == COMPRESSED) {
+        // a compressed entry can only be decompressed whole
+        return getDataCompressed(id, thrIdx) + start;
+    } else if (padded) {
+        unpadResidues(getDataUncompressed(id) + start, len, compressedBuffers[thrIdx]);
+        return compressedBuffers[thrIdx];
+    } else {
+        return getDataUncompressed(id) + start;
+    }
 }
 
 template <typename T> char* DBReader<T>::getDataCompressed(size_t id, int thrIdx) {
@@ -1357,7 +1373,9 @@ void DBReader<T>::decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize,
             sumCharsAssignedToCurrRank = 0;
             currentRank++;
         }
-        sumCharsAssignedToCurrRank += index[i].length;
+        // Add the sequence length at position i (after any sorting)
+        // This is identical to index[i].length when the reader is unsorted
+        sumCharsAssignedToCurrRank += getEntryLen(i);
         entriesPerWorker[currentRank] += 1;
     }
 

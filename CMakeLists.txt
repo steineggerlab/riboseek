@@ -13,6 +13,9 @@ endif()
 
 set(FRAMEWORK_ONLY 1 CACHE INTERNAL "" FORCE)
 include(MMseqsSetupDerivedTarget)
+# libmarv's GPU kernels hold the query PSSM in shared memory with a row count fixed at build time:
+# riboseek's 25-letter dinucleotide alphabet instead of the 21-row protein default
+set(MARV_PSSM_ROWS 25)
 add_subdirectory(lib/mmseqs EXCLUDE_FROM_ALL)
 target_compile_definitions(mmseqs-framework PUBLIC RIBOSEEK=1)
 

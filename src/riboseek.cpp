@@ -3,6 +3,7 @@
 #include "Command.h"
 #include "LocalParameters.h"
 #include "DinucleotideMapping.h"
+#include "rnautils/FragmentMerge.h"
 
 const char* binary_name = "riboseek";
 const char* tool_name = "riboseek";
@@ -32,9 +33,7 @@ void init() {
     registerCommands(&baseCommands);
     registerCommands(&riboseekCommands);
     registerDinucleotideMapping();
-    #ifdef HAVE_CUDA
-    registerDinucleotideFilterConfig();
-    #endif
+    registerFragmentMerger();
 }
 void (*initCommands)(void) = init;
 void initParameterSingleton() { new LocalParameters; }

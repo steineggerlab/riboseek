@@ -997,6 +997,18 @@ Parameters::Parameters():
     mergeresultsbyset.push_back(&PARAM_V);
 
     // offsetalignment
+    // Forwarded so a registered fragment merger can re-align with exactly the same
+    // scoring the alignment module used (see Matcher::registerFragmentMerger).
+    offsetalignment.push_back(&PARAM_SUB_MAT);
+    offsetalignment.push_back(&PARAM_GAP_OPEN);
+    offsetalignment.push_back(&PARAM_GAP_EXTEND);
+    offsetalignment.push_back(&PARAM_NO_COMP_BIAS_CORR);
+    offsetalignment.push_back(&PARAM_NO_COMP_BIAS_CORR_SCALE);
+    offsetalignment.push_back(&PARAM_SCORE_BIAS);
+    offsetalignment.push_back(&PARAM_E);
+    offsetalignment.push_back(&PARAM_C);
+    offsetalignment.push_back(&PARAM_COV_MODE);
+    offsetalignment.push_back(&PARAM_SEQ_ID_MODE);
     offsetalignment.push_back(&PARAM_CHAIN_ALIGNMENT);
     offsetalignment.push_back(&PARAM_MERGE_QUERY);
     offsetalignment.push_back(&PARAM_SEARCH_TYPE);
@@ -2020,6 +2032,18 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
                         std::string val(pargv[argIdx+1]);
                         if (Util::startWith("b64:", val)) {
                             val = base64_decode(val.c_str() + 4, val.size() - 4);
+                        }
+                        // check the regex like the other types; an empty value still clears the option
+                        if (val.empty() == false && par[parIdx]->regex != NULL && par[parIdx]->regex[0] != '\0') {
+                            regex_t regex;
+                            compileRegex(&regex, par[parIdx]->regex);
+                            int nomatch = regexec(&regex, val.c_str(), 0, NULL, 0);
+                            regfree(&regex);
+                            if (nomatch) {
+                                printUsageMessage(command, 0xFFFFFFFF);
+                                Debug(Debug::ERROR) << "Error in argument " << par[parIdx]->name << "\n";
+                                EXIT(EXIT_FAILURE);
+                            }
                         }
                         std::string* currVal = (std::string*)par[parIdx]->value;
                         currVal->assign(val);

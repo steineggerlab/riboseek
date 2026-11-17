@@ -214,6 +214,8 @@ public:
 
     char* getUnpadded(size_t id, int thrIdx);
 
+    char* getDataRange(size_t id, int thrIdx, size_t start, size_t len);
+
     char* getDataUncompressed(size_t id);
 
     void touchData(size_t id);
@@ -428,6 +430,17 @@ public:
     static inline int setExtendedDbtype(int dbtype, uint16_t extended) {
         return dbtype | ((extended & 0x7FFE) << 16);
     }
+
+#ifdef RIBOSEEK
+    static inline int encodedGpuDbtype(int dbtype) {
+        uint16_t ext = getExtendedDbtype(dbtype);
+        if ((ext & Parameters::DBTYPE_EXTENDED_GPU) == 0) {
+            return dbtype;
+        }
+        ext &= ~Parameters::DBTYPE_EXTENDED_DINUCLEOTIDE;
+        return setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, ext);
+    }
+#endif
 
     const char* getDbTypeName() const {
         return Parameters::getDbTypeName(dbtype);

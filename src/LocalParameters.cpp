@@ -33,8 +33,8 @@ LocalParameters::LocalParameters() : Parameters(),
         "^[0-1]$", MMseqsParameter::COMMAND_ALIGN),
     PARAM_DB_SIZE(PARAM_DB_SIZE_ID, "--db-size", "Database size",
         "Effective database size (0: use actual size)",
-        typeid(size_t), (void *) &dbSize,
-        "^[0-9]+$", MMseqsParameter::COMMAND_ALIGN),
+        typeid(std::string), (void *) &dbSize,
+        "^[0-9]{1,19}$", MMseqsParameter::COMMAND_ALIGN),
     PARAM_CMLITE_MSA_EVAL(PARAM_CMLITE_MSA_EVAL_ID, "--cmlite-msa-eval", "CmLite MSA E-value",
         "Include only hits with <= this E-value when building the cmbuild seed CM.\n"
         "All hits from resultDB are still searched afterward; this only filters the CM-building subset.",
@@ -56,7 +56,21 @@ LocalParameters::LocalParameters() : Parameters(),
     PARAM_CMBUILD_MIN_ROW_COV(PARAM_CMBUILD_MIN_ROW_COV_ID, "--cmbuild-min-row-cov", "cmbuild minimum row coverage",
         "Drop MSA rows with non-gap coverage below this fraction",
         typeid(float), (void *) &cmbuildMinRowCov,
-        "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_PROFILE)
+        "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_PROFILE),
+    PARAM_TARGET_SPLIT_DB(PARAM_TARGET_SPLIT_DB_ID, "--target-split-db", "Pre-split target DB",
+        "Pre-computed splitsequence output of the target DB. When given, search reuses it instead of\n"
+        "splitting the target again, which saves the splitsequence pass and its temporary copy.\n"
+        "Build it with something like: riboseek splitsequence <targetDB> <splitDB> --max-seq-len N --sequence-overlap 0\n"
+        "The original target DB must still be passed as the target argument: coordinates are mapped\n"
+        "back through it and fragmented hits are re-aligned against it.\n",
+        typeid(std::string), (void *) &targetSplitDb,
+        "^.*$", MMseqsParameter::COMMAND_PREFILTER),
+    PARAM_REALIGN_QUERY_DB(PARAM_REALIGN_QUERY_DB_ID, "--realign-query-db", "Query DB for fragment re-alignment",
+        "Strand-split query DB of the current search iteration,\n"
+        "set by the search workflow. offsetalignment re-aligns target-split fragments with exactly the\n"
+        "query the aligner used: the sequence in the first iteration, the profile in later ones.",
+        typeid(std::string), (void *) &realignQueryDb,
+        "^.*$", MMseqsParameter::COMMAND_EXPERT)
 {
     cmRegionFlanking = 1.0f;  // 1.0 => pad by full W (prior hardcoded behavior)
     cmScanCutoff = 0.0f;
@@ -64,12 +78,14 @@ LocalParameters::LocalParameters() : Parameters(),
     cmAlign = 0;
     cmAlignBanded = 1;
     cmLocal = 0;        // config: glocal (current shipped default)
-    dbSize = 0;
+    dbSize = "0";
     cmliteMsaEvalThr = DBL_MAX;
     cmbuildEre = -1.0;      // <0 => Infernal default target rel-entropy
     cmbuildSymfrac = -1.0;  // <0 => keep all columns (current default)
     cmbuildNoss = 0;        // use SS_cons (current default)
     cmbuildMinRowCov = 0.30f;
+    targetSplitDb = "";
+    realignQueryDb = "";
 
     // Register dinuc.out as compiled-in matrix and set as default
     scoringMatrixFile = MultiParam<NuclAA<std::string>>(NuclAA<std::string>("dinuc.out", "dinuc.out"));
@@ -79,6 +95,11 @@ LocalParameters::LocalParameters() : Parameters(),
     // Match reference defaults for dinucleotide search
     alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(25, 5));
     maskMode = 0;
+
+    // Search both query strands unless asked otherwise; the E-value covers the strands searched
+    strand = 2;
+    overrideParameterDescription(PARAM_STRAND,
+        "Query strand(s) to search; E-values cover only the strands searched\n0: reverse complement\n1: forward\n2: both");
 
     cmscan = align;
     cmscan.push_back(&PARAM_CM_REGION);
@@ -90,6 +111,10 @@ LocalParameters::LocalParameters() : Parameters(),
 
     rnaalign = align;
     rnaalign.push_back(&PARAM_DB_SIZE);
+    rnaalign.push_back(&PARAM_STRAND);
+
+    rnagcstat.push_back(&PARAM_THREADS);
+    rnagcstat.push_back(&PARAM_V);
 
     splitstrand.push_back(&PARAM_STRAND);
     splitstrand.push_back(&PARAM_THREADS);
@@ -116,4 +141,11 @@ LocalParameters::LocalParameters() : Parameters(),
     // result2profile needs --strand so the RNA-corrected E-value gets the
     // both-strands doubling (matches MMseqs2 RNA fork behavior)
     result2profile.push_back(&PARAM_STRAND);
+
+    // Top-level search option only: the sub-modules never see it, so it is not
+    // added to any list that feeds createParameterString for prefilter/align.
+    offsetalignment.push_back(&PARAM_REALIGN_QUERY_DB);
+    // the fragment re-aligner computes E-values for the strands searched
+    offsetalignment.push_back(&PARAM_STRAND);
+    searchworkflow.push_back(&PARAM_TARGET_SPLIT_DB);
 }

@@ -64,15 +64,19 @@ int splitstrand(int argc, const char **argv, const Command& command) {
             progress.updateProgress();
 
             unsigned int key = reader.getDbKey(i);
+            // the strand is the key's parity: forward 2*key, reverse 2*key+1, also when only one
+            // strand is written (FragmentMerge looks the strand entry up as 2*queryKey+reverse)
+            const unsigned int forwardKey = 2 * key;
+            const unsigned int reverseKey = 2 * key + 1;
             const char* data = reader.getData(i, thread_idx);
             size_t dataLen = reader.getEntryLen(i);  // includes null terminator
             size_t seqLen = reader.getSeqLen(i);
 
             // Forward strand (will get even key after renumbering)
             if (par.strand == 1 || par.strand == 2) {
-                sequenceWriter.writeData(data, dataLen - 1, key, thread_idx);
+                sequenceWriter.writeData(data, dataLen - 1, forwardKey, thread_idx);
                 bufferLen = Orf::writeOrfHeader(buffer, key, static_cast<size_t>(0), seqLen - 1, 0, 0);
-                headerWriter.writeData(buffer, bufferLen, key, thread_idx);
+                headerWriter.writeData(buffer, bufferLen, forwardKey, thread_idx);
             }
 
             // Reverse complement strand (will get odd key after renumbering)
@@ -107,16 +111,16 @@ int splitstrand(int argc, const char **argv, const Command& command) {
                         std::swap(col[18], col[21]);
                         std::swap(col[19], col[20]);
                     }
-                    sequenceWriter.writeData(revData.c_str(), revData.length(), key, thread_idx);
+                    sequenceWriter.writeData(revData.c_str(), revData.length(), reverseKey, thread_idx);
                 } else {
                     // Sequence: write the same forward-strand data for reverse entry.
                     // The dinucleotide encoding produces forward-strand numSequence,
                     // which dinucBuildProfileFromSequence then reverses to get the
                     // correct reversed position order (matching old extractqueryprofiles).
-                    sequenceWriter.writeData(data, dataLen - 1, key, thread_idx);
+                    sequenceWriter.writeData(data, dataLen - 1, reverseKey, thread_idx);
                 }
                 bufferLen = Orf::writeOrfHeader(buffer, key, seqLen - 1, static_cast<size_t>(0), 0, 0);
-                headerWriter.writeData(buffer, bufferLen, key, thread_idx);
+                headerWriter.writeData(buffer, bufferLen, reverseKey, thread_idx);
             }
         }
     }
@@ -124,22 +128,6 @@ int splitstrand(int argc, const char **argv, const Command& command) {
     sequenceWriter.close(true);
     reader.close();
 
-    // Renumber so forward gets even keys (0, 2, 4, ...) and reverse gets odd keys (1, 3, 5, ...)
-#pragma omp parallel
-    {
-#pragma omp single
-        {
-#pragma omp task
-            {
-                DBWriter::createRenumberedDB(par.hdr2, par.hdr2Index, "", "");
-            }
-
-#pragma omp task
-            {
-                DBWriter::createRenumberedDB(par.db2, par.db2Index, par.createLookup ? par.db1 : "", par.createLookup ? par.db1Index : "");
-            }
-        }
-    }
     DBReader<unsigned int>::softlinkDb(par.db1, par.db2, DBFiles::SOURCE);
 
     return EXIT_SUCCESS;

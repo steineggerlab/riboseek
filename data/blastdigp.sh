@@ -56,15 +56,22 @@ OFFSET_QUERYDB="$1"
 TARGETDB="$2"
 TMP_PATH="$4"
 MERGE_INPUT=""
+ALIGN_TARGETDB=""
 
-# if [ -n "$NEEDTARGETSPLIT" ]; then
-#     if notExists "$TMP_PATH/target_seqs_split.dbtype"; then
-#         # shellcheck disable=SC2086
-#         "$MMSEQS" splitsequence "$TARGETDB" "$TMP_PATH/target_seqs_split" ${SPLITSEQUENCE_PAR}  \
-#             || fail "Split sequence died"
-#     fi
-#     TARGETDB="$TMP_PATH/target_seqs_split"
-# fi
+if [ -n "$TARGET_SPLIT_DB" ]; then
+    # Caller supplied a pre-split target DB, so skip splitsequence entirely.
+    # "$2" stays the original target DB: offsetalignment still needs it to map chunk
+    # coordinates back and to re-align hits fragmented across chunk boundaries.
+    [ ! -f "$TARGET_SPLIT_DB.dbtype" ] && fail "$TARGET_SPLIT_DB.dbtype not found!"
+    TARGETDB="$TARGET_SPLIT_DB"
+elif [ -n "$NEEDTARGETSPLIT" ]; then
+    if notExists "$TMP_PATH/target_seqs_split.dbtype"; then
+        # shellcheck disable=SC2086
+        "$MMSEQS" splitsequence "$TARGETDB" "$TMP_PATH/target_seqs_split" ${SPLITSEQUENCE_PAR}  \
+            || fail "Split sequence died"
+    fi
+    TARGETDB="$TMP_PATH/target_seqs_split"
+fi
 
 # Target DB stores raw nucleotide characters. Set DINUCLEOTIDE flag so
 # Sequence::mapSequence uses dinucleotide pair encoding (via auxRegistry).
@@ -72,17 +79,34 @@ MERGE_INPUT=""
 # Also make soft-link to make the target DB dinucleotide-aware without altering the original target DB
 if [ -n "$SPLITSTRAND" ] && [ -z "$GPU" ] && [ -z "$HAVE_INDEX" ]; then
     if notExists "$TMP_PATH/target_db_dinuc.dbtype"; then
-        ln -s "$(abspath "$2")" "$TMP_PATH/target_db_dinuc"
-        ln -s "$(abspath "$2.index")" "$TMP_PATH/target_db_dinuc.index"
-        ln -s "$(abspath "${2}_h")" "$TMP_PATH/target_db_dinuc_h" 2>/dev/null || true
-        ln -s "$(abspath "${2}_h.index")" "$TMP_PATH/target_db_dinuc_h.index" 2>/dev/null || true
-        ln -s "$(abspath "${2}_h.dbtype")" "$TMP_PATH/target_db_dinuc_h.dbtype" 2>/dev/null || true
-        ln -s "$(abspath "${2}.lookup")" "$TMP_PATH/target_db_dinuc.lookup" 2>/dev/null || true
-        ln -s "$(abspath "${2}.source")" "$TMP_PATH/target_db_dinuc.source" 2>/dev/null || true
+        ln -s "$(abspath "$TARGETDB")" "$TMP_PATH/target_db_dinuc"
+        ln -s "$(abspath "$TARGETDB.index")" "$TMP_PATH/target_db_dinuc.index"
+        ln -s "$(abspath "${TARGETDB}_h")" "$TMP_PATH/target_db_dinuc_h" 2>/dev/null || true
+        ln -s "$(abspath "${TARGETDB}_h.index")" "$TMP_PATH/target_db_dinuc_h.index" 2>/dev/null || true
+        ln -s "$(abspath "${TARGETDB}_h.dbtype")" "$TMP_PATH/target_db_dinuc_h.dbtype" 2>/dev/null || true
+        ln -s "$(abspath "${TARGETDB}.lookup")" "$TMP_PATH/target_db_dinuc.lookup" 2>/dev/null || true
+        ln -s "$(abspath "${TARGETDB}.source")" "$TMP_PATH/target_db_dinuc.source" 2>/dev/null || true
+        ln -s "$(abspath "${2}.gcstat")" "$TMP_PATH/target_db_dinuc.gcstat" 2>/dev/null || true
         awk 'BEGIN { printf("%c%c%c%c",0,0,64,0); exit; }' > "$TMP_PATH/target_db_dinuc.dbtype"
     fi
     TARGETDB="$TMP_PATH/target_db_dinuc"
+elif [ "$TARGETDB" = "$TMP_PATH/target_seqs_split" ]; then
+    if [ ! -e "$TMP_PATH/target_seqs_split.gcstat" ] && [ -f "${2}.gcstat" ]; then
+        ln -s "$(abspath "${2}.gcstat")" "$TMP_PATH/target_seqs_split.gcstat"
+    fi
+elif [ -n "$TARGET_SPLIT_DB" ] && [ ! -e "${TARGETDB}.gcstat" ] && [ -f "${2}.gcstat" ]; then
+    # A caller-supplied --target-split-db without .gcstat: align against a TMP_PATH alias that
+    # carries the original target's .gcstat, so rnaalign does not fall back to sampling GC.
+    # The prefilter keeps the real path, which --gpu-server matches on.
+    if notExists "$TMP_PATH/target_split_gc.dbtype"; then
+        for f in "$TARGETDB" "$TARGETDB".* "${TARGETDB}_h" "${TARGETDB}_h".*; do
+            [ -e "$f" ] && ln -sf "$(abspath "$f")" "$TMP_PATH/target_split_gc${f#"$TARGETDB"}"
+        done
+        ln -sf "$(abspath "${2}.gcstat")" "$TMP_PATH/target_split_gc.gcstat"
+    fi
+    ALIGN_TARGETDB="$TMP_PATH/target_split_gc"
 fi
+[ -z "$ALIGN_TARGETDB" ] && ALIGN_TARGETDB="$TARGETDB"
 
 STEP=0
 # processing
@@ -111,6 +135,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
                         || fail "Split strand died"
                 fi
                 QUERYDB="$TMP_PATH/query_strand"
+                STRANDDB="$TMP_PATH/query_strand"
             fi
             if [ -n "$NEEDQUERYSPLIT" ]; then
                 if notExists "$TMP_PATH/query_seqs_split.dbtype"; then
@@ -140,6 +165,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
                         || fail "Split strand died"
                 fi
                 QUERYDB="$TMP_PATH/query_strand_${STEP}"
+                STRANDDB="$TMP_PATH/query_strand_${STEP}"
             fi
             if [ -n "$NEEDQUERYSPLIT" ]; then
                 if notExists "$TMP_PATH/query_seqs_split_$STEP.dbtype"; then
@@ -181,7 +207,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
             MERGE_INPUT="$TMP_PATH/aln_tmp_double_$STEP"
         fi
         # shellcheck disable=SC2086
-        $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "$QUERYDB" "$TARGETDB" "$TMP_PATH/pref_$STEP" "$MERGE_INPUT" ${TMP} \
+        $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "$QUERYDB" "$ALIGN_TARGETDB" "$TMP_PATH/pref_$STEP" "$MERGE_INPUT" ${TMP} \
             || fail "Alignment died"
         touch "$TMP_PATH/aln_tmp_$STEP.done"
     fi
@@ -205,7 +231,7 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
     # offset alignment
     if notExists "$TMP_PATH/aln_offset_$STEP.done"; then
         # shellcheck disable=SC2086
-        "$MMSEQS" offsetalignment "$OFFSET_QUERYDB" "$QUERYDB" "$2" "$TARGETDB" "$MERGE_INPUT" "$TMP_PATH/aln_offset_$STEP" ${OFFSETALIGNMENT_PAR} \
+        "$MMSEQS" offsetalignment "$OFFSET_QUERYDB" "$QUERYDB" "$2" "$TARGETDB" "$MERGE_INPUT" "$TMP_PATH/aln_offset_$STEP" ${OFFSETALIGNMENT_PAR} ${STRANDDB:+--realign-query-db "$STRANDDB"} \
             || fail "Offset step died"
         # replace alignment with offset alignment
         if [ "$STEP" -eq 0 ]; then

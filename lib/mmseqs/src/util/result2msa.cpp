@@ -9,6 +9,10 @@
 #include "HeaderSummarizer.h"
 #include "CompressedA3M.h"
 #include "Sequence.h"
+#include "Orf.h"
+#include "WindowRealigner.h"
+
+#include <algorithm>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -72,6 +76,12 @@ int result2msa(int argc, const char **argv, const Command &command) {
         queryHeaderReader = targetHeaderReader;
     }
     const unsigned int maxSequenceLength = std::max(tDbr->getMaxSeqLen(), qDbr->getMaxSeqLen());
+    // Without deletions the MSA spans the query only, so the per-thread buffers need the longest
+    // query, not the longest target: a target database with whole chromosomes would otherwise cost
+    // hundreds of bytes per base of its longest entry in every thread. Targets are mapped into
+    // buffers that grow on demand, and each hit keeps only its aligned window.
+    const unsigned int msaLength = par.allowDeletion ? maxSequenceLength : std::max(qDbr->getMaxSeqLen(), 2u);
+    const bool targetIsProfile = Parameters::isEqualDbtype(tDbr->getDbtype(), Parameters::DBTYPE_HMM_PROFILE);
 
     DBConcat *seqConcat = NULL;
     DBReader<unsigned int> *refReader = NULL;
@@ -155,20 +165,20 @@ int result2msa(int argc, const char **argv, const Command &command) {
         thread_idx = (unsigned int) omp_get_thread_num();
 #endif
 
-        Matcher matcher(qDbr->getDbtype(), maxSequenceLength, &subMat, &evalueComputation, par.compBiasCorrection,
-                        par.compBiasCorrectionScale, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
-        MultipleAlignment aligner(maxSequenceLength, &subMat);
+        // only needed to realign hits without a backtrace, so only built then
+        WindowRealigner *realigner = NULL;
+        MultipleAlignment aligner(msaLength, &subMat);
         PSSMCalculator calculator(
-            &subMat, maxSequenceLength, maxSetSize, par.pcmode, par.pca, par.pcb
+            &subMat, msaLength, maxSetSize, par.pcmode, par.pca, par.pcb
 #ifdef GAP_POS_SCORING
             , par.gapOpen.values.aminoacid()
             , par.gapPseudoCount
 #endif
         );
-        MsaFilter filter(maxSequenceLength, maxSetSize, &subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid());
+        MsaFilter filter(msaLength, maxSetSize, &subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid());
         UniprotHeaderSummarizer summarizer;
-        Sequence centerSequence(maxSequenceLength, qDbr->getDbtype(), &subMat, 0, false, par.compBiasCorrection);
-        Sequence edgeSequence(maxSequenceLength, tDbr->getDbtype(), &subMat, 0, false, false);
+        Sequence centerSequence(msaLength, qDbr->getDbtype(), &subMat, 0, false, par.compBiasCorrection);
+        Sequence edgeSequence(targetIsProfile ? maxSequenceLength : msaLength, tDbr->getDbtype(), &subMat, 0, false, false);
 
         // which sequences where kept after filtering
         bool *kept = new bool[maxSetSize];
@@ -191,6 +201,10 @@ int result2msa(int argc, const char **argv, const Command &command) {
 
         std::vector<unsigned int> seqKeys;
         seqKeys.reserve(300);
+
+        // where each kept window starts in its target
+        std::vector<int> seqOffsets;
+        seqOffsets.reserve(300);
 
         std::string result;
         result.reserve(300 * 1024);
@@ -240,34 +254,55 @@ int result2msa(int argc, const char **argv, const Command &command) {
                 }
 
                 const size_t columns = Util::getWordsOfLine(data, entry, 255);
-                if (columns > Matcher::ALN_RES_WITHOUT_BT_COL_CNT) {
-                    alnResults.emplace_back(Matcher::parseAlignmentRecord(data));
-                } else {
-                    // Recompute if not all the backtraces are present
-                    if (isQueryInit == false) {
-                        matcher.initQuery(&centerSequence);
-                        isQueryInit = true;
-                    }
-                    alnResults.emplace_back(matcher.getSWResult(&edgeSequence, INT_MAX, false, 0, 0.0, FLT_MAX, Matcher::SCORE_COV_SEQID, 0, false));
-                }
-                bool isReverse = hasReverseMap && (alnResults.back().qStartPos > alnResults.back().qEndPos);
-
                 const size_t edgeId = tDbr->getId(key);
                 if (edgeId == UINT_MAX) {
                     Debug(Debug::ERROR) << "Sequence " << key << " does not exist in target sequence database\n";
                     EXIT(EXIT_FAILURE);
                 }
+
+                const bool hasPositions = columns >= Matcher::ALN_RES_WITHOUT_BT_COL_CNT;
+                const bool hasBacktrace = columns > Matcher::ALN_RES_WITHOUT_BT_COL_CNT;
+                Matcher::result_t record;
+                bool reverseHit = false;
+                if (hasPositions) {
+                    record = Matcher::parseAlignmentRecord(data);
+                    reverseHit = record.qStartPos > record.qEndPos;
+                }
+                const bool isReverse = hasReverseMap && reverseHit;
+
+                const unsigned int tLen = tDbr->getSeqLen(edgeId);
+                int lo = 0, hi = static_cast<int>(tLen) - 1;
+                if (hasPositions && targetIsProfile == false) {
+                    if (record.dbStartPos >= 0 && record.dbEndPos >= 0) {
+                        lo = std::min(record.dbStartPos, record.dbEndPos);
+                        hi = std::min(std::max(record.dbStartPos, record.dbEndPos), hi);
+                    } else {
+                        hi = -1;
+                    }
+                }
+                if (hasPositions && hi < lo) {
+                    // no alignment (dbStartPos -1): computeMSA fills the row with gaps
+                    alnResults.emplace_back(record);
+                    seqSet.emplace_back();
+                    seqOffsets.emplace_back(0);
+                    seqKeys.emplace_back(key);
+                    data = Util::skipLine(data);
+                    continue;
+                }
+                const unsigned int ctxStart = (lo > 0) ? lo - 1 : 0;
+                const unsigned int ctxLen = std::min(tLen, static_cast<unsigned int>(hi) + 2) - ctxStart;
+                const char *window = tDbr->getDataRange(edgeId, thread_idx, ctxStart, ctxLen);
                 if (isReverse) {
-                    edgeSequence.mapSequenceReverse(edgeId, key, tDbr->getData(edgeId, thread_idx), tDbr->getSeqLen(edgeId));
+                    edgeSequence.mapSequenceReverse(edgeId, key, window, ctxLen);
                 } else {
-                    edgeSequence.mapSequence(edgeId, key, tDbr->getData(edgeId, thread_idx), tDbr->getSeqLen(edgeId));
+                    edgeSequence.mapSequence(edgeId, key, window, ctxLen);
                 }
                 #ifdef RIBOSEEK
                 // Remap sequence if the database is from GPU
                 if (DBReader<unsigned int>::getExtendedDbtype(tDbr->getDbtype()) & Parameters::DBTYPE_EXTENDED_GPU) {
-                    char *dbSeqData = tDbr->getDataUncompressed(edgeId);
+                    char *dbSeqData = tDbr->getDataUncompressed(edgeId) + ctxStart;
                     memcpy(edgeSequence.numSequence, dbSeqData, edgeSequence.L);
-                    if (alnResults.back().qStartPos > alnResults.back().qEndPos) {
+                    if (reverseHit) {
                         unsigned char *numSequence = edgeSequence.numSequence;
                         unsigned int i = edgeSequence.L - 1;
                         for (; i >= 4; i -= 4) {
@@ -317,13 +352,42 @@ int result2msa(int argc, const char **argv, const Command &command) {
                     }
                 }
                 #endif
-                seqSet.emplace_back(std::vector<unsigned char>(edgeSequence.numSequence, edgeSequence.numSequence + edgeSequence.L));
+                // keep the window and shift the hit onto it until the MSA is built
+                const unsigned char *win = edgeSequence.numSequence + (lo - ctxStart);
+                const unsigned int winLen = hi - lo + 1;
+                seqSet.emplace_back(std::vector<unsigned char>(win, win + winLen));
+                seqOffsets.emplace_back(lo);
                 seqKeys.emplace_back(key);
+                if (hasBacktrace) {
+                    record.dbStartPos -= lo;
+                    record.dbEndPos -= lo;
+                    alnResults.emplace_back(record);
+                } else {
+                    // Recompute if not all the backtraces are present: inside the window, on the
+                    // record's strand (a profile target is mapped forward only)
+                    if (realigner == NULL) {
+                        realigner = new WindowRealigner(qDbr->getDbtype(), &subMat, &evalueComputation,
+                                                        par.compBiasCorrection, par.compBiasCorrectionScale,
+                                                        par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), par.zdrop);
+                    }
+                    if (isQueryInit == false) {
+                        realigner->newQuery(&centerSequence, queryId, queryKey, qDbr->getData(queryId, thread_idx), qDbr->getSeqLen(queryId));
+                        isQueryInit = true;
+                    }
+                    alnResults.emplace_back(realigner->align(win, winLen, isReverse && targetIsProfile == false, key, tLen));
+                }
 
                 data = Util::skipLine(data);
             }
 
             MultipleAlignment::MSAResult res = aligner.computeMSA(&centerSequence, seqSet, alnResults, !par.allowDeletion);
+            // back to target coordinates for everything written out
+            for (size_t i = 0; i < alnResults.size(); i++) {
+                if (alnResults[i].dbStartPos >= 0 && alnResults[i].dbEndPos >= 0) {
+                    alnResults[i].dbStartPos += seqOffsets[i];
+                    alnResults[i].dbEndPos += seqOffsets[i];
+                }
+            }
             //MultipleAlignment::print(res, &subMat);
 
             // Remap internal encoding to output encoding (e.g. dinucleotide -> nucleotide)
@@ -520,9 +584,16 @@ int result2msa(int argc, const char **argv, const Command &command) {
                         result.append(1, '\n');
                     }else{
                         const std::vector<unsigned char> & seq = seqSet[i-1];
-                        int seqStartPos = alnResults[i-1].dbStartPos;
-                        size_t seqPos = 0;
-                        const std::string & bt = alnResults[i-1].backtrace;
+                        // a reverse hit's backtrace runs from qStartPos down against the reverse
+                        // complement: walk it backwards in query order and the target from dbEndPos
+                        // down, complementing, as computeMSA does
+                        const bool reverse = alnResults[i-1].qStartPos > alnResults[i-1].qEndPos;
+                        std::string bt = alnResults[i-1].backtrace;
+                        if (reverse) {
+                            std::reverse(bt.begin(), bt.end());
+                        }
+                        int seqPos = (reverse ? alnResults[i-1].dbEndPos : alnResults[i-1].dbStartPos) - static_cast<int>(seqOffsets[i-1]);
+                        const int seqStep = reverse ? -1 : 1;
                         size_t btPos = 0;
 
                         for (size_t pos = 0; pos < res.centerLength; pos++) {
@@ -533,17 +604,25 @@ int result2msa(int argc, const char **argv, const Command &command) {
                             }else if(aa<MultipleAlignment::GAP){
                                 result.push_back( subMat.num2aa[(int) aa]);
                                 btPos++;
-                                seqPos++;
+                                seqPos += seqStep;
                             }
                             // skip insert
                             while(btPos < bt.size() && bt[btPos] == 'I') { btPos++;}
 
                             // add lower case deletions
                             while(btPos < bt.size() && bt[btPos] == 'D') {
-                                unsigned char aa = seq[seqStartPos+seqPos];
-                                result.push_back(tolower(subMat.num2aa[num2outputnum ? num2outputnum[aa] : aa]));
+                                unsigned char aa = seq[seqPos];
+#ifdef RIBOSEEK
+                                if (reverse) {
+                                    aa = subMat.num2revcompnum[aa];
+                                }
+                                char letter = subMat.num2aa[num2outputnum ? num2outputnum[aa] : aa];
+#else
+                                char letter = reverse ? Orf::complement(subMat.num2aa[aa]) : subMat.num2aa[aa];
+#endif
+                                result.push_back(tolower(letter));
                                 btPos++;
-                                seqPos++;
+                                seqPos += seqStep;
                             }
                         }
                         result.append(1, '\n');
@@ -602,10 +681,12 @@ int result2msa(int argc, const char **argv, const Command &command) {
             MultipleAlignment::deleteMSA(&res);
             seqSet.clear();
             seqKeys.clear();
+            seqOffsets.clear();
             alnResults.clear();
         }
 
         delete[] kept;
+        delete realigner;
     }
     resultWriter.close(true);
     if (shouldWriteNullByte == false) {

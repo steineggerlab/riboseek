@@ -678,6 +678,11 @@ SmithWaterman::SmithWaterman(size_t maxSequenceLength, int aaSize, bool aaBiasCo
 	profile->profile_rev_byte = (simd_int*)mem_align(ALIGN_INT, aaSize * segSize * sizeof(simd_int));
     profile->profile_rev_word = (simd_int*)mem_align(ALIGN_INT, aaSize * segSize * sizeof(simd_int));
 	profile->profile_rev_int = (simd_int*)mem_align(ALIGN_INT, aaSize * segSize * sizeof(simd_int));
+	// signed ungapped kernel: at least 4 stripes, it sweeps up to 8 db columns at once
+	const int32_t signedSegSize = std::max(segSize, 4);
+	profileSigned = (int8_t*)mem_align(ALIGN_INT, aaSize * signedSegSize * sizeof(simd_int));
+	hSigned = (int8_t*)mem_align(ALIGN_INT, signedSegSize * sizeof(simd_int));
+	signedSegLen = 0;
 
 	// query sequence
     profile->query_sequence     = new int8_t[maxSequenceLength];
@@ -723,6 +728,8 @@ SmithWaterman::~SmithWaterman(){
 	free(profile->profile_rev_byte);
 	free(profile->profile_rev_word);
 	free(profile->profile_rev_int);
+	free(profileSigned);
+	free(hSigned);
 	delete [] profile->query_rev_sequence;
 	delete [] profile->query_sequence;
 	delete [] profile->composition_bias;
@@ -1473,6 +1480,24 @@ void SmithWaterman::ssw_init(const Sequence* q,
 			}
 		}
 	}
+
+	// signed striped profile for ungapped_alignment: raw scores (no bias), 0 past the query end
+	const int32_t elements = VECSIZE_INT * 4;
+	signedSegLen = std::max((q->L + elements - 1) / elements, 4);
+	int8_t *signedIt = profileSigned;
+	for (int32_t nt = 0; nt < alphabetSize; nt++) {
+		for (int32_t i = 0; i < signedSegLen; i++) {
+			for (int32_t k = 0; k < elements; k++) {
+				const int32_t j = i + k * signedSegLen;
+				int8_t value = 0;
+				if (j < q->L) {
+					value = isProfile ? profile->mat[nt * q->L + j]
+									  : static_cast<int8_t>(profile->mat[nt * alphabetSize + profile->query_sequence[j]] + profile->composition_bias[j]);
+				}
+				*signedIt++ = value;
+			}
+		}
+	}
 }
 
 template <unsigned int type>
@@ -1814,63 +1839,139 @@ inline F simd_hmax(const F * in, unsigned int n) {
     return current;
 }
 
-int SmithWaterman::ungapped_alignment(const unsigned char *db_sequence, int32_t db_length) {
-#define SWAP(tmp, arg1, arg2) tmp = arg1; arg1 = arg2; arg2 = tmp;
+#define UNGAPPED_INLINE inline __attribute__((always_inline))
 
-    int i; // position in query bands (0,..,W-1)
-    int j; // position in db sequence (0,..,dbseq_length-1)
-    int element_count = (VECSIZE_INT * 4);
-    const int W = (profile->query_length + (element_count - 1)) /
-                  element_count; // width of bands in query and score matrix = hochgerundetes LQ/16
+// Signed striped kernel for ungapped_alignment (from MMseqs2 f94ba142): H is stored as H - 128 and
+// saturates at 255, the result is capped at 255 - bias as the former unsigned kernel did, so the
+// scores are identical. Each sweep processes C db columns; at step s column c handles stripe s + c.
 
-    simd_int *p;
-    simd_int S;              // 16 unsigned bytes holding S(b*W+i,j) (b=0,..,15)
-    simd_int Smax = simdi_setzero();
-    simd_int Soffset; // all scores in query profile are shifted up by Soffset to obtain pos values
-    simd_int *s_prev, *s_curr; // pointers to Score(i-1,j-1) and Score(i,j), resp.
-    simd_int *qji;             // query profile score in row j (for residue x_j)
-    simd_int *s_prev_it, *s_curr_it;
-    simd_int *query_profile_it = (simd_int *) profile->profile_byte;
+static inline simd_int shiftInZero(simd_int x, simd_int lane0) {
+    return simdi_or(simdi8_shiftl(x, 1), lane0);
+}
 
-    // Load the score offset to all 16 unsigned byte elements of Soffset
-    Soffset = simdi8_set(profile->bias);
-    s_curr = simdData->vHStore;
-    s_prev = simdData->vHLoad;
+template <int C>
+struct SignedSweep {
+    simd_int fifo[C];
+    const simd_int *P[C];
+    simd_int *H;
+    simd_int smax;
+    simd_int lane0;
+    int W;
 
-    memset(simdData->vHStore, 0, W * sizeof(simd_int));
-    memset(simdData->vHLoad, 0, W * sizeof(simd_int));
+    template <int K>
+    UNGAPPED_INLINE void step(int s) {
+        simd_int n = simdi8_adds(fifo[K], simdi_load(P[0] + s));
+        fifo[K] = simdi_load(H + s + C - 1);
+        simd_int m = n;
+        for (int c = 1; c < C; c++) {
+            n = simdi8_adds(n, simdi_load(P[c] + s + c));
+            m = simdi8_max(m, n);
+        }
+        simdi_store(H + s + C - 1, n);
+        smax = simdi8_max(smax, m);
+    }
 
-    for (j = 0; j < db_length; ++j) // loop over db sequence positions
-    {
+    template <int K, int WR>
+    UNGAPPED_INLINE void wrap() {
+        const int s = W - C + 1 + WR;
+        simd_int n = simdi8_adds(fifo[K], simdi_load(P[0] + s));
+        simd_int m = n;
+        for (int c = 1; c < C; c++) {
+            if (c < C - 1 - WR) {
+                n = simdi8_adds(n, simdi_load(P[c] + s + c));
+            } else if (c == C - 1 - WR) {
+                n = simdi8_adds(shiftInZero(n, lane0), simdi_load(P[c]));
+            } else {
+                n = simdi8_adds(n, simdi_load(P[c] + (c - (C - 1 - WR))));
+            }
+            m = simdi8_max(m, n);
+        }
+        simdi_store(H + WR, n);
+        smax = simdi8_max(smax, m);
+    }
+};
 
-        // Get address of query scores for row j
-        qji = query_profile_it + db_sequence[j] * W;
+template <int C, int N, int K = 0, int Left = N - K>
+struct SignedSteps {
+    static UNGAPPED_INLINE void run(SignedSweep<C> &sweep, int s) {
+        sweep.template step<K>(s + K);
+        SignedSteps<C, N, K + 1>::run(sweep, s);
+    }
+};
+template <int C, int N, int K>
+struct SignedSteps<C, N, K, 0> {
+    static UNGAPPED_INLINE void run(SignedSweep<C> &, int) {}
+};
 
-        // Load the next S value
-        S = simdi_load(s_curr + W - 1);
-        S = simdi8_shiftl(S, 1);
+template <int C, int R, int WR, int N = C - 1 - WR>
+struct SignedWrapSteps {
+    static UNGAPPED_INLINE void run(SignedSweep<C> &sweep) {
+        sweep.template wrap<(R + WR) % C, WR>();
+        SignedWrapSteps<C, R, WR + 1>::run(sweep);
+    }
+};
+template <int C, int R, int WR>
+struct SignedWrapSteps<C, R, WR, 0> {
+    static UNGAPPED_INLINE void run(SignedSweep<C> &) {}
+};
 
-        // Swap s_prev and s_curr, smax_prev and smax_curr
-        SWAP(p, s_prev, s_curr);
+template <int C, int R>
+static UNGAPPED_INLINE void signedSweepTail(SignedSweep<C> &sweep, int s) {
+    SignedSteps<C, R>::run(sweep, s);
+    SignedWrapSteps<C, R, 0>::run(sweep);
+}
 
-        s_curr_it = s_curr;
-        s_prev_it = s_prev;
-
-        for (i = 0; i < W; ++i) // loop over query band positions
-        {
-            // Saturated addition and subtraction to score S(i,j)
-            S = simdui8_adds(S, *(qji++)); // S(i,j) = S(i-1,j-1) + (q(i,x_j) + Soffset)
-            S = simdui8_subs(S, Soffset);       // S(i,j) = max(0, S(i,j) - Soffset)
-            simdi_store(s_curr_it++, S);       // store S to s_curr[i]
-            Smax = simdui8_max(Smax, S);       // Smax(i,j) = max(Smax(i,j), S(i,j))
-
-            // Load the next S and Smax values
-            S = simdi_load(s_prev_it++);
+template <int C>
+static int signedSweeps(const simd_int *profile, simd_int *H, int W, simd_int lane0, simd_int &smax,
+                        const unsigned char *t, int tLen) {
+    SignedSweep<C> sweep;
+    sweep.W = W;
+    sweep.H = H;
+    sweep.lane0 = lane0;
+    sweep.smax = smax;
+    const int mainSteps = W - C + 1;
+    int j = 0;
+    for (; j + C <= tLen; j += C) {
+        for (int c = 0; c < C; c++) {
+            sweep.P[c] = profile + t[j + c] * W;
+        }
+        sweep.fifo[0] = shiftInZero(simdi_load(H + W - 1), lane0);
+        for (int c = 1; c < C; c++) {
+            sweep.fifo[c] = simdi_load(H + c - 1);
+        }
+        int s = 0;
+        for (; s + C <= mainSteps; s += C) {
+            SignedSteps<C, C>::run(sweep, s);
+        }
+        switch (mainSteps - s) {
+            case 0: signedSweepTail<C, 0>(sweep, s); break;
+            case 1: signedSweepTail<C, 1 % C>(sweep, s); break;
+            case 2: signedSweepTail<C, 2 % C>(sweep, s); break;
+            case 3: signedSweepTail<C, 3 % C>(sweep, s); break;
+            case 4: signedSweepTail<C, 4 % C>(sweep, s); break;
+            case 5: signedSweepTail<C, 5 % C>(sweep, s); break;
+            case 6: signedSweepTail<C, 6 % C>(sweep, s); break;
+            default: signedSweepTail<C, 7 % C>(sweep, s); break;
         }
     }
-    int score = simd_hmax((unsigned char *) &Smax, element_count);
+    smax = sweep.smax;
+    return j;
+}
 
-    /* return largest score */
-    return score;
-#undef SWAP
+static int signedScore(const simd_int *profile, simd_int *H, int W, const unsigned char *t, int tLen) {
+    const simd_int zeroH = simdi8_set((char) 0x80);
+    const simd_int lane0 = simdi_xor(zeroH, simdi8_shiftl(zeroH, 1));
+    for (int i = 0; i < W; i++) {
+        simdi_store(H + i, zeroH);
+    }
+    simd_int smax = zeroH;
+    int j = (W >= 8) ? signedSweeps<8>(profile, H, W, lane0, smax, t, tLen) : 0;
+    j += signedSweeps<4>(profile, H, W, lane0, smax, t + j, tLen - j);
+    signedSweeps<1>(profile, H, W, lane0, smax, t + j, tLen - j);
+    return simdi8_hmax(simdi_xor(smax, zeroH));
+}
+
+int SmithWaterman::ungapped_alignment(const unsigned char *db_sequence, int32_t db_length) {
+    const int best = signedScore((const simd_int *) profileSigned, (simd_int *) hSigned, signedSegLen, db_sequence, db_length);
+    return std::min(best, 255 - static_cast<int>(profile->bias));
 }

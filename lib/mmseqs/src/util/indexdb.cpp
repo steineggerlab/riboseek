@@ -95,6 +95,8 @@ int indexdb(int argc, const char **argv, const Command &command) {
     if (Parameters::isEqualDbtype(db2Type, Parameters::DBTYPE_NUCLEOTIDES) && Sequence::getAuxInfo(db2Type) != NULL) {
         db2Type = DBReader<unsigned int>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, DBReader<unsigned int>::getExtendedDbtype(db2Type));
     }
+    db1Type = DBReader<unsigned int>::encodedGpuDbtype(db1Type);
+    db2Type = DBReader<unsigned int>::encodedGpuDbtype(db2Type);
 #endif
     const bool db1IsNucl = Parameters::isEqualDbtype(db1Type, Parameters::DBTYPE_NUCLEOTIDES);
     const bool db2IsNucl = dbr2 != NULL && Parameters::isEqualDbtype(db2Type, Parameters::DBTYPE_NUCLEOTIDES);
