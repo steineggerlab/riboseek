@@ -137,9 +137,11 @@ std::string decodeMappedSequenceToRna(const Sequence &seq, const BaseMatrix &sub
     return out;
 }
 
+// Decodes only [start, start + len) of the sequence, so a window on a genomic
+// target doesn't read and decode the whole target.
 FastaSeq decodeOneSequence(DBReader<unsigned int> &dbr, size_t id, BaseMatrix &subMat,
                            Sequence &seqObj, bool useDinucMapping, bool isGpuDb,
-                           unsigned int thread_idx) {
+                           unsigned int thread_idx, size_t start, size_t len) {
     FastaSeq cur;
     cur.key = dbr.getDbKey(id);
     if (dbr.getLookupSize() > 0) {
@@ -148,13 +150,12 @@ FastaSeq decodeOneSequence(DBReader<unsigned int> &dbr, size_t id, BaseMatrix &s
     } else {
         cur.id = std::to_string(cur.key);
     }
-    const size_t seqLen = dbr.getSeqLen(id);
     if (isGpuDb) {
-        const unsigned char *data = reinterpret_cast<const unsigned char *>(dbr.getDataUncompressed(id));
-        seqObj.mapSequence(id, cur.key, std::make_pair(data, seqLen));
+        const unsigned char *data = reinterpret_cast<const unsigned char *>(dbr.getDataUncompressed(id)) + start;
+        seqObj.mapSequence(id, cur.key, std::make_pair(data, static_cast<unsigned int>(len)));
     } else {
-        const char *data = dbr.getData(id, thread_idx);
-        seqObj.mapSequence(id, cur.key, data, seqLen);
+        const char *data = dbr.getDataRange(id, thread_idx, start, len);
+        seqObj.mapSequence(id, cur.key, data, static_cast<unsigned int>(len));
     }
     const Sequence::SeqAuxInfo *auxInfo = Sequence::getAuxInfo(seqObj.getSeqType());
     const unsigned char *num2outputnum = (useDinucMapping && auxInfo != NULL) ? auxInfo->num2outputnum : NULL;
@@ -566,30 +567,31 @@ static void processQueryModel(LocalParameters &par, const InfModel &model,
                     const Cand &cand = cands[static_cast<size_t>(ci)];
                     const size_t tId = seqDbr.getId(cand.tKey);
                     if (tId == UINT_MAX) continue;
-                    FastaSeq fs = decodeOneSequence(seqDbr, tId, subMat, seqObjLocal,
-                                                    decodeSeqDinuc, seqGpuDb, thread_idx);
-                    const int seqLen = static_cast<int>(fs.seq.size());
+                    const int seqLen = static_cast<int>(seqDbr.getSeqLen(tId));
                     if (seqLen <= 0) continue;
 
                     // Rescore a WINDOW around the prefilter envelope, padded by W.
                     // Bounds DP by model size, not the target length.
-                    std::string regionBuf;
-                    const std::string *regionSeqPtr = &fs.seq;
-                    int offset = 0;
+                    int regStart = 0;
+                    int regEnd = seqLen;
                     if (cand.hasRegionCoord && regionFlank > 0.0f) {
                         const int basePad = (W > 0) ? W : std::max(1, model.clen);
                         const int pad = std::max(1, static_cast<int>(regionFlank * basePad));
-                        const int regStart = std::max(0, cand.dbStart - pad);
-                        const int regEnd = std::min(seqLen, cand.dbEnd + 1 + pad);
+                        regStart = std::max(0, cand.dbStart - pad);
+                        regEnd = std::min(seqLen, cand.dbEnd + 1 + pad);
                         if (regEnd <= regStart) continue;
-                        if (regStart != 0 || regEnd != seqLen) {
-                            regionBuf = fs.seq.substr(static_cast<size_t>(regStart),
-                                                      static_cast<size_t>(regEnd - regStart));
-                            regionSeqPtr = &regionBuf;
-                        }
-                        offset = regStart;
                     }
-                    const std::string &regionSeq = *regionSeqPtr;
+                    const int offset = regStart;
+                    // decode one extra base each side, as in result2msa, so the
+                    // dinucleotide codes at the window edges decode as in the full target
+                    const int ctxStart = std::max(0, regStart - 1);
+                    const int ctxEnd = std::min(seqLen, regEnd + 1);
+                    FastaSeq fs = decodeOneSequence(seqDbr, tId, subMat, seqObjLocal,
+                                                    decodeSeqDinuc, seqGpuDb, thread_idx,
+                                                    static_cast<size_t>(ctxStart),
+                                                    static_cast<size_t>(ctxEnd - ctxStart));
+                    const std::string regionSeq = fs.seq.substr(static_cast<size_t>(regStart - ctxStart),
+                                                                static_cast<size_t>(regEnd - regStart));
                     const int regionLen = static_cast<int>(regionSeq.size());
 
                     const bool scanFwd = !cand.hasRegionCoord || !cand.prefilterIsRev;

@@ -85,21 +85,24 @@ static std::string decodeMappedSequenceToRna(const Sequence &seq,
     return out;
 }
 
+// Decode only [start, start + len) of the target: a hit on a genomic target
+// would otherwise read and decode the whole target for every alignment row.
 static std::string decodeDbSequence(DBReader<unsigned int> &dbr,
                                     size_t id,
                                     unsigned int threadIdx,
                                     Sequence &mapper,
                                     bool useDinucMapping,
                                     bool isGpuDb,
-                                    const SubstitutionMatrix &subMat) {
-    const unsigned int seqLen = dbr.getSeqLen(id);
+                                    const SubstitutionMatrix &subMat,
+                                    size_t start,
+                                    size_t len) {
     if (isGpuDb) {
         const unsigned char *data =
-            reinterpret_cast<const unsigned char *>(dbr.getDataUncompressed(id));
-        mapper.mapSequence(id, dbr.getDbKey(id), std::make_pair(data, seqLen));
+            reinterpret_cast<const unsigned char *>(dbr.getDataUncompressed(id)) + start;
+        mapper.mapSequence(id, dbr.getDbKey(id), std::make_pair(data, static_cast<unsigned int>(len)));
     } else {
-        const char *data = dbr.getData(id, threadIdx);
-        mapper.mapSequence(id, dbr.getDbKey(id), data, seqLen);
+        const char *data = dbr.getDataRange(id, threadIdx, start, len);
+        mapper.mapSequence(id, dbr.getDbKey(id), data, static_cast<unsigned int>(len));
     }
 
     const Sequence::SeqAuxInfo *auxInfo = Sequence::getAuxInfo(mapper.getSeqType());
@@ -495,10 +498,22 @@ bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
                 if (seenKeys.find(res.dbKey) != seenKeys.end()) continue;
                 seenKeys.insert(res.dbKey);
 
+                const int tLo = std::min(res.dbStartPos, res.dbEndPos);
+                const int tHi = std::max(res.dbStartPos, res.dbEndPos);
+                if (tLo < 0) continue;
+                // aligned span plus one base each side, as in result2msa, so the
+                // dinucleotide codes at the span edges decode as in the full target
+                const size_t ctxStart = (tLo > 0) ? static_cast<size_t>(tLo - 1) : 0;
+                const size_t ctxEnd = std::min(static_cast<size_t>(tDbr->getSeqLen(targetId)),
+                                               static_cast<size_t>(tHi) + 2);
+                if (ctxEnd <= ctxStart) continue;
                 std::string decodedTargetSeq = decodeDbSequence(*tDbr, targetId, thread_idx,
                                                                 targetMapper, decodeTargetDinuc,
-                                                                targetGpuDb, subMat);
+                                                                targetGpuDb, subMat,
+                                                                ctxStart, ctxEnd - ctxStart);
+                // targetSeq[p] is target position ctxStart + p
                 const char *targetSeq = decodedTargetSeq.c_str();
+                const int ctxOffset = static_cast<int>(ctxStart);
 
                 // Fold reverse-strand alignments onto the forward query frame
                 // (matches result2dnamsa.cpp). Strand handling lives here so
@@ -527,11 +542,12 @@ bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
                 size_t residueCount = 0;
                 unsigned int seqPos = 0;
                 for (size_t bp = 0; bp < res.backtrace.size(); ++bp) {
-                    char rawChar = isReverseStrand
-                        ? Orf::complement(targetSeq[res.dbStartPos - seqPos])
-                        : targetSeq[res.dbStartPos + seqPos];
                     switch (res.backtrace[bp]) {
                         case 'M': {
+                            const int p = isReverseStrand
+                                ? res.dbStartPos - ctxOffset - static_cast<int>(seqPos)
+                                : res.dbStartPos - ctxOffset + static_cast<int>(seqPos);
+                            const char rawChar = isReverseStrand ? Orf::complement(targetSeq[p]) : targetSeq[p];
                             char c = normalizeBase(rawChar);
                             if (c != 'A' && c != 'C' && c != 'G' && c != 'U') c = 'N';
                             row.push_back(c);
