@@ -151,4 +151,6 @@ LocalParameters::LocalParameters() : Parameters(),
     offsetalignment.push_back(&PARAM_DB_SIZE);
     searchworkflow.push_back(&PARAM_TARGET_SPLIT_DB);
     searchworkflow.push_back(&PARAM_DB_SIZE);
+    // easy-search was built from searchworkflow before the line above; it hands set options on to search
+    easysearchworkflow.push_back(&PARAM_DB_SIZE);
 }
