@@ -266,19 +266,22 @@ while [ "$STEP" -lt "$NUM_IT" ]; do
 
             # For dinucleotide search, result2profile must read target sequences
             # in dinucleotide space so the PSSM is built over dinucleotide codes.
-            R2P_TARGET="$2"
+            # With a createindex index "$2" is the .idx file, which result2profile cannot
+            # read as a sequence DB, so it takes the original target DB instead.
+            R2P_ORIG="${ORIG_TARGETDB:-$2}"
+            R2P_TARGET="$R2P_ORIG"
             R2P_QUERY="$ORIQUERYDB"
             if [ -n "$SPLITSTRAND" ] && [ -z "$GPU" ]; then
                 # Create a dinuc-flagged symlink of the original target DB (once)
                 # offsetalignment maps split coords back to original, so r2p needs the original.
                 if notExists "$TMP_PATH/target_r2p.dbtype"; then
-                    ln -s "$(abspath "$2")" "$TMP_PATH/target_r2p"
-                    ln -s "$(abspath "$2.index")" "$TMP_PATH/target_r2p.index"
-                    ln -s "$(abspath "${2}_h")" "$TMP_PATH/target_r2p_h" 2>/dev/null || true
-                    ln -s "$(abspath "${2}_h.index")" "$TMP_PATH/target_r2p_h.index" 2>/dev/null || true
-                    ln -s "$(abspath "${2}_h.dbtype")" "$TMP_PATH/target_r2p_h.dbtype" 2>/dev/null || true
-                    ln -s "$(abspath "${2}.lookup")" "$TMP_PATH/target_r2p.lookup" 2>/dev/null || true
-                    ln -s "$(abspath "${2}.source")" "$TMP_PATH/target_r2p.source" 2>/dev/null || true
+                    ln -s "$(abspath "$R2P_ORIG")" "$TMP_PATH/target_r2p"
+                    ln -s "$(abspath "$R2P_ORIG.index")" "$TMP_PATH/target_r2p.index"
+                    ln -s "$(abspath "${R2P_ORIG}_h")" "$TMP_PATH/target_r2p_h" 2>/dev/null || true
+                    ln -s "$(abspath "${R2P_ORIG}_h.index")" "$TMP_PATH/target_r2p_h.index" 2>/dev/null || true
+                    ln -s "$(abspath "${R2P_ORIG}_h.dbtype")" "$TMP_PATH/target_r2p_h.dbtype" 2>/dev/null || true
+                    ln -s "$(abspath "${R2P_ORIG}.lookup")" "$TMP_PATH/target_r2p.lookup" 2>/dev/null || true
+                    ln -s "$(abspath "${R2P_ORIG}.source")" "$TMP_PATH/target_r2p.source" 2>/dev/null || true
                     awk 'BEGIN { printf("%c%c%c%c",0,0,64,0); exit; }' > "$TMP_PATH/target_r2p.dbtype"
                 fi
                 R2P_TARGET="$TMP_PATH/target_r2p"

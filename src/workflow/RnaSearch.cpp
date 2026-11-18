@@ -167,6 +167,9 @@ int riboseekSearch(int argc, const char **argv, const Command &command) {
     cmd.addVariable("VERBOSITY_PAR", par.createParameterString(par.onlyverbosity).c_str());
 
     cmd.addVariable("HAVE_INDEX", (indexStr == "") ? NULL : "TRUE");
+    // result2profile reads sequences from the original target DB: with an index, the
+    // workflow's target argument is the .idx file
+    cmd.addVariable("ORIG_TARGETDB", (indexStr == "") ? NULL : par.db2.c_str());
     cmd.addVariable("SPLITSTRAND", "TRUE");
     cmd.addVariable("QUERY_IS_PROFILE", queryProfileDb ? "TRUE" : NULL);
     cmd.addVariable("SPLITSEQUENCE_PAR", par.createParameterString(par.splitsequence).c_str());
