@@ -72,23 +72,58 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
     STEPS=${STEPS:-1}
     CLUSTER_STR=""
     while [ "$STEP" -lt "$STEPS" ]; do
+        # riboseek cluster --strand 2 (STRAND_DB: key 2k forward, 2k+1 reverse complement): the queries are both strands
+        # of the step's sequences, the targets their forward strands; mergestrandaln keeps the better strand per pair
+        # for clust and addclustrand writes each member's strand (mergeclusters composes it across the steps)
+        QUERY="$INPUT"
+        if [ -n "$STRAND_DB" ]; then
+            QUERY="${TMP_PATH}/input_step${STEP}_both"
+            if notExists "$QUERY.dbtype"; then
+                awk '{ printf("%.0f\n%.0f\n", 2 * $1, 2 * $1 + 1) }' "$INPUT.index" > "$QUERY.keys"
+                # shellcheck disable=SC2086
+                "$MMSEQS" createsubdb "$QUERY.keys" "$STRAND_DB" "$QUERY" ${VERBOSITY} --subdb-mode 1 \
+                    || fail "Strand step $STEP died"
+            fi
+        fi
         PARAM=PREFILTER${STEP}_PAR
         eval TMP="\$$PARAM"
         if notExists "${TMP_PATH}/pref_step$STEP.dbtype"; then
             # shellcheck disable=SC2086
-            $RUNNER "$MMSEQS" prefilter "$INPUT" "$INPUT" "${TMP_PATH}/pref_step$STEP" ${TMP} \
+            $RUNNER "$MMSEQS" prefilter "$QUERY" "$INPUT" "${TMP_PATH}/pref_step$STEP" ${TMP} \
                 || fail "Prefilter step $STEP died"
         fi
         PARAM=ALIGNMENT${STEP}_PAR
         eval TMP="\$$PARAM"
-        if notExists "${TMP_PATH}/aln_step$STEP.dbtype"; then
+        if [ -n "$STRAND_DB" ]; then
+            if notExists "${TMP_PATH}/aln_step${STEP}_strand.dbtype"; then
+                # shellcheck disable=SC2086
+                $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "$QUERY" "$INPUT" "${TMP_PATH}/pref_step$STEP" "${TMP_PATH}/aln_step${STEP}_strand" ${TMP} \
+                    || fail "Alignment step $STEP died"
+            fi
+            if notExists "${TMP_PATH}/aln_step$STEP.dbtype"; then
+                # shellcheck disable=SC2086
+                "$MMSEQS" mergestrandaln "$INPUT" "${TMP_PATH}/aln_step${STEP}_strand" "${TMP_PATH}/aln_step$STEP" ${TMP} \
+                    || fail "Strand merge step $STEP died"
+            fi
+        elif notExists "${TMP_PATH}/aln_step$STEP.dbtype"; then
             # shellcheck disable=SC2086
             $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "$INPUT" "$INPUT" "${TMP_PATH}/pref_step$STEP" "${TMP_PATH}/aln_step$STEP" ${TMP} \
                 || fail "Alignment step $STEP died"
         fi
         PARAM=CLUSTER${STEP}_PAR
         eval TMP="\$$PARAM"
-        if notExists "${TMP_PATH}/clu_step$STEP.dbtype"; then
+        if [ -n "$STRAND_DB" ]; then
+            if notExists "${TMP_PATH}/clu_step${STEP}_nostrand.dbtype"; then
+                # shellcheck disable=SC2086
+                "$MMSEQS" clust "$INPUT" "${TMP_PATH}/aln_step$STEP" "${TMP_PATH}/clu_step${STEP}_nostrand" ${TMP} \
+                    || fail "Clustering step $STEP died"
+            fi
+            if notExists "${TMP_PATH}/clu_step$STEP.dbtype"; then
+                # shellcheck disable=SC2086
+                "$MMSEQS" addclustrand "${TMP_PATH}/clu_step${STEP}_nostrand" "${TMP_PATH}/aln_step${STEP}_strand" "${TMP_PATH}/clu_step$STEP" ${MERGECLU_PAR} \
+                    || fail "Strand clustering step $STEP died"
+            fi
+        elif notExists "${TMP_PATH}/clu_step$STEP.dbtype"; then
             # shellcheck disable=SC2086
             "$MMSEQS" clust "$INPUT" "${TMP_PATH}/aln_step$STEP" "${TMP_PATH}/clu_step$STEP" ${TMP} \
                 || fail "Clustering step $STEP died"
@@ -125,8 +160,35 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
         STEP=$((STEP-1))
         PARAM=ALIGNMENT${STEP}_PAR
         eval ALIGNMENT_PAR="\$$PARAM"
+        CLU="${TMP_PATH}/clu"
+        if [ -n "$STRAND_DB" ]; then
+            # riboseek --strand 2: every member is aligned to its representative in both orientations (the
+            # representative's strand entries 2r and 2r+1 against the member's forward strand), the better one kept;
+            # the rest runs on the cluster db without its strand column, and members that fail are searched again on
+            # both strands
+            if notExists "${TMP_PATH}/clu_strandq.dbtype"; then
+                # shellcheck disable=SC2086
+                "$MMSEQS" splitclustrand "${TMP_PATH}/clu" "${TMP_PATH}/clu_strandq" ${THREADSANDCOMPRESS} \
+                    || fail "splitclustrand reassign died"
+            fi
+            if notExists "${TMP_PATH}/aln_strand.dbtype"; then
+                # shellcheck disable=SC2086
+                $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "$STRAND_DB" "$SOURCE" "${TMP_PATH}/clu_strandq" "${TMP_PATH}/aln_strand" ${ALIGNMENT_REASSIGN_PAR} \
+                    || fail "align1 reassign died"
+            fi
+            if notExists "${TMP_PATH}/aln.dbtype"; then
+                # shellcheck disable=SC2086
+                "$MMSEQS" mergestrandaln "$SOURCE" "${TMP_PATH}/aln_strand" "${TMP_PATH}/aln" ${ALIGNMENT_REASSIGN_PAR} \
+                    || fail "mergestrandaln reassign died"
+            fi
+            if notExists "${TMP_PATH}/clu_plain.dbtype"; then
+                # shellcheck disable=SC2086
+                "$MMSEQS" filterdb "${TMP_PATH}/clu" "${TMP_PATH}/clu_plain" --trim-to-one-column ${THREADSANDCOMPRESS} \
+                    || fail "filterdb strand reassign died"
+            fi
+            CLU="${TMP_PATH}/clu_plain"
         # align to cluster sequences
-        if notExists "${TMP_PATH}/aln.dbtype"; then
+        elif notExists "${TMP_PATH}/aln.dbtype"; then
             # shellcheck disable=SC2086
             $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "$SOURCE" "$SOURCE" "${TMP_PATH}/clu" "${TMP_PATH}/aln" ${ALIGNMENT_REASSIGN_PAR} \
                     || fail "align1 reassign died"
@@ -134,7 +196,7 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
         # create file of cluster that do not align based on given criteria
         if notExists "${TMP_PATH}/clu_not_accepted.dbtype"; then
             # shellcheck disable=SC2086
-            "$MMSEQS" subtractdbs "${TMP_PATH}/clu" "${TMP_PATH}/aln" "${TMP_PATH}/clu_not_accepted" --e-profile 100000000 -e 100000000 ${THREADSANDCOMPRESS} \
+            "$MMSEQS" subtractdbs "$CLU" "${TMP_PATH}/aln" "${TMP_PATH}/clu_not_accepted" --e-profile 100000000 -e 100000000 ${THREADSANDCOMPRESS} \
                     || fail "subtractdbs1 reassign died"
         fi
         if notExists "${TMP_PATH}/clu_not_accepted_swap.dbtype"; then
@@ -153,12 +215,18 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
                 "$MMSEQS" rmdb "${TMP_PATH}/clu_not_accepted" ${VERBOSITY}
                 # shellcheck disable=SC2086
                 "$MMSEQS" rmdb "${TMP_PATH}/aln" ${VERBOSITY}
+                if [ -n "$STRAND_DB" ]; then
+                    for db in clu_strandq aln_strand clu_plain; do
+                        # shellcheck disable=SC2086
+                        "$MMSEQS" rmdb "${TMP_PATH}/$db" ${VERBOSITY}
+                    done
+                fi
             fi
         else
             # create file of cluster that do align based on given criteria
             if notExists "${TMP_PATH}/clu_accepted.dbtype"; then
                 # shellcheck disable=SC2086
-                "$MMSEQS" subtractdbs "${TMP_PATH}/clu" "${TMP_PATH}/clu_not_accepted" "${TMP_PATH}/clu_accepted" --e-profile 100000000 -e 100000000 ${THREADSANDCOMPRESS} \
+                "$MMSEQS" subtractdbs "$CLU" "${TMP_PATH}/clu_not_accepted" "${TMP_PATH}/clu_accepted" --e-profile 100000000 -e 100000000 ${THREADSANDCOMPRESS} \
                         || fail "subtractdbs2 reassign died"
             fi
             # create sequences database that were wrong assigned
@@ -170,11 +238,22 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
             # build seed sequences
             if notExists "${TMP_PATH}/seq_seeds.dbtype"; then
                 # shellcheck disable=SC2086
-                "$MMSEQS" createsubdb "${TMP_PATH}/clu" "$SOURCE" "${TMP_PATH}/seq_seeds" ${VERBOSITY} \
+                "$MMSEQS" createsubdb "$CLU" "$SOURCE" "${TMP_PATH}/seq_seeds" ${VERBOSITY} \
                         || fail "createsubdb2 reassign died"
             fi
             PARAM=PREFILTER${STEP}_PAR
             eval PREFILTER_PAR="\$$PARAM"
+            # riboseek --strand 2: the wrongly assigned sequences are searched on both strands
+            WRONG="${TMP_PATH}/seq_wrong_assigned"
+            if [ -n "$STRAND_DB" ]; then
+                WRONG="${TMP_PATH}/seq_wrong_assigned_both"
+                if notExists "$WRONG.dbtype"; then
+                    awk '{ printf("%.0f\n%.0f\n", 2 * $1, 2 * $1 + 1) }' "${TMP_PATH}/seq_wrong_assigned.index" > "$WRONG.keys"
+                    # shellcheck disable=SC2086
+                    "$MMSEQS" createsubdb "$WRONG.keys" "$STRAND_DB" "$WRONG" ${VERBOSITY} --subdb-mode 1 \
+                        || fail "createsubdb strand reassign died"
+                fi
+            fi
             # try to find best matching centroid sequences for prev. wrong assigned sequences
             if notExists "${TMP_PATH}/seq_wrong_assigned_pref.dbtype"; then
                 if notExists "${TMP_PATH}/seq_seeds.merged.dbtype"; then
@@ -187,7 +266,7 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
                     cp "${TMP_PATH}/seq_seeds.dbtype" "${TMP_PATH}/seq_seeds.merged.dbtype"
                 fi
                 # shellcheck disable=SC2086
-                $RUNNER "$MMSEQS" prefilter "${TMP_PATH}/seq_wrong_assigned" "${TMP_PATH}/seq_seeds.merged" "${TMP_PATH}/seq_wrong_assigned_pref" ${PREFILTER_REASSIGN_PAR} \
+                $RUNNER "$MMSEQS" prefilter "$WRONG" "${TMP_PATH}/seq_seeds.merged" "${TMP_PATH}/seq_wrong_assigned_pref" ${PREFILTER_REASSIGN_PAR} \
                         || fail "Prefilter reassign died"
             fi
             if notExists "${TMP_PATH}/seq_wrong_assigned_pref_swaped.dbtype"; then
@@ -195,7 +274,32 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
                 "$MMSEQS" swapdb "${TMP_PATH}/seq_wrong_assigned_pref" "${TMP_PATH}/seq_wrong_assigned_pref_swaped" ${THREADSANDCOMPRESS} \
                         || fail "swapdb2 reassign died"
             fi
-            if notExists "${TMP_PATH}/seq_wrong_assigned_pref_swaped_aln.dbtype"; then
+            if [ -n "$STRAND_DB" ]; then
+                # targets are strand entries 2m / 2m+1: keyed by them (swapdb), merged to one hit per sequence pair
+                # (mergestrandaln) and keyed back by the seeds; the strand-keyed alignments are kept for the strands
+                if notExists "${TMP_PATH}/seq_wrong_assigned_strand_aln.dbtype"; then
+                    # shellcheck disable=SC2086
+                    $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "${TMP_PATH}/seq_seeds.merged" "$WRONG" \
+                                                        "${TMP_PATH}/seq_wrong_assigned_pref_swaped" "${TMP_PATH}/seq_wrong_assigned_strand_aln" ${ALIGNMENT_REASSIGN_PAR} \
+                            || fail "align2 reassign died"
+                fi
+                if notExists "${TMP_PATH}/seq_wrong_assigned_strand_aln_swap.dbtype"; then
+                    # shellcheck disable=SC2086
+                    "$MMSEQS" swapdb "${TMP_PATH}/seq_wrong_assigned_strand_aln" "${TMP_PATH}/seq_wrong_assigned_strand_aln_swap" ${THREADSANDCOMPRESS} \
+                            || fail "swapdb3 reassign died"
+                fi
+                if notExists "${TMP_PATH}/seq_wrong_assigned_strand_aln_merged.dbtype"; then
+                    # shellcheck disable=SC2086
+                    "$MMSEQS" mergestrandaln "${TMP_PATH}/seq_wrong_assigned" "${TMP_PATH}/seq_wrong_assigned_strand_aln_swap" \
+                                             "${TMP_PATH}/seq_wrong_assigned_strand_aln_merged" ${ALIGNMENT_REASSIGN_PAR} \
+                            || fail "mergestrandaln2 reassign died"
+                fi
+                if notExists "${TMP_PATH}/seq_wrong_assigned_pref_swaped_aln.dbtype"; then
+                    # shellcheck disable=SC2086
+                    "$MMSEQS" swapdb "${TMP_PATH}/seq_wrong_assigned_strand_aln_merged" "${TMP_PATH}/seq_wrong_assigned_pref_swaped_aln" ${THREADSANDCOMPRESS} \
+                            || fail "swapdb4 reassign died"
+                fi
+            elif notExists "${TMP_PATH}/seq_wrong_assigned_pref_swaped_aln.dbtype"; then
                 # shellcheck disable=SC2086
                 $RUNNER "$MMSEQS" "${ALIGN_MODULE}" "${TMP_PATH}/seq_seeds.merged" "${TMP_PATH}/seq_wrong_assigned" \
                                                     "${TMP_PATH}/seq_wrong_assigned_pref_swaped" "${TMP_PATH}/seq_wrong_assigned_pref_swaped_aln" ${ALIGNMENT_REASSIGN_PAR} \
@@ -233,9 +337,28 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
 
             PARAM=CLUSTER${STEP}_PAR
             eval TMP="\$$PARAM"
-            # shellcheck disable=SC2086
-            "$MMSEQS" clust "${SOURCE}" "${TMP_PATH}/clu_accepted_plus_wrong_plus_single" "${2}" ${TMP} \
-                    || fail "Clustering step $STEP died"
+            if [ -n "$STRAND_DB" ]; then
+                # strands from the alignments behind every final pair: members kept (aln_strand, keyed by the
+                # representative's strand entry) and members reassigned (keyed by their own strand entry)
+                if notExists "${TMP_PATH}/clu_reassign_nostrand.dbtype"; then
+                    # shellcheck disable=SC2086
+                    "$MMSEQS" clust "${SOURCE}" "${TMP_PATH}/clu_accepted_plus_wrong_plus_single" "${TMP_PATH}/clu_reassign_nostrand" ${TMP} \
+                            || fail "Clustering step $STEP died"
+                fi
+                if notExists "${TMP_PATH}/strand_evidence.dbtype"; then
+                    # shellcheck disable=SC2086
+                    "$MMSEQS" mergedbs "$STRAND_DB" "${TMP_PATH}/strand_evidence" "${TMP_PATH}/aln_strand" \
+                                       "${TMP_PATH}/seq_wrong_assigned_strand_aln_swap" ${MERGEDBS_PAR} \
+                            || fail "mergedbs strand reassign died"
+                fi
+                # shellcheck disable=SC2086
+                "$MMSEQS" addclustrand "${TMP_PATH}/clu_reassign_nostrand" "${TMP_PATH}/strand_evidence" "${2}" ${THREADSANDCOMPRESS} \
+                        || fail "addclustrand reassign died"
+            else
+                # shellcheck disable=SC2086
+                "$MMSEQS" clust "${SOURCE}" "${TMP_PATH}/clu_accepted_plus_wrong_plus_single" "${2}" ${TMP} \
+                        || fail "Clustering step $STEP died"
+            fi
 
             if [ -n "$REMOVE_TMP" ]; then
                 # shellcheck disable=SC2086
@@ -268,6 +391,15 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
                 "$MMSEQS" rmdb "${TMP_PATH}/clu_accepted_plus_wrong" ${VERBOSITY}
                 # shellcheck disable=SC2086
                 "$MMSEQS" rmdb "${TMP_PATH}/clu_accepted_plus_wrong_plus_single" ${VERBOSITY}
+                if [ -n "$STRAND_DB" ]; then
+                    for db in clu_strandq aln_strand clu_plain seq_wrong_assigned_both seq_wrong_assigned_strand_aln \
+                              seq_wrong_assigned_strand_aln_swap seq_wrong_assigned_strand_aln_merged clu_reassign_nostrand \
+                              strand_evidence; do
+                        # shellcheck disable=SC2086
+                        "$MMSEQS" rmdb "${TMP_PATH}/$db" ${VERBOSITY}
+                    done
+                    rm -f "${TMP_PATH}/seq_wrong_assigned_both.keys"
+                fi
             fi
         fi
     fi
@@ -297,6 +429,15 @@ if [ -n "$REMOVE_TMP" ]; then
             "$MMSEQS" rmdb "${TMP_PATH}/aln_step$STEP" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/clu_step$STEP" ${VERBOSITY}
+            if [ -n "$STRAND_DB" ]; then
+                # shellcheck disable=SC2086
+                "$MMSEQS" rmdb "${TMP_PATH}/aln_step${STEP}_strand" ${VERBOSITY}
+                # shellcheck disable=SC2086
+                "$MMSEQS" rmdb "${TMP_PATH}/clu_step${STEP}_nostrand" ${VERBOSITY}
+                # shellcheck disable=SC2086
+                "$MMSEQS" rmdb "${TMP_PATH}/input_step${STEP}_both" ${VERBOSITY}
+                rm -f "${TMP_PATH}/input_step${STEP}_both.keys"
+            fi
             STEP=$((STEP+1))
         done
 

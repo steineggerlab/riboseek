@@ -84,6 +84,9 @@ public:
     std::vector<MMseqsParameter*> cmbuild;
     std::vector<MMseqsParameter*> cmscan;
     std::vector<MMseqsParameter*> dinucdb;
+    std::vector<MMseqsParameter*> mergestrandaln;
+    std::vector<MMseqsParameter*> addclustrand;
+    std::vector<MMseqsParameter*> splitclustrand;
     std::vector<MMseqsParameter*> envalign;
     std::vector<MMseqsParameter*> chainalign;
     std::vector<MMseqsParameter*> redkmermatcher;

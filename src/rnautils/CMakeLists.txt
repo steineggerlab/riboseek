@@ -4,6 +4,7 @@ set(rnautils_source_files
     rnautils/GenerateCm.cpp
     rnautils/splitstrand.cpp
     rnautils/DinucDb.cpp
+    rnautils/StrandClust.cpp
     rnautils/EnvAlign.cpp
     rnautils/RedKmerMatcher.cpp
     rnautils/RnaAlign.cpp

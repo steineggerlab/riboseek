@@ -128,6 +128,22 @@ static int rnaClusterWorkflow(int argc, const char **argv, const Command &comman
         return EXIT_FAILURE;
     }
 
+    // --strand 2 (the default, as for search): every cascade step searches both strands of its sequences against their
+    // forward strands and the cluster db carries each member's strand (cascaded_clustering.sh, STRAND_DB). linclust
+    // keeps its own behavior: both strands on a flagged nucleotide db, the forward strand of a dinucleotide db.
+    const bool bothStrands = linear == false && convert && par.strand == 2;
+    if (linear == false && par.strand == 0) {
+        Debug(Debug::ERROR) << "--strand 0 (reverse complement only) is not a clustering mode, use 2 (both) or 1 (forward)\n";
+        return EXIT_FAILURE;
+    }
+    if (linear == false && convert == false && par.PARAM_STRAND.wasSet && par.strand == 2) {
+        Debug(Debug::WARNING) << "Input " << par.db1 << " is already dinucleotide encoded, clustering its forward strand only\n";
+    }
+    if (bothStrands && (par.singleStepClustering || par.clusterVersion != Parameters::CLUSTER_VERSION1)) {
+        Debug(Debug::ERROR) << "--strand 2 needs the cascaded --cluster-version 1, use --strand 1 for the forward strand only\n";
+        return EXIT_FAILURE;
+    }
+
     std::string tmpDir = par.db3;
     std::string hash = SSTR(par.hashParameter(command.databases, par.filenames, workflow));
     if (par.reuseLatest) {
@@ -149,7 +165,13 @@ static int rnaClusterWorkflow(int argc, const char **argv, const Command &comman
     cmd.addVariable("RUNNER", par.runner.c_str());
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
     cmd.addVariable("CONVERT", convert ? "TRUE" : NULL);
+    const int strand = par.strand;
+    par.strand = 1;
     cmd.addVariable("DINUCDB_PAR", par.createParameterString(par.dinucdb).c_str());
+    par.strand = 2;
+    cmd.addVariable("DINUCDB_BOTH_PAR", par.createParameterString(par.dinucdb).c_str());
+    par.strand = strand;
+    cmd.addVariable("STRAND_BOTH", bothStrands ? "TRUE" : NULL);
     cmd.addVariable("CLUST_MODULE", linear ? "linclustbase" : "clusterbase");
     cmd.addVariable("CLUST_PAR", clustPar.c_str());
 

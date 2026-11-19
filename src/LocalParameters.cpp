@@ -215,9 +215,20 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuild.push_back(&PARAM_V);
 
     dinucdb.push_back(&PARAM_SUB_MAT);
+    // --strand: forward by default (keys kept), 0 reverse complement, 2 both (keys 2k, 2k+1)
+    dinucdb.push_back(&PARAM_STRAND);
     dinucdb.push_back(&PARAM_THREADS);
     dinucdb.push_back(&PARAM_COMPRESSED);
     dinucdb.push_back(&PARAM_V);
+
+    // riboseek cluster --strand (2: both strands, the default as for search; 1: forward only, the MMseqs2 behavior)
+    clusterworkflow.push_back(&PARAM_STRAND);
+    // mergestrandaln takes the cascade step's alignment parameters (uses -e)
+    mergestrandaln = combineList(align, rescorediagonal);
+    addclustrand.push_back(&PARAM_THREADS);
+    addclustrand.push_back(&PARAM_COMPRESSED);
+    addclustrand.push_back(&PARAM_V);
+    splitclustrand = addclustrand;
 
     // result2profile needs --strand so the RNA-corrected E-value gets the
     // both-strands doubling (matches MMseqs2 RNA fork behavior)
