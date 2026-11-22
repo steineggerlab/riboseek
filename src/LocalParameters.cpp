@@ -53,6 +53,15 @@ LocalParameters::LocalParameters() : Parameters(),
         "cmbuild:\n0: use SS_cons base pairs\n1: build a sequence-only CM (ignore/require-no structure).",
         typeid(int), (void *) &cmbuildNoss,
         "^[0-1]$", MMseqsParameter::COMMAND_PROFILE),
+    PARAM_CM_CALIBRATE(PARAM_CM_CALIBRATE_ID, "--cm-calibrate", "Calibrate CM E-values",
+        "Run Infernal cmcalibrate on each built CM so cmsearch reports E-values (slow: ~10-90 CPU-min per CM)\n"
+        "0: off\n1: Infernal default background (genome-like HMM)\n2: iid background from the CM null model (cmcalibrate --random)",
+        typeid(int), (void *) &cmCalibrate,
+        "^[0-2]$", MMseqsParameter::COMMAND_PROFILE),
+    PARAM_CM_CALIBRATE_LEN(PARAM_CM_CALIBRATE_LEN_ID, "--cm-calibrate-len", "cmcalibrate random length",
+        "Random sequence length in Mb searched per CM (cmcalibrate -L)",
+        typeid(float), (void *) &cmCalibrateLen,
+        "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_PROFILE | MMseqsParameter::COMMAND_EXPERT),
     PARAM_CMBUILD_MIN_ROW_COV(PARAM_CMBUILD_MIN_ROW_COV_ID, "--cmbuild-min-row-cov", "cmbuild minimum row coverage",
         "Drop MSA rows with non-gap coverage below this fraction",
         typeid(float), (void *) &cmbuildMinRowCov,
@@ -82,6 +91,8 @@ LocalParameters::LocalParameters() : Parameters(),
     cmliteMsaEvalThr = DBL_MAX;
     cmbuildEre = -1.0;      // <0 => Infernal default target rel-entropy
     cmbuildSymfrac = -1.0;  // <0 => keep all columns (current default)
+    cmCalibrate = 0;        // off: cmcalibrate costs ~10-90 CPU-min per CM
+    cmCalibrateLen = 1.6f;  // cmcalibrate -L default (Mb)
     cmbuildNoss = 0;        // use SS_cons (current default)
     cmbuildMinRowCov = 0.30f;
     targetSplitDb = "";
@@ -108,6 +119,7 @@ LocalParameters::LocalParameters() : Parameters(),
     cmscan.push_back(&PARAM_CM_ALIGN);
     cmscan.push_back(&PARAM_CM_ALIGN_BANDED);
     cmscan.push_back(&PARAM_CM_LOCAL);
+    cmscan.push_back(&PARAM_DB_SIZE);
 
     rnaalign = align;
     rnaalign.push_back(&PARAM_DB_SIZE);
@@ -134,6 +146,8 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuild.push_back(&PARAM_CMBUILD_SYMFRAC);
     cmbuild.push_back(&PARAM_CMBUILD_NOSS);
     cmbuild.push_back(&PARAM_CMBUILD_MIN_ROW_COV);
+    cmbuild.push_back(&PARAM_CM_CALIBRATE);
+    cmbuild.push_back(&PARAM_CM_CALIBRATE_LEN);
     cmbuild.push_back(&PARAM_THREADS);
     cmbuild.push_back(&PARAM_COMPRESSED);
     cmbuild.push_back(&PARAM_V);

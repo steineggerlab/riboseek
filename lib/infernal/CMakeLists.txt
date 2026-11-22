@@ -39,7 +39,7 @@ set(EASEL_SRCS
         ${INFERNAL_EASEL_DIR}/esl_graph.c
         ${INFERNAL_EASEL_DIR}/esl_gumbel.c
         # ${INFERNAL_EASEL_DIR}/esl_heap.c
-        # ${INFERNAL_EASEL_DIR}/esl_histogram.c
+        ${INFERNAL_EASEL_DIR}/esl_histogram.c
         ${INFERNAL_EASEL_DIR}/esl_hmm.c
         # ${INFERNAL_EASEL_DIR}/esl_huffman.c
         # ${INFERNAL_EASEL_DIR}/esl_hyperexp.c
@@ -189,6 +189,7 @@ elseif (X86 OR X64)
 endif ()
 
 set(INFERNAL_CORE_SRCS
+        ${CMAKE_CURRENT_SOURCE_DIR}/riboseek_cmcalibrate.c
         ${INFERNAL_SRC_DIR}/cm.c
         ${INFERNAL_SRC_DIR}/cm_alidisplay.c
         ${INFERNAL_SRC_DIR}/cm_alndata.c

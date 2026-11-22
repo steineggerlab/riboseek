@@ -71,7 +71,10 @@ std::vector<Command> riboseekCommands = {
                                       {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
     {"cmsearch", cmsearch, &localPar.cmscan, COMMAND_ALIGNMENT,
             "CM search with in-tree CYK/Inside dynamic programming",
-            "riboseek cmsearch queryCMDB targetDB resultDB alignmentDB\n",
+            "riboseek cmsearch queryCMDB targetDB resultDB alignmentDB\n"
+            "CMs calibrated with Infernal cmcalibrate get Infernal E-values (-e applies) with the database\n"
+            "size Z = residues rescanned for that query (its windows, per strand scanned), as rMSA;\n"
+            "--db-size N sets Z = 2N instead (whole database). Uncalibrated CMs report E = 1.\n",
             "Martin Steinegger <martin.steinegger@snu.ac.kr>",
             "<i:queryCMDB> <i:targetDB> <i:resultDB> <o:alignmentDB>",
             CITATION_MMSEQS2, {{"queryCMDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::genericDb },

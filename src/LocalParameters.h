@@ -33,6 +33,8 @@ public:
     double cmbuildEre;
     double cmbuildSymfrac;
     int cmbuildNoss;
+    int cmCalibrate;
+    float cmCalibrateLen;
     float cmbuildMinRowCov;
     std::string targetSplitDb;
     std::string realignQueryDb;
@@ -48,6 +50,8 @@ public:
     PARAMETER(PARAM_CMBUILD_ERE)
     PARAMETER(PARAM_CMBUILD_SYMFRAC)
     PARAMETER(PARAM_CMBUILD_NOSS)
+    PARAMETER(PARAM_CM_CALIBRATE)
+    PARAMETER(PARAM_CM_CALIBRATE_LEN)
     PARAMETER(PARAM_CMBUILD_MIN_ROW_COV)
     PARAMETER(PARAM_TARGET_SPLIT_DB)
     PARAMETER(PARAM_REALIGN_QUERY_DB)

@@ -544,7 +544,9 @@ static void processQueryModel(LocalParameters &par, const InfModel &model,
         }
 
         std::vector<InfHit> hits;
-#pragma omp parallel num_threads(static_cast<int>(nThreads))
+        // residues rescanned for this query (window length x strands scanned), the default E-value Z
+        double scannedResidues = 0.0;
+#pragma omp parallel num_threads(static_cast<int>(nThreads)) reduction(+:scannedResidues)
         {
             unsigned int thread_idx = 0;
 #ifdef OPENMP
@@ -596,6 +598,7 @@ static void processQueryModel(LocalParameters &par, const InfModel &model,
 
                     const bool scanFwd = !cand.hasRegionCoord || !cand.prefilterIsRev;
                     const bool scanRev = !cand.hasRegionCoord ||  cand.prefilterIsRev;
+                    scannedResidues += static_cast<double>(regionLen) * ((scanFwd ? 1 : 0) + (scanRev ? 1 : 0));
                     if (scanFwd) {
                         InfHit h = scanRegionInfernal(model, tcm, regionSeq);
                         if (h.valid) {
@@ -626,10 +629,38 @@ static void processQueryModel(LocalParameters &par, const InfModel &model,
             return a.end1 < b.end1;
         });
 
+        // E-values need a calibrated CM (ECM lines from Infernal cmcalibrate); otherwise E = 1.
+        // Infernal: E = Z_eff * exp(-lambda (s - mu_extrap)), Z_eff = Z / dbsize_cal * nrandhits,
+        // Z = residues rescanned for this query: the sum of its windows, once per strand scanned
+        // (as rMSA, which runs cmsearch on a file of hit windows). --db-size N instead sets
+        // Z = 2N, the whole-database convention of rnaalign and Infernal's cmsearch -Z.
+        const bool calibrated = (model.cm->flags & CMH_EXPTAIL_STATS) && model.cm->expA != NULL;
+        const ExpInfo_t *expInfo = NULL;
+        double effDbSize = 0.0;
+        if (calibrated) {
+            const bool cmLocal = (model.cm->config_opts & CM_CONFIG_LOCAL) != 0;
+            const int expMode = cmLocal ? (model.useInside ? EXP_CM_LI : EXP_CM_LC)
+                                        : (model.useInside ? EXP_CM_GI : EXP_CM_GC);
+            expInfo = model.cm->expA[expMode];
+            if (expInfo == NULL || !expInfo->is_valid) {
+                expInfo = NULL;
+            } else {
+                // --db-size, as in rnaalign, counts the residues of one strand
+                const size_t userDbSize = strtoull(par.dbSize.c_str(), NULL, 10);
+                const double Z = (userDbSize > 0) ? 2.0 * static_cast<double>(userDbSize) : scannedResidues;
+                effDbSize = Z / expInfo->dbsize * static_cast<double>(expInfo->nrandhits);
+            }
+        }
+
         char buffer[1024 + 32768 * 4];
         resultWriter.writeStart(0);
         for (size_t i = 0; i < hits.size(); ++i) {
             const InfHit &h = hits[i];
+            double evalue = 1.0;
+            if (expInfo != NULL) {
+                evalue = effDbSize * std::exp(-expInfo->lambda * (h.score - expInfo->mu_extrap));
+                if (evalue > par.evalThr) continue;
+            }
             int dbStartOut = std::max(0, h.start1 - 1);
             int dbEndOut = std::max(0, h.end1 - 1);
             const unsigned int qLen = (modelLen > 0)
@@ -646,7 +677,6 @@ static void processQueryModel(LocalParameters &par, const InfModel &model,
             const float qcov = (qLen > 0) ? static_cast<float>(qSpan) / static_cast<float>(qLen) : 0.0f;
             const float dbcov = (h.dbLen > 0) ? static_cast<float>(dbSpan) / static_cast<float>(h.dbLen) : 0.0f;
             const int bitScore = static_cast<int>(std::lrint(h.score));
-            const double evalue = 1.0; // E-values out of scope
             const bool hasBacktrace = (!h.cigar.empty() && h.cigar != "NA");
             // Swap I/D (I=target-consume, D=query-consume) to MMseqs2 convention
             std::string emitCigar;
@@ -741,6 +771,7 @@ int cmscan(int argc, const char **argv, const Command &command) {
                           Parameters::DBTYPE_ALIGNMENT_RES);
     resultWriter.open();
 
+    size_t nCalibrated = 0;
     for (size_t qi = 0; qi < queryRefs.size(); ++qi) {
         const QueryModelRef &ref = queryRefs[qi];
         std::string cmText;
@@ -768,11 +799,14 @@ int cmscan(int argc, const char **argv, const Command &command) {
             Debug(Debug::WARNING) << "cmscan: could not load model key " << ref.key << ", skipping\n";
             continue;
         }
+        if (model.cm->flags & CMH_EXPTAIL_STATS) nCalibrated++;
         processQueryModel(par, model, ref.key, seqDbr, resultReader, resultWriter,
                           subMat, nucMat, seqDecodeType, seqGpuDb, decodeSeqDinuc, nThreads);
         freeModel(model);
     }
 
+    Debug(Debug::INFO) << "cmsearch: " << nCalibrated << " of " << queryRefs.size()
+                       << " models calibrated (Infernal E-values, -e filter applied); others report E = 1\n";
     resultWriter.close();
     resultReader.close();
     seqDbr.close();

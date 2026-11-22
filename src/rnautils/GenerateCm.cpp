@@ -13,6 +13,7 @@
 #include "SubstitutionMatrix.h"
 #include "Util.h"
 #include "DinucleotideMapping.h"
+#include "infernal/riboseek_cmcalibrate.h"
 
 #include <set>
 #include <unordered_map>
@@ -768,6 +769,10 @@ int cmbuild(int argc, const char **argv, const Command &command) {
         Debug(Debug::INFO) << "cmbuild seed E-value threshold: " << msaEvalStream.str() << "\n";
     }
 
+    if (par.cmCalibrate != 0) {
+        Debug(Debug::INFO) << "cmbuild: calibrating CM E-values (cmcalibrate -L " << par.cmCalibrateLen
+                           << (par.cmCalibrate == 2 ? " --random" : "") << "); expect ~10-90 CPU-min per CM\n";
+    }
     Debug::Progress progress(resultReader.getSize());
 
     // Stockholm rows are filtered: drop any target with non-gap coverage below
@@ -814,6 +819,20 @@ int cmbuild(int argc, const char **argv, const Command &command) {
             progress.updateProgress();
             std::string cmText, buildErr;
             if (buildQueryCmText(par, ctx, id, thread_idx, cmText, buildErr)) {
+                if (par.cmCalibrate != 0) {
+                    // Infernal cmcalibrate in memory; on failure keep the uncalibrated CM (cmsearch then reports E = 1)
+                    char *calText = NULL;
+                    size_t calLen = 0;
+                    char calErr[128];
+                    if (riboseek_cmcalibrate(cmText.c_str(), cmText.size(), par.cmCalibrateLen,
+                                             par.cmCalibrate == 2 ? 1 : 0, &calText, &calLen, calErr) == 0) {
+                        cmText.assign(calText, calLen);
+                        free(calText);
+                    } else {
+                        Debug(Debug::WARNING) << "cmbuild: cmcalibrate failed for query key "
+                                              << resultReader.getDbKey(id) << ": " << calErr << "\n";
+                    }
+                }
                 cmWriter.writeData(cmText.c_str(), cmText.size(), resultReader.getDbKey(id), thread_idx);
             } else if (!buildErr.empty()) {
                 Debug(Debug::WARNING) << "cmbuild: " << buildErr << "\n";
