@@ -100,9 +100,14 @@ std::vector<Command> riboseekCommands = {
                                       {"resultDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::resultDb },
                                       {"queryCM", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::profileDb }}},
     {"cmbuild", cmbuild, &localPar.cmbuild, COMMAND_PROFILE,
-            "Build CM from aligned Stockholm/FASTA input",
+            "Build CMs from search results or from an MSA DB",
             "riboseek cmbuild queryDB targetDB resultDB outputCMDB\n"
-            "targetDB and resultDB may be comma-separated lists of equal length.\n",
+            "targetDB and resultDB may be comma-separated lists of equal length.\n"
+            "riboseek cmbuild msaDB outputCMDB\n"
+            "msaDB entries: Stockholm (convertmsa), aligned FASTA or A3M (result2msa --msa-format-mode 2-6);\n"
+            "the first row is the reference row.\n"
+            "--cmbuild-ss-mode 1 takes SS_cons from R-scape CaCoFold (R-scape --cacofold) on each MSA:\n"
+            "riboseek cmbuild msaDB outputCMDB --cmbuild-ss-mode 1 --rscape-bin /path/to/R-scape\n",
             "Martin Steinegger <martin.steinegger@snu.ac.kr>",
             "<i:queryDB> <i:targetDB> <i:resultDB> <o:outputCMDB>",
             CITATION_MMSEQS2, {{"queryDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },

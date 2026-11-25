@@ -26,6 +26,9 @@ struct CmBuildCtx {
     bool decodeTargetDinuc = false;
     bool targetGpuDb = false;
     int targetSeqType = 0;
+    // --cmbuild-ss-mode 1: resolved R-scape executable and per-run scratch directory
+    std::string rscapeExe;
+    std::string rscapeWorkDir;
 };
 
 extern bool buildQueryCmText(

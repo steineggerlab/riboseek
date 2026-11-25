@@ -17,9 +17,13 @@
 
 #include <set>
 #include <unordered_map>
-#ifdef RIBOSEEK_CMBUILD_DUMP_STOCKHOLM
+#include <unordered_set>
 #include <fstream>
-#endif
+#include <iterator>
+#include <cstdlib>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -437,6 +441,268 @@ static bool mergeCmbuildInputs(const std::string &queryDb,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// R-scape CaCoFold structure (--cmbuild-ss-mode 1)
+// ---------------------------------------------------------------------------
+
+static std::string shellQuote(const std::string &s) {
+    std::string out = "'";
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\'') out += "'\\''";
+        else out.push_back(s[i]);
+    }
+    out.push_back('\'');
+    return out;
+}
+
+// Resolve an executable name through PATH (or check a path containing '/').
+static bool findExecutable(const std::string &name, std::string &resolved) {
+    if (name.empty()) return false;
+    if (name.find('/') != std::string::npos) {
+        if (access(name.c_str(), X_OK) == 0) { resolved = name; return true; }
+        return false;
+    }
+    const char *path = std::getenv("PATH");
+    if (path == NULL) return false;
+    const std::vector<std::string> dirs = Util::split(path, ":");
+    for (size_t i = 0; i < dirs.size(); ++i) {
+        const std::string cand = (dirs[i].empty() ? std::string(".") : dirs[i]) + "/" + name;
+        if (access(cand.c_str(), X_OK) == 0) { resolved = cand; return true; }
+    }
+    return false;
+}
+
+// R-scape writes a flat output directory; remove its files and the directory.
+static void removeFlatDir(const std::string &dir) {
+    DIR *d = opendir(dir.c_str());
+    if (d == NULL) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        const std::string n = e->d_name;
+        if (n == "." || n == "..") continue;
+        unlink((dir + "/" + n).c_str());
+    }
+    closedir(d);
+    rmdir(dir.c_str());
+}
+
+// Concatenate the "#=GC <tag>" lines of a (possibly interleaved) Stockholm file.
+static bool readStockholmGc(const std::string &path, const std::string &tag, std::string &out) {
+    out.clear();
+    std::ifstream in(path.c_str());
+    if (!in) return false;
+    const std::string prefix = "#=GC " + tag;
+    std::string line;
+    bool found = false;
+    while (std::getline(in, line)) {
+        if (line.compare(0, prefix.size(), prefix) != 0) continue;
+        if (line.size() > prefix.size() && !std::isspace(static_cast<unsigned char>(line[prefix.size()]))) {
+            continue;  // e.g. SS_cons_1 / SS_cons_pk_1
+        }
+        out += trimCopy(line.substr(prefix.size()));
+        found = true;
+    }
+    return found;
+}
+
+static std::string tailOfFile(const std::string &path, size_t maxBytes) {
+    std::ifstream in(path.c_str());
+    if (!in) return std::string();
+    std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (all.size() > maxBytes) all = all.substr(all.size() - maxBytes);
+    return trimCopy(all);
+}
+
+// Run R-scape on the alignment (rows as given to cmbuild) and return the
+// CaCoFold SS_cons (all alignment columns; pseudoknot letters are dropped
+// later by Infernal's HandModelmaker, as in cmbuild).
+static bool rscapeCacofoldSs(const LocalParameters &par, const CmBuildCtx &ctx,
+                             const std::string &modelName,
+                             const std::vector<AlnSeq> &rows,
+                             std::string &ssCons, std::string &err) {
+    ssCons.clear();
+    if (rows.empty() || rows[0].aln.empty()) { err = "empty alignment"; return false; }
+    const size_t alen = rows[0].aln.size();
+    const std::string dir = ctx.rscapeWorkDir + "/" + modelName;
+    removeFlatDir(dir);
+    if (!FileUtil::makeDir(dir.c_str())) { err = "cannot create " + dir; return false; }
+    const std::string stoPath = dir + "/input.sto";
+    {
+        std::ofstream sto(stoPath.c_str());
+        if (!sto) { err = "cannot write " + stoPath; return false; }
+        sto << "# STOCKHOLM 1.0\n#=GF ID " << modelName << "\n";
+        // Exact duplicate aligned rows (common in raw search results) would
+        // distort the tree R-scape builds for its null; write each distinct
+        // row once. Row 0 (query/reference) is always written first.
+        std::unordered_set<std::string> seenRows;
+        size_t nWritten = 0;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (!seenRows.insert(rows[i].aln).second) continue;
+            sto << rows[i].id << " " << rows[i].aln << "\n";
+            ++nWritten;
+        }
+        if (std::getenv("RIBOSEEK_DEBUG_SSCONS") != nullptr) {
+            Debug(Debug::WARNING) << "[rscape] " << modelName << " rows=" << rows.size()
+                                  << " distinct=" << nWritten << "\n";
+        }
+        sto << "#=GC RF " << std::string(alen, 'x') << "\n//\n";
+        if (!sto) { err = "cannot write " + stoPath; return false; }
+    }
+    const std::string logPath = dir + "/rscape.log";
+    const std::string cmd = shellQuote(ctx.rscapeExe) + " " + par.rscapeArgs
+                          + " --outdir " + shellQuote(dir) + " --outname model "
+                          + shellQuote(stoPath) + " > " + shellQuote(logPath) + " 2>&1";
+    const int rc = std::system(cmd.c_str());
+    const std::string outSto = dir + "/model.cacofold.sto";
+    if (rc != 0 || !readStockholmGc(outSto, "SS_cons", ssCons)) {
+        err = "R-scape failed (exit " + SSTR(WIFEXITED(rc) ? WEXITSTATUS(rc) : rc) + "), files kept in "
+            + dir + ": " + tailOfFile(logPath, 300);
+        ssCons.clear();
+        return false;
+    }
+    if (ssCons.size() != alen) {
+        err = "R-scape SS_cons has " + SSTR(ssCons.size()) + " columns, alignment has " + SSTR(alen)
+            + "; files kept in " + dir;
+        ssCons.clear();
+        return false;
+    }
+    removeFlatDir(dir);
+    return true;
+}
+
+// Nested base pairs in a WUSS string. Pseudoknot letters (Aa, Bb, ...) are not
+// counted: Infernal's HandModelmaker removes them before building.
+static size_t countNestedPairs(const std::string &ss) {
+    size_t n = 0;
+    for (size_t i = 0; i < ss.size(); ++i) {
+        const char c = ss[i];
+        if (c == '<' || c == '(' || c == '[' || c == '{') ++n;
+    }
+    return n;
+}
+
+// Shared tail of both inputs (result DB and MSA DB): optional row filter,
+// SS_cons, then Infernal cmbuild. Row 0 is the reference (query) row.
+static bool finishCmBuild(LocalParameters &par, CmBuildCtx &ctx, unsigned int key,
+                          std::vector<AlnSeq> &stoSeqs, const std::string &givenSsCons,
+                          std::string &cmText, std::string &err,
+                          bool forScan, bool useInside, bool useLocal, CM_t **ret_cm) {
+    if (stoSeqs.empty() || stoSeqs[0].aln.empty()) {
+        err = "empty alignment for key " + std::to_string(key);
+        return false;
+    }
+    const std::string modelName = "query_" + std::to_string(key);
+
+    // Optional MsaFilter pass: rMSA/hhfilter-style row pruning before
+    // cmbuild. Encodes ACGU/N/'-' rows into MsaFilter's byte alphabet
+    // (residues < NAA, N=NAA, '-'=GAP) so identity comparisons land in
+    // pure byte-equality and qsc/qid stay disabled (we set qsc=-50 and
+    // qid="0" by default since the loaded subMat is dinucleotide).
+    if (ctx.doMsaFilter && stoSeqs.size() > 1) {
+        std::vector<unsigned char> encBuf;
+        std::vector<const char *> rowPtrs;
+        const int N = static_cast<int>(stoSeqs.size());
+        const int L = static_cast<int>(stoSeqs[0].aln.size());
+        encBuf.assign(static_cast<size_t>(N) * static_cast<size_t>(L), MultipleAlignment::GAP);
+        rowPtrs.assign(N, nullptr);
+        for (int i = 0; i < N; ++i) {
+            unsigned char *dst = encBuf.data() + static_cast<size_t>(i) * static_cast<size_t>(L);
+            const std::string &aln = stoSeqs[i].aln;
+            const int copyLen = std::min(L, static_cast<int>(aln.size()));
+            for (int p = 0; p < copyLen; ++p) dst[p] = encodeAlignedNuc(aln[p]);
+            rowPtrs[i] = reinterpret_cast<const char *>(dst);
+        }
+        ctx.msaFilter->filter(N, L,
+                              static_cast<int>(par.covMSAThr * 100),
+                              ctx.qid_vec, par.qsc,
+                              static_cast<int>(par.filterMaxSeqId * 100),
+                              par.Ndiff, par.filterMinEnable,
+                              rowPtrs.data(), false);
+        bool *keptRaw = new bool[N];
+        ctx.msaFilter->getKept(keptRaw, N);
+        std::vector<AlnSeq> keptSeqs;
+        keptSeqs.reserve(N);
+        for (int i = 0; i < N; ++i) {
+            if (keptRaw[i]) keptSeqs.push_back(std::move(stoSeqs[i]));
+        }
+        delete[] keptRaw;
+        stoSeqs = std::move(keptSeqs);
+        if (stoSeqs.empty()) {
+            err = "MSA filter removed all rows for key " + std::to_string(key);
+            return false;
+        }
+    }
+
+    // SS_cons: R-scape CaCoFold (mode 1), else a given SS_cons (MSA DB
+    // entry), else a single-sequence MFE fold of row 0.
+    std::string ssCons;
+    bool ssOk = false;
+    bool querySsNoss = false;
+    if (par.cmbuildNoss == 0) {
+        if (par.cmbuildSsMode == 1) {
+            std::string rsErr;
+            ssOk = rscapeCacofoldSs(par, ctx, modelName, stoSeqs, ssCons, rsErr);
+            if (ssOk && countNestedPairs(ssCons) == 0) {
+                // CaCoFold found no nested base pair: build this query like cmbuild --noss
+                Debug(Debug::INFO) << "cmbuild: " << modelName
+                                   << ": CaCoFold structure has no base pairs; building it without structure (--noss)\n";
+                querySsNoss = true;
+            }
+            if (!ssOk) {
+                Debug(Debug::WARNING) << "cmbuild: " << modelName << ": " << rsErr
+                                      << "; using the "
+                                      << (givenSsCons.empty() ? "MFE fold of the first row" : "input SS_cons")
+                                      << " instead\n";
+            }
+        }
+        if (!ssOk && !givenSsCons.empty()) {
+            ssCons = givenSsCons;
+            ssOk = true;
+        }
+        if (!ssOk) {
+            double mfe = 0.0;
+            ssOk = rnaFoldMfeDotBracket(stoSeqs[0].aln, ssCons, &mfe);
+        }
+    }
+    if (std::getenv("RIBOSEEK_DEBUG_SSCONS") != nullptr) {
+        Debug(Debug::WARNING) << "[ssCons] q=" << key
+            << " ok=" << (ssOk ? 1 : 0)
+            << " len=" << ssCons.size()
+            << " ss=[" << ssCons << "]\n";
+    }
+
+    std::string buildErr;
+    std::vector<std::string> sqnames;
+    std::vector<std::string> aseqs;
+    sqnames.reserve(stoSeqs.size());
+    aseqs.reserve(stoSeqs.size());
+    for (const AlnSeq &s : stoSeqs) {
+        sqnames.push_back(s.id);
+        std::string row = s.aln;
+        convertTsToUs(row);
+        aseqs.push_back(std::move(row));
+    }
+#ifdef RIBOSEEK_CMBUILD_DUMP_STOCKHOLM
+    // Serializes seed MSA + SS_cons fed to Infernal cmbuild
+    std::ofstream sto(std::string(RIBOSEEK_CMBUILD_DUMP_STOCKHOLM) + "/" + modelName + ".sto");
+    if (sto) {
+        sto << "# STOCKHOLM 1.0\n#=GF ID " << modelName << "\n";
+        for (size_t i = 0; i < sqnames.size(); ++i)
+            sto << sqnames[i] << " " << aseqs[i] << "\n";
+        if (!aseqs.empty() && !aseqs[0].empty())
+            sto << "#=GC RF " << std::string(aseqs[0].size(), 'x') << "\n";
+        if (!ssCons.empty())
+            sto << "#=GC SS_cons " << ssCons << "\n";
+        sto << "//\n";
+    }
+#endif
+    bool success = cmbuildFromAlignment(modelName, sqnames, aseqs, ssCons, cmText, buildErr,
+                                        par.cmbuildEre, par.cmbuildSymfrac, par.cmbuildNoss != 0 || querySsNoss,
+                                        forScan, useInside, useLocal, ret_cm);
+    if (!success) { err = "build failed for query " + std::to_string(key) + ": " + buildErr; return false; }
+    return true;
+}
+
 bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
                       unsigned int thread_idx, std::string &cmText, std::string &err,
                       bool forScan, bool useInside, bool useLocal,
@@ -445,17 +711,12 @@ bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
     DBReader<unsigned int> *tDbr = ctx.tDbr;
     DBReader<unsigned int> &resultReader = *ctx.resultReader;
     SubstitutionMatrix &subMat = *ctx.subMat;
-    MsaFilter &msaFilter = *ctx.msaFilter;
     Sequence &targetMapper = *ctx.targetMapper;
-    const std::vector<int> &qid_vec = ctx.qid_vec;
     const float minColCoverage = ctx.minColCoverage;
-    const bool doMsaFilter = ctx.doMsaFilter;
     const bool decodeTargetDinuc = ctx.decodeTargetDinuc;
     const bool targetGpuDb = ctx.targetGpuDb;
     std::vector<Matcher::result_t> alnResults; alnResults.reserve(300);
     std::set<unsigned int> seenKeys;
-    std::vector<unsigned char> encBuf;
-    std::vector<const char *> rowPtrs;
             unsigned int queryKey = resultReader.getDbKey(id);
             size_t queryId = qDbr.getId(queryKey);
             if (queryId == UINT_MAX) {
@@ -583,83 +844,300 @@ bool buildQueryCmText(LocalParameters &par, CmBuildCtx &ctx, size_t id,
                 }
             }
 
-            // SS_cons from a single-sequence MFE fold of the query row.
-            std::string ssCons;
-            double mfe = 0.0;
-            bool ssOk = rnaFoldMfeDotBracket(queryRow, ssCons, &mfe);
-            (void)mfe;
-            if (std::getenv("RIBOSEEK_DEBUG_SSCONS") != nullptr) {
-                Debug(Debug::WARNING) << "[ssCons] q=" << queryKey
-                    << " ok=" << (ssOk ? 1 : 0)
-                    << " len=" << ssCons.size()
-                    << " ss=[" << ssCons << "]\n";
-            }
+            return finishCmBuild(par, ctx, queryKey, stoSeqs, std::string(), cmText, err,
+                                 forScan, useInside, useLocal, ret_cm);
+}
 
-            // Optional MsaFilter pass: rMSA/hhfilter-style row pruning before
-            // cmbuild. Encodes ACGU/N/'-' rows into MsaFilter's byte alphabet
-            // (residues < NAA, N=NAA, '-'=GAP) so identity comparisons land in
-            // pure byte-equality and qsc/qid stay disabled (we set qsc=-50 and
-            // qid="0" by default since the loaded subMat is dinucleotide).
-            if (doMsaFilter && stoSeqs.size() > 1) {
-                const int N = static_cast<int>(stoSeqs.size());
-                const int L = static_cast<int>(qLen);
-                encBuf.assign(static_cast<size_t>(N) * static_cast<size_t>(L), MultipleAlignment::GAP);
-                rowPtrs.assign(N, nullptr);
-                for (int i = 0; i < N; ++i) {
-                    unsigned char *dst = encBuf.data() + static_cast<size_t>(i) * static_cast<size_t>(L);
-                    const std::string &aln = stoSeqs[i].aln;
-                    const int copyLen = std::min(L, static_cast<int>(aln.size()));
-                    for (int p = 0; p < copyLen; ++p) dst[p] = encodeAlignedNuc(aln[p]);
-                    rowPtrs[i] = reinterpret_cast<const char *>(dst);
-                }
-                msaFilter.filter(N, L,
-                                 static_cast<int>(par.covMSAThr * 100),
-                                 qid_vec, par.qsc,
-                                 static_cast<int>(par.filterMaxSeqId * 100),
-                                 par.Ndiff, par.filterMinEnable,
-                                 rowPtrs.data(), false);
-                bool *keptRaw = new bool[N];
-                msaFilter.getKept(keptRaw, N);
-                std::vector<AlnSeq> keptSeqs;
-                keptSeqs.reserve(N);
-                for (int i = 0; i < N; ++i) {
-                    if (keptRaw[i]) keptSeqs.push_back(std::move(stoSeqs[i]));
-                }
-                delete[] keptRaw;
-                stoSeqs = std::move(keptSeqs);
-            }
+// ---------------------------------------------------------------------------
+// MSA DB input: riboseek cmbuild msaDB outputCMDB
+// ---------------------------------------------------------------------------
 
-            const std::string modelName = "query_" + std::to_string(queryKey);
-            std::string buildErr;
-            std::vector<std::string> sqnames;
-            std::vector<std::string> aseqs;
-            sqnames.reserve(stoSeqs.size());
-            aseqs.reserve(stoSeqs.size());
-            for (const AlnSeq &s : stoSeqs) {
-                sqnames.push_back(s.id);
-                std::string row = s.aln;
-                convertTsToUs(row);
-                aseqs.push_back(std::move(row));
+static inline char normalizeMsaChar(char c) {
+    if (c == '-' || c == '.' || c == '_' || c == '~') return '-';
+    c = normalizeBase(c);
+    if (c != 'A' && c != 'C' && c != 'G' && c != 'U') c = 'N';
+    return c;
+}
+
+// Parse one MSA DB entry: Stockholm (convertmsa, result2msa --msa-format-mode 4),
+// aligned FASTA (modes 2/3) or A3M (modes 5/6; lowercase insert columns are
+// dropped). Row 0 is the reference row. Returns the entry's SS_cons if present.
+static bool parseMsaEntry(const char *data, size_t len, std::vector<AlnSeq> &rows,
+                          std::string &ssCons, std::string &err) {
+    rows.clear();
+    ssCons.clear();
+    std::vector<std::string> names;
+    std::vector<std::string> seqs;
+    std::unordered_map<std::string, size_t> stoIndex;
+    bool isStockholm = false;
+    bool sawFirst = false;
+    size_t pos = 0;
+    while (pos < len && data[pos] != '\0') {
+        size_t eol = pos;
+        while (eol < len && data[eol] != '\n' && data[eol] != '\0') ++eol;
+        std::string line(data + pos, eol - pos);
+        pos = (eol < len && data[eol] == '\n') ? eol + 1 : eol;
+        if (!line.empty() && line[line.size() - 1] == '\r') line.resize(line.size() - 1);
+        const std::string t = trimCopy(line);
+        if (t.empty()) continue;
+        if (!sawFirst) {
+            sawFirst = true;
+            if (t.compare(0, 11, "# STOCKHOLM") == 0) { isStockholm = true; continue; }
+        }
+        if (isStockholm) {
+            if (t == "//") break;
+            if (t.compare(0, 12, "#=GC SS_cons") == 0
+                && (t.size() == 12 || std::isspace(static_cast<unsigned char>(t[12])))) {
+                ssCons += trimCopy(t.substr(12));
+                continue;
             }
-#ifdef RIBOSEEK_CMBUILD_DUMP_STOCKHOLM
-            // Serializes seed MSA + SS_cons fed to Infernal cmbuild
-            std::ofstream sto(std::string(RIBOSEEK_CMBUILD_DUMP_STOCKHOLM) + "/" + modelName + ".sto");
-            if (sto) {
-                sto << "# STOCKHOLM 1.0\n#=GF ID " << modelName << "\n";
-                for (size_t i = 0; i < sqnames.size(); ++i)
-                    sto << sqnames[i] << " " << aseqs[i] << "\n";
-                if (!aseqs.empty() && !aseqs[0].empty())
-                    sto << "#=GC RF " << std::string(aseqs[0].size(), 'x') << "\n";
-                if (!ssCons.empty())
-                    sto << "#=GC SS_cons " << ssCons << "\n";
-                sto << "//\n";
+            if (t[0] == '#') continue;
+            size_t sp = 0;
+            while (sp < t.size() && !std::isspace(static_cast<unsigned char>(t[sp]))) ++sp;
+            const std::string name = t.substr(0, sp);
+            std::string seq;
+            for (size_t i = sp; i < t.size(); ++i) {
+                if (!std::isspace(static_cast<unsigned char>(t[i]))) seq.push_back(t[i]);
             }
-#endif
-            bool success = cmbuildFromAlignment(modelName, sqnames, aseqs, ssCons, cmText, buildErr,
-                                                par.cmbuildEre, par.cmbuildSymfrac, par.cmbuildNoss != 0,
-                                                forScan, useInside, useLocal, ret_cm);
-    if (!success) { err = "build failed for query " + std::to_string(queryKey) + ": " + buildErr; return false; }
+            std::unordered_map<std::string, size_t>::const_iterator it = stoIndex.find(name);
+            if (it == stoIndex.end()) {
+                stoIndex[name] = names.size();
+                names.push_back(name);
+                seqs.push_back(seq);
+            } else {
+                seqs[it->second] += seq;
+            }
+        } else {
+            if (t[0] == '#') continue;  // A3M comment / consensus header lines
+            if (t[0] == '>') {
+                size_t e = 1;
+                while (e < t.size() && !std::isspace(static_cast<unsigned char>(t[e]))) ++e;
+                names.push_back(t.substr(1, e - 1));
+                seqs.push_back(std::string());
+            } else {
+                if (seqs.empty()) { err = "sequence data before the first header"; return false; }
+                for (size_t i = 0; i < t.size(); ++i) {
+                    if (!std::isspace(static_cast<unsigned char>(t[i]))) seqs.back().push_back(t[i]);
+                }
+            }
+        }
+    }
+    if (seqs.empty()) { err = "no sequences"; return false; }
+
+    // Aligned FASTA: every row has the same length, keep all columns.
+    // A3M: lengths differ; drop lowercase insert states and '.'.
+    bool sameLen = true;
+    for (size_t i = 1; i < seqs.size(); ++i) {
+        if (seqs[i].size() != seqs[0].size()) { sameLen = false; break; }
+    }
+    if (!isStockholm && !sameLen) {
+        for (size_t i = 0; i < seqs.size(); ++i) {
+            std::string kept;
+            kept.reserve(seqs[i].size());
+            for (size_t j = 0; j < seqs[i].size(); ++j) {
+                const char c = seqs[i][j];
+                if (std::islower(static_cast<unsigned char>(c)) || c == '.') continue;
+                kept.push_back(c);
+            }
+            seqs[i].swap(kept);
+        }
+        sameLen = true;
+        for (size_t i = 1; i < seqs.size(); ++i) {
+            if (seqs[i].size() != seqs[0].size()) { sameLen = false; break; }
+        }
+    }
+    if (!sameLen) { err = "rows have different aligned lengths"; return false; }
+    if (seqs[0].empty()) { err = "empty alignment"; return false; }
+    if (!ssCons.empty() && ssCons.size() != seqs[0].size()) {
+        err = "SS_cons length " + SSTR(ssCons.size()) + " differs from alignment length " + SSTR(seqs[0].size());
+        return false;
+    }
+
+    // Unique, whitespace-free names (Infernal and R-scape need them).
+    std::set<std::string> used;
+    rows.reserve(seqs.size());
+    for (size_t i = 0; i < seqs.size(); ++i) {
+        std::string name;
+        for (size_t j = 0; j < names[i].size(); ++j) {
+            const unsigned char c = static_cast<unsigned char>(names[i][j]);
+            name.push_back(std::isgraph(c) ? static_cast<char>(c) : '_');
+        }
+        if (name.empty()) name = "seq" + SSTR(i);
+        if (used.count(name) != 0) {
+            size_t k = 2;
+            while (used.count(name + "_" + SSTR(k)) != 0) ++k;
+            name += "_" + SSTR(k);
+        }
+        used.insert(name);
+        AlnSeq a;
+        a.id = name;
+        a.aln.resize(seqs[i].size());
+        for (size_t j = 0; j < seqs[i].size(); ++j) a.aln[j] = normalizeMsaChar(seqs[i][j]);
+        rows.push_back(std::move(a));
+    }
     return true;
+}
+
+// Resolve R-scape and create its scratch directory next to the output DB.
+static bool setupRscape(const LocalParameters &par, const std::string &outDb,
+                        std::string &exe, std::string &workDir) {
+    if (par.cmbuildSsMode != 1 || par.cmbuildNoss != 0) return true;
+    if (!findExecutable(par.rscapeBin, exe)) {
+        Debug(Debug::ERROR) << "cmbuild: --cmbuild-ss-mode 1 needs R-scape; \"" << par.rscapeBin
+                            << "\" was not found (set --rscape-bin)\n";
+        return false;
+    }
+    workDir = outDb + "_rscape";
+    if (!FileUtil::directoryExists(workDir.c_str()) && !FileUtil::makeDir(workDir.c_str())) {
+        Debug(Debug::ERROR) << "cmbuild: cannot create R-scape directory " << workDir << "\n";
+        return false;
+    }
+    Debug(Debug::INFO) << "cmbuild: SS_cons from R-scape (" << exe << " " << par.rscapeArgs << ")\n";
+    return true;
+}
+
+static void calibrateIfRequested(const LocalParameters &par, std::string &cmText, unsigned int key) {
+    if (par.cmCalibrate == 0) return;
+    // Infernal cmcalibrate in memory; on failure keep the uncalibrated CM (cmsearch then reports E = 1)
+    char *calText = NULL;
+    size_t calLen = 0;
+    char calErr[128];
+    if (riboseek_cmcalibrate(cmText.c_str(), cmText.size(), par.cmCalibrateLen,
+                             par.cmCalibrate == 2 ? 1 : 0, &calText, &calLen, calErr) == 0) {
+        cmText.assign(calText, calLen);
+        free(calText);
+    } else {
+        Debug(Debug::WARNING) << "cmbuild: cmcalibrate failed for query key " << key << ": " << calErr << "\n";
+    }
+}
+
+static int cmbuildFromMsaDb(LocalParameters &par) {
+    DBReader<unsigned int> msaReader(par.db1.c_str(), par.db1Index.c_str(), par.threads,
+                                     DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
+    msaReader.open(DBReader<unsigned int>::LINEAR_ACCCESS);
+    if (Parameters::isEqualDbtype(msaReader.getDbtype(), Parameters::DBTYPE_MSA_DB) == false) {
+        Debug(Debug::WARNING) << "cmbuild: " << par.db1 << " is a " << msaReader.getDbTypeName()
+                              << " DB, reading its entries as MSAs\n";
+    }
+    if (msaReader.getSize() > 0) {
+        // binary cA3M (result2msa --msa-format-mode 0/1) is not text
+        const char *d = msaReader.getData(0, 0);
+        if (d != NULL && msaReader.getEntryLen(0) > 1 && d[0] != '#' && d[0] != '>') {
+            Debug(Debug::ERROR) << "cmbuild: MSA entries must be Stockholm, aligned FASTA or A3M text "
+                                   "(result2msa --msa-format-mode 2-6); binary cA3M is not supported\n";
+            msaReader.close();
+            return EXIT_FAILURE;
+        }
+    }
+
+    std::string rscapeExe, rscapeWorkDir;
+    if (!setupRscape(par, par.db2, rscapeExe, rscapeWorkDir)) {
+        msaReader.close();
+        return EXIT_FAILURE;
+    }
+
+    DBWriter cmWriter(par.db2.c_str(), par.db2Index.c_str(), par.threads,
+                      par.compressed, Parameters::DBTYPE_GENERIC_DB);
+    cmWriter.open();
+    Debug(Debug::INFO) << "MSA database size: " << msaReader.getSize() << "\n";
+    if (par.cmCalibrate != 0) {
+        Debug(Debug::INFO) << "cmbuild: calibrating CM E-values (cmcalibrate -L " << par.cmCalibrateLen
+                           << (par.cmCalibrate == 2 ? " --random" : "") << "); expect ~10-90 CPU-min per CM\n";
+    }
+
+    SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0f, 0.0f);
+    std::vector<int> qid_vec;
+    {
+        std::vector<std::string> qid_str_vec = Util::split(par.qid, ",");
+        for (size_t i = 0; i < qid_str_vec.size(); ++i) {
+            qid_vec.push_back(static_cast<int>(static_cast<float>(std::atof(qid_str_vec[i].c_str())) * 100));
+        }
+        if (qid_vec.empty()) qid_vec.push_back(0);
+        std::sort(qid_vec.begin(), qid_vec.end());
+    }
+    Debug::Progress progress(msaReader.getSize());
+    size_t nFailed = 0;
+
+#pragma omp parallel reduction(+:nFailed)
+    {
+        unsigned int thread_idx = 0;
+#ifdef OPENMP
+        thread_idx = (unsigned int) omp_get_thread_num();
+#endif
+        MsaFilter msaFilter(8192, 1024, &subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid());
+        CmBuildCtx ctx;
+        ctx.subMat = &subMat; ctx.msaFilter = &msaFilter;
+        ctx.qid_vec = qid_vec; ctx.minColCoverage = par.cmbuildMinRowCov;
+        ctx.doMsaFilter = (par.filterMsa != 0);
+        ctx.rscapeExe = rscapeExe; ctx.rscapeWorkDir = rscapeWorkDir;
+        std::vector<AlnSeq> rows;
+
+#pragma omp for schedule(dynamic, 1)
+        for (size_t id = 0; id < msaReader.getSize(); id++) {
+            progress.updateProgress();
+            const unsigned int key = msaReader.getDbKey(id);
+            const char *data = msaReader.getData(id, thread_idx);
+            const size_t len = msaReader.getEntryLen(id);
+            std::string givenSs, err;
+            if (!parseMsaEntry(data, len, rows, givenSs, err)) {
+                Debug(Debug::WARNING) << "cmbuild: MSA key " << key << ": " << err << "\n";
+                nFailed++;
+                continue;
+            }
+            // drop non-reference rows with coverage below --cmbuild-min-row-cov
+            const size_t alen = rows[0].aln.size();
+            std::vector<AlnSeq> kept;
+            kept.reserve(rows.size());
+            for (size_t i = 0; i < rows.size(); ++i) {
+                size_t res = 0;
+                for (size_t j = 0; j < alen; ++j) res += (rows[i].aln[j] != '-');
+                if (i == 0 || static_cast<float>(res) / static_cast<float>(alen) >= ctx.minColCoverage) {
+                    kept.push_back(std::move(rows[i]));
+                }
+            }
+            std::string cmText;
+            if (finishCmBuild(par, ctx, key, kept, givenSs, cmText, err, false, true, false, NULL)) {
+                calibrateIfRequested(par, cmText, key);
+                cmWriter.writeData(cmText.c_str(), cmText.size(), key, thread_idx);
+            } else {
+                Debug(Debug::WARNING) << "cmbuild: " << err << "\n";
+                nFailed++;
+            }
+        }
+    }
+    const size_t nMsa = msaReader.getSize();
+    cmWriter.close(true);
+    msaReader.close();
+    if (!rscapeWorkDir.empty()) rmdir(rscapeWorkDir.c_str());  // stays if failed runs were kept
+    if (nFailed > 0) {
+        Debug(Debug::WARNING) << "cmbuild: " << nFailed << " of " << nMsa
+                              << " MSAs produced no CM\n";
+    }
+    return EXIT_SUCCESS;
+}
+
+// Positional (non-option) arguments in argv; bool flags take no value
+// unless the next argument is 0/1/true/false.
+static size_t countPositionalArgs(int argc, const char **argv, const std::vector<MMseqsParameter *> &params) {
+    size_t n = 0;
+    for (int i = 0; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a.size() > 1 && a[0] == '-') {
+            bool isBool = false;
+            for (size_t p = 0; p < params.size(); ++p) {
+                if (a == params[p]->name) { isBool = (params[p]->type == typeid(bool)); break; }
+            }
+            if (!isBool) {
+                ++i;
+            } else if (i + 1 < argc) {
+                const std::string v = argv[i + 1];
+                if (v == "0" || v == "1" || v == "true" || v == "false") ++i;
+            }
+            continue;
+        }
+        ++n;
+    }
+    return n;
 }
 
 int cmbuild(int argc, const char **argv, const Command &command) {
@@ -673,6 +1151,17 @@ int cmbuild(int argc, const char **argv, const Command &command) {
     par.covMSAThr = 0.5f;
     par.filterMaxSeqId = 0.99f;
     par.Ndiff = 128;
+
+    // riboseek cmbuild msaDB outputCMDB
+    if (countPositionalArgs(argc, argv, *command.params) == 2) {
+        Command msaCommand = command;
+        msaCommand.databases.clear();
+        msaCommand.databases.push_back({"msaDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, NULL});
+        msaCommand.databases.push_back({"outputCMDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::genericDb});
+        par.parseParameters(argc, argv, msaCommand, true, 0, 0);
+        cmInfernalGlobalInit();
+        return cmbuildFromMsaDb(par);
+    }
 
     std::string rawTargetDbArg;
     std::string rawResultDbArg;
@@ -757,6 +1246,11 @@ int cmbuild(int argc, const char **argv, const Command &command) {
                                         DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA);
     resultReader.open(DBReader<unsigned int>::LINEAR_ACCCESS);
 
+    std::string rscapeExe, rscapeWorkDir;
+    if (!setupRscape(par, par.db4, rscapeExe, rscapeWorkDir)) {
+        return EXIT_FAILURE;
+    }
+
     DBWriter cmWriter(par.db4.c_str(), par.db4Index.c_str(), par.threads,
                       par.compressed, Parameters::DBTYPE_GENERIC_DB);
     cmWriter.open();
@@ -813,26 +1307,14 @@ int cmbuild(int argc, const char **argv, const Command &command) {
         ctx.qid_vec = qid_vec; ctx.minColCoverage = minColCoverage;
         ctx.doMsaFilter = doMsaFilter; ctx.decodeTargetDinuc = decodeTargetDinuc; ctx.targetSeqType = targetSeqType;
         ctx.targetGpuDb = targetGpuDb;
+        ctx.rscapeExe = rscapeExe; ctx.rscapeWorkDir = rscapeWorkDir;
 
 #pragma omp for schedule(dynamic, 1)
         for (size_t id = 0; id < resultReader.getSize(); id++) {
             progress.updateProgress();
             std::string cmText, buildErr;
             if (buildQueryCmText(par, ctx, id, thread_idx, cmText, buildErr)) {
-                if (par.cmCalibrate != 0) {
-                    // Infernal cmcalibrate in memory; on failure keep the uncalibrated CM (cmsearch then reports E = 1)
-                    char *calText = NULL;
-                    size_t calLen = 0;
-                    char calErr[128];
-                    if (riboseek_cmcalibrate(cmText.c_str(), cmText.size(), par.cmCalibrateLen,
-                                             par.cmCalibrate == 2 ? 1 : 0, &calText, &calLen, calErr) == 0) {
-                        cmText.assign(calText, calLen);
-                        free(calText);
-                    } else {
-                        Debug(Debug::WARNING) << "cmbuild: cmcalibrate failed for query key "
-                                              << resultReader.getDbKey(id) << ": " << calErr << "\n";
-                    }
-                }
+                calibrateIfRequested(par, cmText, resultReader.getDbKey(id));
                 cmWriter.writeData(cmText.c_str(), cmText.size(), resultReader.getDbKey(id), thread_idx);
             } else if (!buildErr.empty()) {
                 Debug(Debug::WARNING) << "cmbuild: " << buildErr << "\n";
@@ -841,6 +1323,7 @@ int cmbuild(int argc, const char **argv, const Command &command) {
     }
 
     cmWriter.close(true);
+    if (!rscapeWorkDir.empty()) rmdir(rscapeWorkDir.c_str());  // stays if failed runs were kept
     resultReader.close();
     if (!sameDatabase) {
         tDbr->close();

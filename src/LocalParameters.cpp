@@ -66,6 +66,20 @@ LocalParameters::LocalParameters() : Parameters(),
         "Drop MSA rows with non-gap coverage below this fraction",
         typeid(float), (void *) &cmbuildMinRowCov,
         "^[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_PROFILE),
+    PARAM_CMBUILD_SS_MODE(PARAM_CMBUILD_SS_MODE_ID, "--cmbuild-ss-mode", "cmbuild structure source",
+        "Consensus structure (SS_cons) given to cmbuild:\n"
+        "0: single-sequence MFE fold of the first (query) row; an MSA DB entry with its own SS_cons keeps it\n"
+        "1: R-scape CaCoFold on the final MSA, exact duplicate rows removed (falls back to 0 if R-scape fails)",
+        typeid(int), (void *) &cmbuildSsMode,
+        "^[0-1]$", MMseqsParameter::COMMAND_PROFILE),
+    PARAM_RSCAPE_BIN(PARAM_RSCAPE_BIN_ID, "--rscape-bin", "R-scape executable",
+        "R-scape executable used by --cmbuild-ss-mode 1 (name in PATH or path)",
+        typeid(std::string), (void *) &rscapeBin,
+        "^.*$", MMseqsParameter::COMMAND_PROFILE | MMseqsParameter::COMMAND_EXPERT),
+    PARAM_RSCAPE_ARGS(PARAM_RSCAPE_ARGS_ID, "--rscape-args", "R-scape arguments",
+        "Arguments passed to R-scape by --cmbuild-ss-mode 1; --outdir and --outname are added by cmbuild",
+        typeid(std::string), (void *) &rscapeArgs,
+        "^.*$", MMseqsParameter::COMMAND_PROFILE | MMseqsParameter::COMMAND_EXPERT),
     PARAM_TARGET_SPLIT_DB(PARAM_TARGET_SPLIT_DB_ID, "--target-split-db", "Pre-split target DB",
         "Pre-computed splitsequence output of the target DB. When given, search reuses it instead of\n"
         "splitting the target again, which saves the splitsequence pass and its temporary copy.\n"
@@ -95,6 +109,9 @@ LocalParameters::LocalParameters() : Parameters(),
     cmCalibrateLen = 1.6f;  // cmcalibrate -L default (Mb)
     cmbuildNoss = 0;        // use SS_cons (current default)
     cmbuildMinRowCov = 0.30f;
+    cmbuildSsMode = 0;      // 0: MFE fold of the query row (current default)
+    rscapeBin = "R-scape";
+    rscapeArgs = "--cacofold --nofigures --rna";
     targetSplitDb = "";
     realignQueryDb = "";
 
@@ -146,6 +163,9 @@ LocalParameters::LocalParameters() : Parameters(),
     cmbuild.push_back(&PARAM_CMBUILD_SYMFRAC);
     cmbuild.push_back(&PARAM_CMBUILD_NOSS);
     cmbuild.push_back(&PARAM_CMBUILD_MIN_ROW_COV);
+    cmbuild.push_back(&PARAM_CMBUILD_SS_MODE);
+    cmbuild.push_back(&PARAM_RSCAPE_BIN);
+    cmbuild.push_back(&PARAM_RSCAPE_ARGS);
     cmbuild.push_back(&PARAM_CM_CALIBRATE);
     cmbuild.push_back(&PARAM_CM_CALIBRATE_LEN);
     cmbuild.push_back(&PARAM_THREADS);
